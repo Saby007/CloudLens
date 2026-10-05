@@ -21,9 +21,9 @@ param(
     [string] $CertManagerVersion = 'v1.21.2',
     [ValidatePattern('^[a-f0-9]{64}$')]
     [string] $CertManagerSha256 = 'e03b668ec8675214af6b0a671699d088f2601fa3878e0dbe1b41d3feafd1879f',
-    [ValidateRange(30, 3600)]
+    [ValidateRange(1, 3600)]
     [int] $RbacTimeoutSeconds = 900,
-    [ValidateRange(30, 3600)]
+    [ValidateRange(1, 3600)]
     [int] $ReadyTimeoutSeconds = 600,
     [switch] $PlanOnly
 )
@@ -68,21 +68,28 @@ function ConvertTo-BootstrapManifest {
 }
 
 function Invoke-Kubectl {
-    # Returns kubectl's combined output; throws with it when kubectl fails, unless -AllowFailure.
+    # Returns kubectl's standard output only, so callers can parse it: kubectl also writes warnings to standard
+    # error (for example "resource ... is not namespace scoped"). Throws with both streams when kubectl fails,
+    # unless -AllowFailure; the standard error of the last call is kept in $script:KubectlError either way.
     param([Parameter(Mandatory)][string[]] $Arguments, [string] $InputText, [switch] $AllowFailure)
     $output = if ($PSBoundParameters.ContainsKey('InputText')) {
         $InputText | & kubectl @Arguments 2>&1
     } else {
         & kubectl @Arguments 2>&1
     }
-    $text = Get-CliText $output
-    if ($LASTEXITCODE -ne 0 -and -not $AllowFailure) { throw "kubectl $($Arguments -join ' ') failed: $text" }
-    return $text
+    $exitCode = $LASTEXITCODE
+    $standardOutput = Get-CliText @($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+    $script:KubectlError = Get-CliText @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() })
+    if ($exitCode -ne 0 -and -not $AllowFailure) {
+        throw "kubectl $($Arguments -join ' ') failed: $(Get-CliText @($standardOutput, $script:KubectlError))"
+    }
+    $global:LASTEXITCODE = $exitCode
+    return $standardOutput
 }
 
 function Wait-Until {
     param([Parameter(Mandatory)][scriptblock] $Condition, [Parameter(Mandatory)][int] $TimeoutSeconds,
-          [Parameter(Mandatory)][string] $Activity, [int] $IntervalSeconds = 15)
+          [Parameter(Mandatory)][string] $Activity, [int] $IntervalSeconds = 15, [scriptblock] $Status)
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $attempt = 0
     while ($true) {
@@ -90,7 +97,9 @@ function Wait-Until {
         if (& $Condition) { return $true }
         if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) { return $false }
         if ($attempt % 4 -eq 1) {
-            Write-Host "  $Activity ($([int]$clock.Elapsed.TotalSeconds)s so far, up to $TimeoutSeconds)..." -ForegroundColor DarkGray
+            $detail = if ($Status) { "$(& $Status)" -replace '\s+', ' ' } else { '' }
+            if ($detail.Trim()) { $detail = " - last response: $($detail.Trim())" } else { $detail = '' }
+            Write-Host "  $Activity ($([int]$clock.Elapsed.TotalSeconds)s so far, up to $TimeoutSeconds)$detail" -ForegroundColor DarkGray
         }
         Start-Sleep -Seconds $IntervalSeconds
     }
@@ -148,11 +157,16 @@ try {
     $env:KUBECONFIG = $kubeconfig
 
     Write-Host '==> Waiting for the cluster-admin role to reach the Kubernetes API server' -ForegroundColor Cyan
-    $ready = Wait-Until -TimeoutSeconds $RbacTimeoutSeconds -Activity 'Azure RBAC is still propagating' -Condition {
-        (Invoke-Kubectl @('auth', 'can-i', 'create', 'customresourcedefinitions.apiextensions.k8s.io') -AllowFailure) -eq 'yes'
+    $script:rbacResponse = ''
+    $ready = Wait-Until -TimeoutSeconds $RbacTimeoutSeconds -Activity 'Azure RBAC is still propagating' -Status { $script:rbacResponse } -Condition {
+        # CRDs are cluster-scoped; --all-namespaces stops kubectl from checking (and warning about) a namespace.
+        $answer = Invoke-Kubectl @('auth', 'can-i', 'create', 'customresourcedefinitions.apiextensions.k8s.io', '--all-namespaces') -AllowFailure
+        $allowed = $LASTEXITCODE -eq 0 -and @($answer -split "`r?`n" | ForEach-Object { $_.Trim() }) -contains 'yes'
+        $script:rbacResponse = Get-CliText @($answer, $script:KubectlError)
+        return $allowed
     }
     if (-not $ready) {
-        throw "The signed-in account still cannot administer $cluster after $RbacTimeoutSeconds seconds. Confirm it holds 'Azure Kubernetes Service RBAC Cluster Admin' on the cluster (Terraform assigns it to the deploying principal), then rerun 'azd provision'."
+        throw "The signed-in account still cannot administer $cluster after $RbacTimeoutSeconds seconds (last response from kubectl: $($script:rbacResponse -replace '\s+', ' ')). Confirm it holds 'Azure Kubernetes Service RBAC Cluster Admin' on the cluster (Terraform assigns it to the deploying principal), then rerun 'azd provision'."
     }
 
     $installed = Invoke-Kubectl @('get', 'deployment', 'cert-manager', '--namespace', 'cert-manager', '--ignore-not-found',
@@ -175,8 +189,8 @@ try {
 
     # cert-manager's webhook can refuse requests for a short while after it reports ready.
     Write-Host '==> Applying the ingress controller and Let''s Encrypt issuers' -ForegroundColor Cyan
-    $lastError = ''
-    $applied = Wait-Until -TimeoutSeconds $ReadyTimeoutSeconds -Activity 'waiting for the cert-manager webhook' -Condition {
+    $script:lastError = ''
+    $applied = Wait-Until -TimeoutSeconds $ReadyTimeoutSeconds -Activity 'waiting for the cert-manager webhook' -Status { $script:lastError } -Condition {
         try {
             Invoke-Kubectl @('apply', '--server-side', '--force-conflicts', "--field-manager=$fieldManager", '-f', '-') -InputText $manifest | Out-Null
             return $true
@@ -185,12 +199,12 @@ try {
             return $false
         }
     }
-    if (-not $applied) { throw "The cluster bootstrap manifest could not be applied: $lastError" }
+    if (-not $applied) { throw "The cluster bootstrap manifest could not be applied: $($script:lastError)" }
 
     Write-Host "==> Waiting for the ingress controller to take the static IP $(Get-Setting 'APP_INGRESS_PUBLIC_IP')" -ForegroundColor Cyan
     $available = Invoke-Kubectl @('wait', 'nginxingresscontroller/cloudlens', '--for=condition=Available=True', "--timeout=$($ReadyTimeoutSeconds)s") -AllowFailure
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "The ingress controller is not available yet: $available"
+        Write-Warning "The ingress controller is not available yet: $(Get-CliText @($available, $script:KubectlError))"
         Write-Warning "Check it with: kubectl describe nginxingresscontroller cloudlens; kubectl get service --namespace app-routing-system"
     }
     Write-Host 'AKS bootstrap complete.' -ForegroundColor Green

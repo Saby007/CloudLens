@@ -328,7 +328,8 @@ def test_end_to_end_helper_deploys_once_retries_and_never_hides_a_question():
 def test_aks_bootstrap_hook_waits_for_rbac_and_installs_only_the_pinned_cert_manager():
     summary = run_powershell_harness("test-aks-bootstrap.ps1")
     assert summary == {"result": "passed", "rbacWaited": True, "checksumEnforced": True,
-                       "webhookRetried": True, "kubeconfigIsolated": True}
+                       "webhookRetried": True, "kubeconfigIsolated": True,
+                       "kubectlWarningsIgnored": True, "deniedAccessReported": True}
 
 
 @pytest.mark.parametrize("apply", [False, True])
@@ -680,7 +681,7 @@ def test_azure_yaml_deploys_both_services_to_the_terraform_provisioned_cluster()
     assert text.count("remoteBuild: true") == 2 and text.count("platform: linux/amd64") == 2
     assert text.count("deploymentPath: manifests") == 2
     assert "containerapp" not in text and "resourceName" not in text
-    assert re.search(r"postprovision:\n    shell: pwsh\n    run: \./scripts/aks-bootstrap\.ps1", text)
+    assert re.search(r"postprovision:\n    shell: pwsh\n    run: \./scripts/aks-bootstrap\.ps1\n    interactive: true\n", text)
     assert 'namespace         = "cloudlens"' in (PROJECT_ROOT / "infra" / "main.tf").read_text()
     assert text.index("  api:") < text.index("  web:")
 

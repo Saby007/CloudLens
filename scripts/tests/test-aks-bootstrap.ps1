@@ -17,6 +17,7 @@ function Reset-State {
         appliedManifest = ''
         kubeconfig = ''
         content = $certManagerContent
+        rbacDenied = $false
     }
 }
 
@@ -58,13 +59,26 @@ function kubectl {
     $state = $global:bootstrapTestState
     if ($env:KUBECONFIG -ne $state.kubeconfig) { throw 'kubectl must use the temporary kubeconfig.' }
     if ($a[0] -eq 'auth') {
+        # Like kubectl, warn on standard error when a cluster-scoped resource is checked inside a namespace.
+        $namespaced = $a -notcontains '--all-namespaces' -and $a -notcontains '-A'
+        if ($namespaced) {
+            Write-Error -ErrorAction Continue "Warning: resource 'customresourcedefinitions' is not namespace scoped in group 'apiextensions.k8s.io'"
+        }
+        if ($state.rbacDenied) {
+            $global:LASTEXITCODE = 1
+            return 'no'
+        }
         $answer = if ($state.canIAnswers.Count) { $state.canIAnswers[0] } else { 'yes' }
         if ($state.canIAnswers.Count) { $state.canIAnswers.RemoveAt(0) }
-        $state.calls.Add("can-i $answer")
+        $state.calls.Add("can-i $answer$(if ($namespaced) { ' (namespaced)' })")
         if ($answer -ne 'yes') { $global:LASTEXITCODE = 1 }
         return $answer
     }
-    if ($a[0] -eq 'get' -and $a[1] -eq 'deployment') { return $state.installedVersion }
+    if ($a[0] -eq 'get' -and $a[1] -eq 'deployment') {
+        # A server warning on standard error must never be read as the installed version.
+        Write-Error -ErrorAction Continue 'Warning: unrecognized format "int64"'
+        return $state.installedVersion
+    }
     if ($a[0] -eq 'apply') {
         if ($a -notcontains '--server-side' -or $a -notcontains '--force-conflicts') { throw 'Applies must be server-side.' }
         $file = $a[-1]
@@ -133,7 +147,7 @@ try {
     # Full run: waits for RBAC, installs the checksum-verified release, retries while the webhook starts.
     Reset-State
     $global:bootstrapTestState.canIAnswers.AddRange([string[]]@('no', 'no', 'yes'))
-    & $script -CertManagerSha256 $certManagerSha 6>$null | Out-Null
+    & $script -CertManagerSha256 $certManagerSha -RbacTimeoutSeconds 30 6>$null | Out-Null
     $state = $global:bootstrapTestState
     $expectedCalls = @(
         'get-credentials aks-0123456789abc', 'kubelogin azurecli', 'can-i no', 'can-i no', 'can-i yes',
@@ -152,17 +166,28 @@ try {
     Reset-State
     $global:bootstrapTestState.content = $certManagerContent + "# tampered`n"
     $refused = $null
-    try { & $script -CertManagerSha256 $certManagerSha 6>$null | Out-Null } catch { $refused = $_.Exception.Message }
+    try { & $script -CertManagerSha256 $certManagerSha -RbacTimeoutSeconds 30 6>$null | Out-Null } catch { $refused = $_.Exception.Message }
     if ($refused -notmatch 'not the pinned' -or $global:bootstrapTestState.calls -contains 'apply cert-manager') { throw 'A checksum mismatch must stop before anything is applied.' }
 
     # A rerun with cert-manager already current skips the download.
     Reset-State
     $global:bootstrapTestState.installedVersion = 'v1.21.2'
-    & $script -CertManagerSha256 $certManagerSha 6>$null | Out-Null
+    & $script -CertManagerSha256 $certManagerSha -RbacTimeoutSeconds 30 6>$null | Out-Null
     if (@($global:bootstrapTestState.calls | Where-Object { $_ -like 'download*' -or $_ -eq 'apply cert-manager' }).Count) { throw 'An installed release must not be downloaded or reapplied.' }
     if ($global:bootstrapTestState.calls -notcontains 'apply bootstrap') { throw 'The ingress controller and issuers must still be reconciled on reruns.' }
 
-    [ordered]@{ result = 'passed'; rbacWaited = $true; checksumEnforced = $true; webhookRetried = $true; kubeconfigIsolated = $true } | ConvertTo-Json -Compress
+    # Access that never arrives: the hook stops with kubectl's last answer instead of waiting without a word.
+    Reset-State
+    $global:bootstrapTestState.rbacDenied = $true
+    $denied = $null
+    try { & $script -CertManagerSha256 $certManagerSha -RbacTimeoutSeconds 1 6>$null | Out-Null } catch { $denied = $_.Exception.Message }
+    if ($denied -notmatch 'still cannot administer' -or $denied -notmatch 'last response from kubectl: no\)') { throw "Denied access must be reported with kubectl's answer; got: $denied" }
+    if ($global:bootstrapTestState.calls -contains 'apply cert-manager' -or @($global:bootstrapTestState.calls | Where-Object { $_ -like 'download*' }).Count) {
+        throw 'Nothing may be installed before access is confirmed.'
+    }
+
+    [ordered]@{ result = 'passed'; rbacWaited = $true; checksumEnforced = $true; webhookRetried = $true; kubeconfigIsolated = $true
+                kubectlWarningsIgnored = $true; deniedAccessReported = $true } | ConvertTo-Json -Compress
 } finally {
     foreach ($entry in $saved.GetEnumerator()) { [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process') }
     Remove-Variable -Name bootstrapTestState -Scope Global -ErrorAction SilentlyContinue

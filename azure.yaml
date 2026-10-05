@@ -9,10 +9,11 @@ infra:
   module: main
 hooks:
   # Installs cert-manager, the static-IP ingress controller and the Let's Encrypt issuers (idempotent).
+  # interactive streams its progress to the terminal; otherwise azd shows only a short preview while it runs.
   postprovision:
     shell: pwsh
     run: ./scripts/aks-bootstrap.ps1
-    interactive: false
+    interactive: true
     continueOnError: false
 services:
   # Deploy order matters: web's nginx resolves the api Service when it starts.
