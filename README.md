@@ -135,7 +135,15 @@ Two other top-level views round out the app:
 - The [Azure CLI](https://learn.microsoft.com/cli/azure/), signed in with `az login`. Terraform authenticates through it, not through azd.
 - The [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/) 1.32 or later.
 - [Terraform](https://developer.hashicorp.com/terraform/install) 1.9 or later (for example `winget install Hashicorp.Terraform`).
-- **kubectl** and **kubelogin**. `az aks install-cli` installs both; the one-command script offers to run it for you.
+- **kubectl** and **kubelogin** on your `PATH`; azd deploys with them. `az aks install-cli` installs both, and the one-command script offers to run it for you.
+
+**kubectl and kubelogin on `PATH`.** `azd` looks both up on your `PATH` and otherwise stops with *required external tools are missing: kubectl is not installed*, even when they are installed. `az aks install-cli` doesn't add them to `PATH`, and the one-command script puts them there only for its own run, printing these commands when they aren't on yours. Before you run `azd` yourself — for example `azd deploy` after a code change — add both folders once, then open a new terminal (restart VS Code if you use its terminal). On Windows:
+
+```powershell
+[Environment]::SetEnvironmentVariable('Path', ([Environment]::GetEnvironmentVariable('Path', 'User') + ";$HOME\.azure-kubectl;$HOME\.azure-kubelogin").Trim(';'), 'User')
+```
+
+Don't use `setx` for this: it cuts a `PATH` longer than 1,024 characters off, losing whatever came last. In a terminal that's already open, run `$env:PATH = "$HOME\.azure-kubectl;$HOME\.azure-kubelogin;" + $env:PATH` instead. On macOS or Linux, if the script installed them, add `export PATH="$HOME/.azure-kubectl:$HOME/.azure-kubelogin:$PATH"` to your shell profile.
 
 **Permissions.** Owner (or Contributor plus User Access Administrator) on the subscription you deploy into: Terraform creates role assignments for the app's identities and makes you an administrator of the new cluster. The three per-subscription role assignments described [below](#the-three-manual-role-assignments) need Owner or User Access Administrator on each subscription you assess.
 
@@ -187,7 +195,7 @@ pwsh ./scripts/deploy-end-to-end.ps1 `
 
 **Expect the first run to take roughly 30–45 minutes** — creating the cluster alone takes 10–15 minutes. A failed `azd up` or `azd deploy` is retried after a wait (`-MaxAttempts`, default 3). The usual reasons on a brand-new environment are a role assignment that hasn't reached Azure or the cluster yet, or Azure still finishing an earlier operation on the cluster or the Foundry account; warnings about them are normal progress, not failures. Every phase is idempotent, so a run that stops partway can simply be rerun — it reapplies the current code once and skips whatever is already in place.
 
-**The run never waits on a question you can't see.** Every `azd` command runs with `--no-prompt`, so a new environment is created and becomes the folder's default azd environment without asking. If `azd` still needs an answer, the script reruns that command in the terminal so you can answer it. If kubectl or kubelogin is missing, or your tenant requires a Service Tree ID on the sign-in app registrations, the script asks there too.
+**The run never waits on a question you can't see.** Every `azd` command runs with `--no-prompt`, so a new environment is created and becomes the folder's default azd environment without asking. If `azd` still needs an answer, the script reruns that command in the terminal so you can answer it. If kubectl or kubelogin is missing, or your tenant requires a Service Tree ID on the sign-in app registrations, the script asks there too. When kubectl and kubelogin are installed but not on your `PATH`, the script uses them for its own run and prints the commands that put them on `PATH` for the `azd` commands you run yourself later (see [Prerequisites](#prerequisites)).
 
 | Switch | Use it when |
 | --- | --- |
@@ -234,7 +242,7 @@ azd provision --preview
 azd up
 ```
 
-Boolean settings must be lowercase `true` or `false`. Re-running `azd up` (or `azd deploy` alone, for code changes) later updates the deployment in place.
+Boolean settings must be lowercase `true` or `false`. Re-running `azd up` (or `azd deploy` alone, for code changes) later updates the deployment in place, as long as kubectl and kubelogin are on your `PATH` ([Prerequisites](#prerequisites)).
 
 If you intentionally want exports without Foundry chat, set `APP_PROFILE=data` and omit the five Model Router/chat settings. That is an opt-out path, not the recommended deployment.
 
@@ -406,6 +414,7 @@ azd keeps the Terraform state in `.azure/<environment>/infra/terraform.tfstate` 
 
 | Symptom | What to do |
 | --- | --- |
+| `azd deploy` or `azd up` stops with *required external tools are missing: kubectl is not installed* | kubectl and kubelogin are usually installed but not on this terminal's `PATH`: the one-command script puts them there only while it runs. Add `$HOME\.azure-kubectl` and `$HOME\.azure-kubelogin` to `PATH` as shown under [Prerequisites](#prerequisites), then rerun. |
 | The postprovision hook says the account *still cannot administer* the cluster | The cluster-admin role assignment hadn't reached the API server yet. Rerun `azd provision`. |
 | The browser warns about the certificate, or `kubectl get certificate --namespace cloudlens` shows `READY False` | Inspect `kubectl describe certificate web-tls --namespace cloudlens` and `kubectl get challenges --all-namespaces`. Port 80 must be reachable from the internet; a `rateLimited` error means switch to `letsencrypt-staging` for a while. |
 | Pods stay `Pending` | `kubectl describe pod <name> --namespace cloudlens`: usually vCPU quota or node size — raise the quota, or adjust `APP_AKS_USER_*`. |

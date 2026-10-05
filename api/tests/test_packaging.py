@@ -323,6 +323,7 @@ def test_end_to_end_helper_deploys_once_retries_and_never_hides_a_question():
     assert summary["result"] == "passed"
     assert summary["rerunRedeploysOnce"] and summary["noHiddenPrompts"] and summary["azdQuestionsAskedInTerminal"]
     assert summary["serviceTreeIdAskedAndRemembered"] and summary["kubernetesToolsOfferedAndInstalled"]
+    assert summary["kubernetesToolsPathExplained"]
 
 
 def test_aks_bootstrap_hook_waits_for_rbac_and_installs_only_the_pinned_cert_manager():

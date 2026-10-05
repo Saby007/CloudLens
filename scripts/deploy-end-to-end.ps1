@@ -8,7 +8,8 @@
 
       1. Checks prerequisites (git, azd, az, terraform, kubectl, kubelogin) and clones the repository
          (skipped when already run from a checkout). Missing kubectl/kubelogin are installed with
-         `az aks install-cli` once you agree.
+         `az aks install-cli` once you agree. When they are not on your PATH, the run puts them there for
+         itself only and prints how to add them, which azd commands you run yourself later need.
       2. Signs in with `azd` and `az` (Terraform authenticates through the Azure CLI).
       3. Creates the azd environment and applies the recommended `ai` profile settings, including the
          scheduled export processor.
@@ -224,15 +225,34 @@ function Resolve-KubernetesTools {
     $suffix = if ($IsWindows) { '.exe' } else { '' }
     $kubectlPath = Join-Path (Join-Path $KubernetesToolsDirectory '.azure-kubectl') "kubectl$suffix"
     $kubeloginPath = Join-Path (Join-Path $KubernetesToolsDirectory '.azure-kubelogin') "kubelogin$suffix"
+    $directories = @((Split-Path -Parent $kubectlPath), (Split-Path -Parent $kubeloginPath))
     $separator = [System.IO.Path]::PathSeparator
     function Test-Missing { @('kubectl', 'kubelogin' | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }) }
     function Add-ToolPath {
-        # Only for this run and the azd/hook processes it starts; az aks install-cli prints how to add them permanently.
-        foreach ($directory in @((Split-Path -Parent $kubectlPath), (Split-Path -Parent $kubeloginPath))) {
+        # Only for this run and the azd/hook processes it starts; Set-ToolPathHint covers everything after it.
+        foreach ($directory in $directories) {
             if ((Test-Path -LiteralPath $directory) -and ($env:PATH -split [regex]::Escape($separator)) -notcontains $directory) {
                 $env:PATH = "$directory$separator$env:PATH"
             }
         }
+    }
+    function Set-ToolPathHint {
+        # azd looks kubectl and kubelogin up on PATH, so after this run a plain `azd deploy` would report kubectl
+        # as not installed. az aks install-cli's own PATH advice is a warning, which --only-show-errors hides.
+        $quoted = ($directories -join $separator).Replace("'", "''")
+        $lines = @(
+            "kubectl and kubelogin are in $($directories -join ' and '). Those folders aren't on your PATH, so this run added them for itself only."
+            'Before running azd yourself (for example azd deploy after a code change), put them on PATH in that terminal:'
+            "    `$env:PATH = '$quoted$separator' + `$env:PATH"
+        )
+        if ($IsWindows) {
+            $lines += 'or add them to your user PATH once and open a new terminal (not with setx, which cuts a long PATH off at 1,024 characters):'
+            $lines += "    [Environment]::SetEnvironmentVariable('Path', ([Environment]::GetEnvironmentVariable('Path', 'User') + ';$quoted').Trim(';'), 'User')"
+        } else {
+            $lines += 'or add this line to your shell profile:'
+            $lines += "    export PATH=`"$($directories -join ':'):`$PATH`""
+        }
+        $script:kubernetesToolsPathHint = $lines -join [Environment]::NewLine
     }
 
     $missing = @(Test-Missing)
@@ -241,6 +261,7 @@ function Resolve-KubernetesTools {
     $missing = @(Test-Missing)
     if (-not $missing.Count) {
         Write-Host 'Using kubectl and kubelogin from an earlier az aks install-cli.'
+        Set-ToolPathHint
         return
     }
     if (-not $InstallKubernetesTools) {
@@ -249,12 +270,13 @@ function Resolve-KubernetesTools {
         if (-not $install) { throw "$($missing -join ' and ') are required. Install them with 'az aks install-cli', then rerun." }
     }
     Write-Host 'Installing kubectl and kubelogin (az aks install-cli)...'
-    # Not piped: the download progress and PATH guidance reach the terminal as az prints them.
+    # Not piped, so the download progress reaches the terminal as az prints it.
     & az aks install-cli --install-location $kubectlPath --kubelogin-install-location $kubeloginPath --only-show-errors
     if ($LASTEXITCODE -ne 0) { throw 'az aks install-cli failed. Install kubectl and kubelogin manually, then rerun.' }
     Add-ToolPath
     $missing = @(Test-Missing)
     if ($missing.Count) { throw "$($missing -join ' and ') still cannot be found after installation." }
+    Set-ToolPathHint
 }
 
 function Invoke-AzdCaptured {
@@ -439,10 +461,13 @@ $deployed = $null
 $previousDynamicInstall = $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL
 $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'yes_without_prompt'
 $previousPath = $env:PATH
+# Set when kubectl and kubelogin had to be put on PATH for this run; shown now and again after the summary.
+$kubernetesToolsPathHint = ''
 Push-Location -LiteralPath $repoRoot
 try {
     Resolve-KubernetesTools
     Write-Host 'kubectl and kubelogin are available.'
+    if ($kubernetesToolsPathHint) { Write-Host $kubernetesToolsPathHint -ForegroundColor Yellow }
 
     # -----------------------------------------------------------------------
     # 2. Sign in
@@ -692,3 +717,7 @@ try {
 
 $deployed | ConvertTo-Json -Depth 5
 if ($deployed.webUrl) { Write-Host "Open the app: $($deployed.webUrl)" -ForegroundColor Green }
+if ($kubernetesToolsPathHint) {
+    Write-Host ''
+    Write-Host $kubernetesToolsPathHint -ForegroundColor Yellow
+}

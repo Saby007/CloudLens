@@ -348,7 +348,8 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     $state.azdCalls.Clear()
     $state.roleCreates.Clear()
     $state.previewCalls = 0
-    & $script @parameters -SkipPreview | Out-Null
+    $rerunOutput = (& $script @parameters -SkipPreview 6>&1 | ForEach-Object { "$_" }) -join "`n"
+    if ($rerunOutput -match 'on your PATH') { throw 'kubectl and kubelogin were already on PATH, so the run must not suggest adding them.' }
     if (($state.azdCalls -join ',') -ne 'up:succeeded') { throw "A rerun made these azd calls instead of one azd up: $($state.azdCalls -join ',')" }
     if ($state.roleCreates.Count -ne 0) { throw 'A rerun duplicated role assignments instead of detecting the existing ones.' }
     if ($state.previewCalls -ne 0) { throw '-SkipPreview still ran the infrastructure preview.' }
@@ -390,21 +391,28 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
 
     # Missing kubectl/kubelogin: the helper asks before installing them with az aks install-cli into the
     # tools directory, -InstallKubernetesTools installs without asking, and an unattended run that cannot
-    # ask explains what to do instead of guessing.
+    # ask explains what to do instead of guessing. Tools the run had to put on PATH itself come with the
+    # commands a later plain azd needs, because the helper restores PATH when it finishes.
     $savedPath = $env:PATH
     $emptyPath = Join-Path $repoRoot 'empty-path'
     New-Item -ItemType Directory -Path $emptyPath -Force | Out-Null
+    $toolSuffix = if ($IsWindows) { '.exe' } else { '' }
+    $kubectlDirectory = Join-Path $toolsHome '.azure-kubectl'
+    $kubeloginDirectory = Join-Path $toolsHome '.azure-kubelogin'
+    $pathSeparator = [System.IO.Path]::PathSeparator
+    $sessionCommand = "`$env:PATH = '$kubectlDirectory$pathSeparator$kubeloginDirectory$pathSeparator' + `$env:PATH"
     try {
         $env:PATH = $emptyPath
         Remove-Item -Path Function:\kubectl, Function:\kubelogin
         $state.answers.Add('')
-        & $script @parameters -SkipPreview -SkipIdentityBootstrap -SkipRoleAssignments | Out-Null
+        $installedOutput = (& $script @parameters -SkipPreview -SkipIdentityBootstrap -SkipRoleAssignments 6>&1 | ForEach-Object { "$_" }) -join "`n"
         if ($state.questions.Count -ne 1 -or $state.questions[0] -notmatch 'az aks install-cli') {
             throw "Missing Kubernetes tools must be offered for installation in the terminal. Asked: $($state.questions -join ' | ')"
         }
-        $expectedInstall = "$(Join-Path (Join-Path $toolsHome '.azure-kubectl') "kubectl$(if ($IsWindows) { '.exe' })")|$(Join-Path (Join-Path $toolsHome '.azure-kubelogin') "kubelogin$(if ($IsWindows) { '.exe' })")"
+        $expectedInstall = "$(Join-Path $kubectlDirectory "kubectl$toolSuffix")|$(Join-Path $kubeloginDirectory "kubelogin$toolSuffix")"
         if (($state.installCliCalls -join ';') -ne $expectedInstall) { throw "az aks install-cli was not run once into the tools directory: $($state.installCliCalls -join ';')" }
         if ($env:PATH -ne $emptyPath) { throw 'The helper must restore PATH when it finishes.' }
+        if (-not $installedOutput.Contains($sessionCommand)) { throw "Freshly installed tools must come with the command that puts them on PATH; got: $installedOutput" }
 
         $state.questions.Clear()
         $state.installCliCalls.Clear()
@@ -418,6 +426,40 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         if ($refused -notmatch 'az aks install-cli' -or $refused -notmatch '-InstallKubernetesTools') {
             throw "A session that cannot answer must explain how to install the tools; got: $refused"
         }
+
+        # The usual state on a later run: tools from an earlier az aks install-cli that are not on PATH. They
+        # are reused without asking, and the printed command really puts them on PATH. The helper only
+        # explains the permanent fix; it must never change the user's PATH itself.
+        $kubectlFile = Join-Path $kubectlDirectory "kubectl$toolSuffix"
+        $kubeloginFile = Join-Path $kubeloginDirectory "kubelogin$toolSuffix"
+        foreach ($file in @($kubectlFile, $kubeloginFile)) {
+            New-Item -ItemType File -Path $file -Force | Out-Null
+            if (-not $IsWindows) { & chmod +x $file }
+        }
+        $state.questions.Clear()
+        $state.installCliCalls.Clear()
+        $userPathBefore = if ($IsWindows) { [Environment]::GetEnvironmentVariable('Path', 'User') } else { '' }
+        $reusedOutput = (& $script @parameters -SkipPreview -SkipIdentityBootstrap -SkipRoleAssignments 6>&1 | ForEach-Object { "$_" }) -join "`n"
+        if ($state.questions.Count -or $state.installCliCalls.Count) { throw 'Tools from an earlier install must be reused without asking or reinstalling.' }
+        if ($env:PATH -ne $emptyPath) { throw 'The helper must restore PATH when it finishes.' }
+        if ($IsWindows -and [Environment]::GetEnvironmentVariable('Path', 'User') -ne $userPathBefore) { throw 'The helper must not change the user PATH.' }
+        $hintLines = @($reusedOutput -split "`n" | ForEach-Object { $_.Trim() })
+        $printedSession = @($hintLines | Where-Object { $_.StartsWith('$env:PATH = ') })
+        # Once right after the tool check and once after the summary, so a long run does not scroll it away.
+        if ($printedSession.Count -ne 2 -or $printedSession[0] -ne $sessionCommand) {
+            throw "The run must show the PATH command for later azd runs at the start and the end; got: $reusedOutput"
+        }
+        Invoke-Expression $printedSession[0]
+        if ((Get-Command kubectl).Source -ne $kubectlFile -or (Get-Command kubelogin).Source -ne $kubeloginFile) {
+            throw 'The printed PATH command does not make kubectl and kubelogin resolvable.'
+        }
+        $env:PATH = $emptyPath
+        $printedPermanent = @($hintLines | Where-Object { $_ -match '^(\[Environment\]::SetEnvironmentVariable|export PATH=)' }) | Select-Object -First 1
+        $parseErrors = $null
+        if ($IsWindows) { [System.Management.Automation.Language.Parser]::ParseInput("$printedPermanent", [ref] $null, [ref] $parseErrors) | Out-Null }
+        if (-not $printedPermanent -or @($parseErrors).Count -or -not $printedPermanent.Contains($kubectlDirectory) -or -not $printedPermanent.Contains($kubeloginDirectory)) {
+            throw "The run must show a valid permanent PATH command for both folders; got: $printedPermanent"
+        }
     } finally {
         $env:PATH = $savedPath
         Install-KubernetesToolStubs
@@ -425,7 +467,7 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
 
     [ordered]@{ result = 'passed'; azdCalls = 'up,deploy'; roleAssignments = 6; rerunRedeploysOnce = $true
                 noHiddenPrompts = $true; azdQuestionsAskedInTerminal = $true; serviceTreeIdAskedAndRemembered = $true
-                kubernetesToolsOfferedAndInstalled = $true } | ConvertTo-Json -Compress
+                kubernetesToolsOfferedAndInstalled = $true; kubernetesToolsPathExplained = $true } | ConvertTo-Json -Compress
 } finally {
     Remove-Variable -Name deployTestState -Scope Global -ErrorAction SilentlyContinue
     Remove-Item -Path Function:\kubectl, Function:\kubelogin -ErrorAction SilentlyContinue
