@@ -85,6 +85,20 @@ it('presents one report-wide cost window beside the saved-report controls and ha
   expect(container.querySelector('[data-testid="loaded-report"]')?.getAttribute('data-window')).toBe('2026-09-04..2026-09-10');
 });
 
+it('opens on the open month to date when the daily pull has added one, with the presets one click away', async () => {
+  const dates = Array.from({ length: 34 }, (_, index) => new Date(Date.UTC(2026, 8, 1 + index)).toISOString().slice(0, 10));
+  vi.mocked(getLatestReport).mockResolvedValue({ ...snapshot, report: { ...snapshot.report, costDetails: { dates, partialPeriod: '2026-10' } } } as ReportSnapshot);
+  await act(async () => root.render(<App />));
+  const window = () => container.querySelector('[data-testid="loaded-report"]')?.getAttribute('data-window');
+  expect(window()).toBe('2026-10-01..2026-10-04');
+  expect(button('MTD').getAttribute('aria-pressed')).toBe('true');
+  await act(async () => button('30d').click());
+  expect(window()).toBe('2026-09-05..2026-10-04');
+  expect(button('MTD').getAttribute('aria-pressed')).toBe('false');
+  await act(async () => button('MTD').click());
+  expect(window()).toBe('2026-10-01..2026-10-04');
+});
+
 it('shows no cost window until a report is loaded', async () => {
   vi.mocked(getLatestReport).mockResolvedValue(null);
   await act(async () => root.render(<App />));

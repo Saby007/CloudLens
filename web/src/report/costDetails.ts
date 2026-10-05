@@ -1,6 +1,11 @@
 import type { CostDetailRow, CostDetailSummary } from './models';
 
-export type CostWindow = { startDate: string; endDate: string };
+export type CostWindow = {
+  startDate: string;
+  endDate: string;
+  // Set only on the open month to date, which compares with the same days of the previous month.
+  monthToDate?: boolean;
+};
 export type CostDimension = 'resource' | 'subscription' | 'service' | 'resourceType' | 'region' | 'resourceGroup' | 'tag';
 export type CostFilter = { subscriptionId?: string; resourceId?: string; serviceName?: string; resourceGroup?: string; region?: string; tagKey?: string; tagValue?: string; requiredTagKeys?: string };
 const DAY_MS = 86400000;
@@ -26,9 +31,46 @@ export function presetCostWindow(dates: string[], days: number): CostWindow {
   return { startDate: shiftCostDate(endDate, 1 - days), endDate };
 }
 
+/* The daily pull adds the open month through yesterday. When a report has it,
+   the page opens on that month to date so the newest days are what you see first. */
+export function monthToDateWindow(details: CostDetailSummary | undefined): CostWindow | null {
+  const period = details?.partialPeriod;
+  const latest = (details?.dates ?? []).filter(validCostDate).sort().at(-1);
+  if (!period || !/^\d{4}-\d{2}$/.test(period) || !latest || latest.slice(0, 7) !== period) return null;
+  return { startDate: `${period}-01`, endDate: latest, monthToDate: true };
+}
+
+/* The initial window for a report: the open month to date, else the last 30 days. */
+export function defaultCostWindow(details: CostDetailSummary | undefined, dates: string[]): CostWindow {
+  return monthToDateWindow(details) ?? presetCostWindow(dates, 30);
+}
+
+/* The open month to date (1-4 Oct). Other windows that happen to start on the
+   1st, such as a 7-day range ending on the 7th, keep rolling comparisons. */
+export function isMonthToDate(window: CostWindow): boolean {
+  return window.monthToDate === true && validCostDate(window.startDate) && validCostDate(window.endDate) && window.startDate.endsWith('-01')
+    && window.startDate.slice(0, 7) === window.endDate.slice(0, 7) && window.startDate <= window.endDate;
+}
+
 export function previousCostWindow(window: CostWindow): CostWindow {
+  // A month to date compares with the same days of the previous month (1-4 Oct with 1-4 Sep).
+  if (isMonthToDate(window)) {
+    const [year, month] = window.startDate.split('-').map(Number);
+    const previousYear = month === 1 ? year - 1 : year;
+    const previousMonth = month === 1 ? 12 : month - 1;
+    const lastDay = new Date(Date.UTC(previousYear, previousMonth, 0)).getUTCDate();
+    const prefix = `${previousYear}-${String(previousMonth).padStart(2, '0')}`;
+    return { startDate: `${prefix}-01`, endDate: `${prefix}-${String(Math.min(Number(window.endDate.slice(8)), lastDay)).padStart(2, '0')}` };
+  }
   const days = costWindowDates(window).length;
   return days ? { startDate: shiftCostDate(window.startDate, -days), endDate: shiftCostDate(window.startDate, -1) } : { startDate: '', endDate: '' };
+}
+
+/* The date a given day is compared with. In a month to date that is the same day of the
+   previous month, and a day the previous month lacks (30 Mar against February) has none. */
+export function comparisonDate(window: CostWindow, index: number): string {
+  const previous = previousCostWindow(window);
+  return isMonthToDate(window) ? costWindowDates(previous)[index] ?? '' : shiftCostDate(previous.startDate, index);
 }
 
 export function costTagValue(row: CostDetailRow, key: string): string | undefined {
@@ -98,7 +140,6 @@ export function compareCostGroups(details: CostDetailSummary | undefined, window
 }
 
 export function dailySubscriptionCosts(details: CostDetailSummary | undefined, window: CostWindow, filter: CostFilter = {}) {
-  const previous = previousCostWindow(window);
   const rows = details?.status === 'complete' ? details.rows.filter((row) => matchesCostFilter(row, filter)) : [];
   const subscriptions = [...new Map(rows.map((row) => [row.subscriptionId, row.subscriptionName])).entries()];
   const dates = costWindowDates(window);
@@ -109,7 +150,7 @@ export function dailySubscriptionCosts(details: CostDetailSummary | undefined, w
       for (const [day, amount] of Object.entries(row.dailyCosts)) totals.set(day, (totals.get(day) ?? 0) + amount);
     }
     return { subscriptionId, subscriptionName, days: dates.map((date, index) => {
-      const previousDate = shiftCostDate(previous.startDate, index);
+      const previousDate = comparisonDate(window, index);
       return { date, previousDate, current: available.has(date) ? totals.get(date) ?? 0 : null, previous: available.has(previousDate) ? totals.get(previousDate) ?? 0 : null };
     }) };
   });

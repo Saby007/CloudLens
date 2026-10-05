@@ -10,6 +10,14 @@ param apiPrincipalId string
 param storageSku string = 'Standard_LRS'
 @description('Explicitly approved native-export ingress exception; never bypass an Azure Policy denial.')
 param allowNativeExportTrustedServices bool = false
+@description('Days to keep daily month-to-date FOCUS snapshots (cost-exports/focus-daily/).')
+@minValue(7)
+@maxValue(365)
+param dailyExportRetentionDays int = 60
+@description('Days to keep closed-month FOCUS exports (cost-exports/focus/); covers the longest 6-month window.')
+@minValue(190)
+@maxValue(3650)
+param closedMonthRetentionDays int = 214
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: 'st${resourceToken}'
@@ -56,6 +64,36 @@ resource containers 'Microsoft.Storage/storageAccounts/blobServices/containers@2
   name: name
   properties: { publicAccess: 'None' }
 }]
+
+resource exportRetention 'Microsoft.Storage/storageAccounts/managementPolicies@2023-05-01' = {
+  parent: storage
+  name: 'default'
+  properties: {
+    policy: {
+      rules: [
+        {
+          name: 'focus-daily-snapshots'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: { blobTypes: ['blockBlob'], prefixMatch: ['cost-exports/focus-daily/'] }
+            actions: { baseBlob: { delete: { daysAfterModificationGreaterThan: dailyExportRetentionDays } } }
+          }
+        }
+        {
+          name: 'focus-closed-months'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: { blobTypes: ['blockBlob'], prefixMatch: ['cost-exports/focus/'] }
+            actions: { baseBlob: { delete: { daysAfterModificationGreaterThan: closedMonthRetentionDays } } }
+          }
+        }
+      ]
+    }
+  }
+  dependsOn: [containers]
+}
 
 resource processorIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: 'id-processor-${resourceToken}'

@@ -28,6 +28,18 @@ param logRetentionDays int = 30
 @allowed(['Standard_LRS', 'Standard_ZRS'])
 param storageSku string = 'Standard_LRS'
 param allowNativeExportTrustedServices bool = false
+@description('Days to keep daily month-to-date FOCUS snapshots under cost-exports/focus-daily/.')
+@minValue(7)
+@maxValue(365)
+param dailyExportRetentionDays int = 60
+@description('Days to keep closed-month FOCUS exports under cost-exports/focus/. Must cover the longest 6-month history window.')
+@minValue(190)
+@maxValue(3650)
+param closedMonthRetentionDays int = 214
+@description('Months each subscription may export at once. Keep 1 until Azure is confirmed to run one export\'s months in parallel.')
+@minValue(1)
+@maxValue(6)
+param exportParallelMonths int = 1
 @description('Keep false until the scheduled processor implementation is validated end to end.')
 param enableProcessor bool = false
 @description('Only set true when redeploying the same environment name after azd down without --purge left a soft-deleted AI Foundry account behind.')
@@ -35,7 +47,8 @@ param restoreAiAccount bool = false
 @description('Reuse an already-created Foundry account and deploy only its project, model, RBAC and private endpoint children.')
 param reuseAiAccount bool = false
 param processorImage string = ''
-param processorSchedule string = '*/15 * * * *'
+@description('Worker cadence. Each tick advances monthly pulls and starts daily pulls once their UTC time has passed.')
+param processorSchedule string = '*/5 * * * *'
 @minLength(2)
 @maxLength(32)
 param foundryProjectName string = 'cost-agent-project'
@@ -64,6 +77,7 @@ resource group 'Microsoft.Resources/resourceGroups@2024-03-01' = {
 
 var resourceToken = toLower(uniqueString(subscription().id, environmentName, group.name))
 var exportName = 'focus-closed-month-${resourceToken}'
+var dailyExportName = 'focus-daily-${resourceToken}'
 
 module core './modules/core.bicep' = {
   name: 'app-core'
@@ -91,6 +105,8 @@ module data './modules/data.bicep' = if (dataEnabled) {
     apiPrincipalId: core.outputs.apiIdentity.principalId
     storageSku: storageSku
     allowNativeExportTrustedServices: allowNativeExportTrustedServices
+    dailyExportRetentionDays: dailyExportRetentionDays
+    closedMonthRetentionDays: closedMonthRetentionDays
   }
 }
 
@@ -164,6 +180,8 @@ module apps './modules/apps.bicep' = if (deployApplications) {
       { name: 'REPORT_SNAPSHOT_CONTAINER', value: 'report-snapshots' }
       { name: 'CONTROL_STATE_CONTAINER', value: 'control-state' }
       { name: 'COST_EXPORT_NAME', value: exportName }
+      { name: 'COST_EXPORT_DAILY_NAME', value: dailyExportName }
+      { name: 'FOCUS_EXPORT_PARALLEL_MONTHS', value: string(exportParallelMonths) }
       { name: 'COST_EXPORT_LOCATION', value: location }
       { name: 'REPORT_PUBLIC_APP_URL', value: webOrigin }
     ]
@@ -184,6 +202,8 @@ module processor './modules/processor.bicep' = if (deployProcessor) {
     storageUrl: data!.outputs.storageUrl
     storageResourceId: data!.outputs.storageResourceId
     exportName: exportName
+    dailyExportName: dailyExportName
+    exportParallelMonths: exportParallelMonths
     schedule: processorSchedule
   }
 }
@@ -207,6 +227,7 @@ output MEGHKOSHA_OBO_MANAGED_IDENTITY_CLIENT_ID string = core.outputs.oboIdentit
 output MEGHKOSHA_OBO_MANAGED_IDENTITY_RESOURCE_ID string = core.outputs.oboIdentity.resourceId
 output MEGHKOSHA_OBO_MANAGED_IDENTITY_PRINCIPAL_ID string = core.outputs.oboIdentity.principalId
 output COST_EXPORT_NAME string = exportName
+output COST_EXPORT_DAILY_NAME string = dailyExportName
 output COST_EXPORT_STORAGE_RESOURCE_ID string = dataEnabled ? data!.outputs.storageResourceId : ''
 output AI_PROJECT_ENDPOINT string = aiProjectEndpoint
 output APP_DEPLOYMENT_STATE object = {
