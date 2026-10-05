@@ -5,11 +5,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TERRAFORM_ROOTS = ("infra", "infra/export-access", "infra/model-router")
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +36,7 @@ def test_api_container_has_an_explicit_nonroot_source_only_contract():
 
 def test_api_build_context_excludes_environment_state_and_test_data():
     patterns = (PROJECT_ROOT / "api" / ".dockerignore").read_text().splitlines()
-    assert {".venv", ".env", ".env.*", ".azure", ".git", "tests", "__pycache__"} <= set(patterns)
+    assert {".venv", ".env", ".env.*", ".azure", ".git", "tests", "manifests", "__pycache__"} <= set(patterns)
 
 
 def test_container_base_images_are_immutable_and_installer_is_patched():
@@ -64,14 +66,13 @@ def test_web_image_copies_only_built_assets_into_an_unprivileged_runtime():
     assert "COPY --from=build --chown=101:101 /app/dist/" in runtime
     assert "node_modules" not in runtime and "npm run dev" not in runtime
     patterns = set((PROJECT_ROOT / "web" / ".dockerignore").read_text().splitlines())
-    assert {"node_modules", ".env", ".env.*", "test-results", "browser"} <= patterns
+    assert {"node_modules", ".env", ".env.*", "test-results", "browser", "manifests"} <= patterns
 
 
-def test_web_proxy_preserves_bearer_challenges_without_legacy_identity_trust():
+def test_web_proxy_reaches_the_in_cluster_api_and_strips_forged_identity_headers():
     configuration = (PROJECT_ROOT / "web" / "nginx" / "default.conf.template").read_text()
-    assert "proxy_pass https://${API_HOST};" in configuration
-    assert "proxy_ssl_verify on;" in configuration
-    assert "proxy_ssl_verify_depth 3;" in configuration
+    assert "proxy_pass http://${API_HOST};" in configuration
+    assert "proxy_pass https://" not in configuration
     assert "proxy_set_header Authorization $http_authorization;" in configuration
     assert "proxy_set_header X-MS-CLIENT-PRINCIPAL '';" in configuration
     assert "proxy_set_header X-Meghkosha-User-Token '';" in configuration
@@ -81,6 +82,7 @@ def test_web_proxy_preserves_bearer_challenges_without_legacy_identity_trust():
     assert "frame-src 'self' https://login.microsoftonline.com" in configuration
     assert "$http_authorization" not in configuration.splitlines()[0]
     assert "$request_uri" not in configuration.splitlines()[0]
+    assert 'NGINX_ENVSUBST_FILTER="^API_HOST$"' in (PROJECT_ROOT / "web" / "Dockerfile").read_text()
 
 
 def test_container_smoke_is_portable_and_uses_only_synthetic_identity():
@@ -88,9 +90,12 @@ def test_container_smoke_is_portable_and_uses_only_synthetic_identity():
     result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert "--api" in result.stdout and "--web" in result.stdout
-    assert '"unavailableHttpsUpstream": "rejected"' in script.read_text()
-    assert "invalidTlsUpstream" not in script.read_text()
+    source = script.read_text()
+    assert '"proxiedApi": "passed"' in source
+    assert '"proxiedForgedIdentity": "rejected"' in source
+    assert "unavailableHttpsUpstream" not in source
     task = (script.parent / "acr-smoke.yaml").read_text()
+    assert task.count("API_HOST=phase2-api:8000") == 2
     assert "disableWorkingDirectoryOverride: true" in task
     assert "/usr/bin/python /workspace/container-smoke.py" in task
     assert "nginx -t" in task
@@ -137,17 +142,17 @@ def run_input_validation(overrides=None, operation="Local"):
 
 
 @pytest.mark.parametrize("profile", ["core", "data", "ai"])
-def test_each_profile_defaults_to_no_applications_processor_ai_runtime_or_export_exception(profile):
+def test_each_profile_defaults_to_no_processor_ai_runtime_or_export_exception(profile):
     result = run_input_validation({"APP_PROFILE": profile})
     assert result.returncode == 0, result.stderr
     settings = json.loads(result.stdout)
     assert settings["profile"] == profile
-    assert not settings["applicationImagesSupplied"]
+    assert settings["hosting"] == "aks"
+    assert settings["tlsIssuer"] == "letsencrypt"
+    assert not settings["signInConfigured"]
     assert not settings["processorEnabled"]
     assert not settings["aiRuntimeEnabled"]
     assert not settings["chatRuntimeEnabled"]
-    assert not settings["aiAccountRestored"]
-    assert not settings["aiAccountReused"]
     assert not settings["nativeExportNetworkException"]
     assert settings["cloudPreflightStillRequired"]
 
@@ -162,16 +167,23 @@ def test_azure_operations_are_blocked_without_explicit_approval(operation):
 @pytest.mark.parametrize("overrides, message", [
     ({"APP_PROFILE": "unknown"}, "APP_PROFILE must be"),
     ({"APP_PROVISIONED_PROFILE": "ai", "APP_PROFILE": "core"}, "Profile downgrade"),
-    ({"APP_APPLICATIONS_DEPLOYED": "true"}, "Do not clear deployed"),
-    ({"SERVICE_API_IMAGE_NAME": "single-image"}, "Provide both application images"),
-    ({"APP_CONTAINER_SUBNET_PREFIX": "10.42.1.0/27"}, "must not overlap"),
+    ({"APP_AKS_SUBNET_PREFIX": "10.42.1.0/27"}, "must not overlap"),
     ({"APP_PRIVATE_ENDPOINT_SUBNET_PREFIX": "10.43.0.0/27"}, "within the VNet"),
+    ({"APP_AKS_SERVICE_CIDR": "10.42.0.0/16"}, "APP_AKS_SERVICE_CIDR must not overlap the VNet"),
+    ({"APP_AKS_POD_CIDR": "10.0.0.0/16"}, "must not overlap"),
+    ({"APP_AKS_ZONES": "1,4"}, "APP_AKS_ZONES must be"),
+    ({"APP_AKS_SKU_TIER": "Basic"}, "APP_AKS_SKU_TIER must be"),
+    ({"APP_AKS_USER_VM_SIZE": "Standard_D4s_v5"}, "local temp disk"),
+    ({"APP_TLS_CLUSTER_ISSUER": "self-signed"}, "APP_TLS_CLUSTER_ISSUER must be"),
+    ({"APP_INGRESS_DNS_LABEL": "9lives"}, "APP_INGRESS_DNS_LABEL must be"),
+    ({"APP_CUSTOM_DOMAIN": "not a domain"}, "APP_CUSTOM_DOMAIN must be"),
+    ({"APP_ACME_EMAIL": "ops"}, "APP_ACME_EMAIL must be"),
+    ({"APP_ENABLE_PROCESSOR": "True"}, "must be true or false (lowercase)"),
+    ({"MEGHKOSHA_API_CLIENT_ID": "33333333-3333-3333-3333-333333333333"}, "must contain a nonzero UUID"),
     ({"APP_EXPORT_TRUSTED_SERVICES": "true"}, "not part of the core stage"),
     ({"APP_ENABLE_PROCESSOR": "true"}, "requires the data"),
     ({"APP_ENABLE_AI_RUNTIME": "true"}, "AI runtime requires"),
     ({"APP_ENABLE_CHAT_RUNTIME": "true"}, "Foundry chat requires"),
-    ({"APP_REUSE_AI_ACCOUNT": "true"}, "Foundry account reuse requires"),
-    ({"APP_PROFILE": "ai", "APP_RESTORE_AI_ACCOUNT": "true", "APP_REUSE_AI_ACCOUNT": "true"}, "restore and reuse cannot both"),
     ({"APP_MODEL_DEPLOYMENTS": "{}"}, "must be a JSON array"),
     ({"APP_PROFILE": "ai", "APP_MODEL_DEPLOYMENTS": '[{"name":"test"}]'}, "missing modelFormat"),
 ])
@@ -203,7 +215,20 @@ def test_approved_model_router_enables_chat_without_hosted_agent_narration():
     assert settings["aiRuntimeEnabled"] is False
 
 
-def test_ai_deployment_helper_plans_previewed_ai_profile_with_processor():
+def test_publish_and_deploy_require_the_provisioned_registry_and_cluster():
+    approved = {"APP_ALLOW_AZURE_CHANGES": "true"}
+    result = run_input_validation({**approved, "AZURE_CONTAINER_REGISTRY_ENDPOINT": "testapp.azurecr.io"}, "Publish")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["operation"] == "Publish"
+    result = run_input_validation(approved, "Publish")
+    assert result.returncode != 0 and "provisioned environment registry" in result.stderr
+    result = run_input_validation(approved, "Deploy")
+    assert result.returncode != 0 and "provisioned AKS cluster" in result.stderr
+    result = run_input_validation({**approved, "AZURE_AKS_CLUSTER_NAME": "aks-0123456789abc"}, "Deploy")
+    assert result.returncode == 0, result.stderr
+
+
+def test_ai_deployment_helper_plans_the_recommended_aks_profile_without_sign_in_steps():
     shell = shutil.which("pwsh")
     if not shell:
         pytest.skip("PowerShell 7.4 or later is required for deployment-helper checks")
@@ -216,8 +241,11 @@ def test_ai_deployment_helper_plans_previewed_ai_profile_with_processor():
     assert result.returncode == 0, result.stderr
     plan = json.loads(result.stdout)
     assert plan["environment"] == "fresh-ai"
+    assert plan["hosting"] == "aks"
     assert plan["preview"] is True
     assert plan["enableProcessor"] is True
+    assert plan["bootstrapIdentity"] is False
+    assert plan["roleAssignments"] is False
     assert plan["maxAttempts"] == 3
     assert plan["settings"] == {
         "AZURE_LOCATION": "centralindia",
@@ -228,28 +256,12 @@ def test_ai_deployment_helper_plans_previewed_ai_profile_with_processor():
         "APP_ENABLE_CHAT_RUNTIME": "true",
         "APP_AI_VALIDATED": "true",
         "APP_ENABLE_AI_RUNTIME": "false",
-        "APP_RESTORE_AI_ACCOUNT": "false",
-        "APP_REUSE_AI_ACCOUNT": "false",
+        "APP_ENABLE_PROCESSOR": "true",
     }
     source = script.read_text(encoding="utf-8")
-    assert "AccountProvisioningStateInvalid|Another operation is in progress" in source
-    assert "resource not found: unable to find a resource with name 'ca-(api|web)-" in source
-    assert "$deploymentActive = $text -match 'DeploymentActive'" in source
-    assert "$acrPullRace = $text -match 'unable to pull image using Managed identity'" in source
-    assert "foundryRace -or $missingApp -or $deploymentActive -or $acrPullRace" in source
-    assert "function Wait-RbacPropagation" in source
-    assert "function Wait-ActiveDeployments" in source
-    assert "function Test-AppsHealthy" in source
-    assert "function Get-WebEndpointUrl" in source
-    assert "az deployment group list" in source
-    assert "az cognitiveservices account list" in source
-    assert "az cognitiveservices account show" in source
-    assert "APP_REUSE_AI_ACCOUNT true" in source
-    assert "az resource list" not in source
-    assert "azd env list --output json" in source
-    assert "azd env select $EnvironmentName 2>$null" not in source
-    assert "azd down" not in source
-    assert "--purge" not in source
+    assert "deploy-end-to-end.ps1" in source
+    assert "SkipIdentityBootstrap = $true" in source and "SkipRoleAssignments = $true" in source
+    assert "azd down" not in source and "--purge" not in source
 
 
 def test_ai_deployment_helper_plan_supports_explicit_opt_outs():
@@ -265,6 +277,7 @@ def test_ai_deployment_helper_plan_supports_explicit_opt_outs():
     plan = json.loads(result.stdout)
     assert plan["preview"] is False
     assert plan["enableProcessor"] is False
+    assert "APP_ENABLE_PROCESSOR" not in plan["settings"]
     assert plan["maxAttempts"] == 5
 
 
@@ -295,11 +308,27 @@ function Test-Inventory([string] $Json) {
     assert json.loads(result.stdout) == {"empty": False, "present": True, "other": False}
 
 
-def test_first_publish_allows_no_existing_digests_but_requires_approved_environment_registry():
-    result = run_input_validation({"APP_ALLOW_AZURE_CHANGES": "true",
-                                   "AZURE_CONTAINER_REGISTRY_ENDPOINT": "testapp.azurecr.io"}, "Publish")
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["applicationImagesSupplied"] is False
+def run_powershell_harness(name, timeout=180):
+    shell = shutil.which("pwsh")
+    if not shell:
+        pytest.skip("PowerShell 7.4 or later is required for the deployment harnesses")
+    result = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-File", str(PROJECT_ROOT / "scripts" / "tests" / name)],
+                            capture_output=True, text=True, timeout=timeout)
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_end_to_end_helper_deploys_once_retries_and_never_hides_a_question():
+    summary = run_powershell_harness("test-deploy-end-to-end.ps1")
+    assert summary["result"] == "passed"
+    assert summary["rerunRedeploysOnce"] and summary["noHiddenPrompts"] and summary["azdQuestionsAskedInTerminal"]
+    assert summary["serviceTreeIdAskedAndRemembered"] and summary["kubernetesToolsOfferedAndInstalled"]
+
+
+def test_aks_bootstrap_hook_waits_for_rbac_and_installs_only_the_pinned_cert_manager():
+    summary = run_powershell_harness("test-aks-bootstrap.ps1")
+    assert summary == {"result": "passed", "rbacWaited": True, "checksumEnforced": True,
+                       "webhookRetried": True, "kubeconfigIsolated": True}
 
 
 @pytest.mark.parametrize("apply", [False, True])
@@ -345,216 +374,320 @@ def test_identity_bootstrap_apply_is_idempotent_against_offline_graph_transport(
     assert summary["consentFailureRecoverable"]
 
 
-def resource_map(template):
-    resources = template["resources"]
-    return resources if isinstance(resources, dict) else {str(index): resource for index, resource in enumerate(resources)}
+# ---------------------------------------------------------------------------
+# Terraform (infra/) - offline: `terraform test` runs against mocked providers.
+# ---------------------------------------------------------------------------
 
-
-def test_export_access_template_limits_roles_without_mutating_application_or_storage():
-    compiler = shutil.which("bicep") or str(Path.home() / ".azure" / "bin" / "bicep.exe")
-    if not Path(compiler).is_file():
-        pytest.skip("Standalone Bicep is required for generated-template checks")
-    result = subprocess.run([compiler, "build", str(PROJECT_ROOT / "infra" / "export-access.bicep"), "--stdout"],
-                            capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stderr
-    assert not result.stderr.strip(), result.stderr
-    template = json.loads(result.stdout)
-    resources = list(resource_map(template).values())
-    assert {resource["type"] for resource in resources} == {
-        "Microsoft.Authorization/roleDefinitions", "Microsoft.Authorization/roleAssignments", "Microsoft.Resources/deployments",
-    }
-    roles = [resource for resource in resources if resource["type"] == "Microsoft.Authorization/roleDefinitions"]
-    assert len(roles) == 3
-    expected = {
-        "Export Configurator": {"Microsoft.Authorization/permissions/read", "Microsoft.CostManagement/exports/read",
-                                "Microsoft.CostManagement/exports/write", "Microsoft.CostManagement/exports/action",
-                                "Microsoft.CostManagement/exports/run/action"},
-        "Export Executor": {"Microsoft.Authorization/permissions/read", "Microsoft.CostManagement/exports/read",
-                             "Microsoft.CostManagement/exports/action", "Microsoft.CostManagement/exports/run/action"},
-        "Export Storage Setup": {"Microsoft.Storage/storageAccounts/read", "Microsoft.Storage/storageAccounts/write",
-                                  "Microsoft.Storage/storageAccounts/blobServices/containers/read",
-                                  "Microsoft.Authorization/permissions/read", "Microsoft.Authorization/roleAssignments/read",
-                                  "Microsoft.Authorization/roleAssignments/write"},
-    }
-    for label, actions in expected.items():
-        role = next(resource["properties"] for resource in roles if label in resource["properties"]["roleName"])
-        assert role["type"] == "CustomRole"
-        assert len(role["permissions"]) == 1
-        permissions = role["permissions"][0]
-        assert set(permissions["actions"]) == actions
-        assert permissions["notActions"] == permissions["dataActions"] == permissions["notDataActions"] == []
-        assert len(role["assignableScopes"]) == 1
-        if label == "Export Storage Setup":
-            assert "Microsoft.Storage/storageAccounts" in role["assignableScopes"][0]
-        else:
-            assert role["assignableScopes"] == ["[subscription().id]"]
-    assignments = [resource for resource in resources if resource["type"] == "Microsoft.Authorization/roleAssignments"]
-    assert len(assignments) == 3
-    assert template["parameters"]["enableApiCostManagementContributor"]["defaultValue"] is False
-    compatibility = next(resource for resource in assignments if "condition" in resource)
-    assert compatibility["condition"] == "[parameters('enableApiCostManagementContributor')]"
-    assert compatibility["properties"]["principalId"] == "[parameters('apiPrincipalId')]"
-    assert compatibility["properties"]["roleDefinitionId"] == "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '434105ed-43f6-45c7-a02f-909b2ba83430')]"
-    assert "scope" not in compatibility
-    module = next(resource for resource in resources if resource["type"] == "Microsoft.Resources/deployments")
-    storage_assignments = list(resource_map(module["properties"]["template"]).values())
-    assert len(storage_assignments) == 2
-    assert template["parameters"]["enableApiStorageAccountContributor"]["defaultValue"] is False
-    assert module["properties"]["parameters"]["enableApiStorageAccountContributor"]["value"] == "[parameters('enableApiStorageAccountContributor')]"
-    storage_compatibility = next(resource for resource in storage_assignments if "condition" in resource)
-    assert storage_compatibility["condition"] == "[parameters('enableApiStorageAccountContributor')]"
-    assert storage_compatibility["properties"]["principalId"] == "[parameters('apiPrincipalId')]"
-    assert storage_compatibility["properties"]["roleDefinitionId"] == "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '17d1049b-9a84-46fb-8f53-869881c3d3ab')]"
-    assert "Microsoft.Storage/storageAccounts" in storage_compatibility["scope"]
-    assignment = next(resource for resource in storage_assignments if "condition" not in resource)
-    assert assignment["type"] == "Microsoft.Authorization/roleAssignments"
-    assert "Microsoft.Storage/storageAccounts" in assignment["scope"]
-    assert assignment["properties"]["principalId"] == "[parameters('apiPrincipalId')]"
-    assert all(resource["properties"]["principalType"] == "ServicePrincipal" for resource in assignments + storage_assignments)
+def _terraform_environment(data_dir):
+    environment = {name: value for name, value in os.environ.items() if not name.startswith(("ARM_", "TF_VAR_"))}
+    environment.update(
+        TF_IN_AUTOMATION="1",
+        TF_INPUT="0",
+        TF_DATA_DIR=str(data_dir),
+        TF_PLUGIN_CACHE_DIR=os.environ.get("TF_PLUGIN_CACHE_DIR", str(Path(tempfile.gettempdir()) / "cloudlens-terraform-plugin-cache")),
+        CHECKPOINT_DISABLE="1",
+    )
+    Path(environment["TF_PLUGIN_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+    return environment
 
 
 @pytest.fixture(scope="module")
-def compiled_profiles():
-    az = shutil.which("az")
-    if not az:
-        pytest.skip("Azure CLI (with the bicep extension) is required for generated-template checks")
-    profiles = {}
-    for profile in ("core", "data", "ai"):
-        environment = {name: value for name, value in os.environ.items()
-                       if not name.startswith(("AZURE_", "APP_", "SERVICE_", "MEGHKOSHA_", "FOUNDRY_", "MODEL_ROUTER_"))}
-        environment.update(AZURE_ENV_NAME="app-contract-test", APP_PROFILE=profile)
-        result = subprocess.run([az, "bicep", "build-params", "--file", str(PROJECT_ROOT / "infra" / "main.bicepparam"), "--stdout", "--only-show-errors"],
-                                env=environment, capture_output=True, text=True, timeout=60)
-        assert result.returncode == 0, result.stderr
-        compiled = json.loads(result.stdout)
-        profiles[profile] = (json.loads(compiled["parametersJson"]), json.loads(compiled["templateJson"]))
-    return profiles
+def terraform_roots(tmp_path_factory):
+    """Initializes a scratch copy of each Terraform root, so tests never touch infra/ or its lock files."""
+    terraform = shutil.which("terraform")
+    if not terraform:
+        pytest.skip("Terraform 1.9 or later is required for the infrastructure contract tests")
+    roots = {}
+    for root in TERRAFORM_ROOTS:
+        workspace = tmp_path_factory.mktemp(root.replace("/", "-"))
+        copy = workspace / "module"
+        shutil.copytree(PROJECT_ROOT / root, copy, ignore=shutil.ignore_patterns(".terraform", "*.tfstate*", "export-access", "model-router", "k8s"))
+        environment = _terraform_environment(workspace / "data")
+        result = subprocess.run([terraform, f"-chdir={copy}", "init", "-backend=false", "-no-color"],
+                                env=environment, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0 and re.search(r"Failed to query available provider packages|could not connect|no such host|timeout", result.stdout + result.stderr):
+            pytest.skip("Terraform providers could not be downloaded; run once with network access to fill the plugin cache")
+        assert result.returncode == 0, result.stdout + result.stderr
+        roots[root] = (copy, environment)
+    return terraform, roots
 
 
-def test_compiled_stage_defaults_are_explicit_and_safe(compiled_profiles):
-    for profile, (parameters, template) in compiled_profiles.items():
-        values = {name: item["value"] for name, item in parameters["parameters"].items()}
-        assert values["profile"] == profile
-        assert values["location"] == "centralindia"
-        assert values["foundryLocation"] == "eastus2"
-        assert values["apiImage"] == values["webImage"] == ""
-        assert values["apiClientId"] == values["webClientId"] == ""
-        assert values["modelDeployments"] == []
-        assert not any(values[name] for name in ("enableProcessor", "enableAiRuntime", "enableChatRuntime", "reuseAiAccount", "allowNativeExportTrustedServices"))
-        modules = resource_map(template)
-        assert "condition" not in modules["core"]
-        assert modules["data"]["condition"] == "[variables('dataEnabled')]"
-        assert modules["ai"]["condition"] == "[and(variables('aiEnabled'), not(parameters('reuseAiAccount')))]"
-        assert modules["existingAi"]["condition"] == "[and(variables('aiEnabled'), parameters('reuseAiAccount'))]"
-        assert modules["apps"]["condition"] == "[variables('deployApplications')]"
-        assert modules["processor"]["condition"] == "[variables('deployProcessor')]"
-        assert template["variables"]["dataEnabled"] == "[contains(createArray('data', 'ai'), parameters('profile'))]"
-        assert template["variables"]["aiEnabled"] == "[equals(parameters('profile'), 'ai')]"
+@pytest.mark.parametrize("root", TERRAFORM_ROOTS)
+def test_terraform_root_is_formatted_and_valid(terraform_roots, root):
+    terraform, roots = terraform_roots
+    copy, environment = roots[root]
+    formatted = subprocess.run([terraform, "fmt", "-check", "-recursive", "-diff", "-no-color", str(PROJECT_ROOT / root)],
+                               env=environment, capture_output=True, text=True, timeout=60)
+    assert formatted.returncode == 0, formatted.stdout + formatted.stderr
+    validated = subprocess.run([terraform, f"-chdir={copy}", "validate", "-no-color"],
+                               env=environment, capture_output=True, text=True, timeout=180)
+    assert validated.returncode == 0, validated.stdout + validated.stderr
+    assert "Warning" not in validated.stdout + validated.stderr
 
 
-def test_compiled_core_and_apps_enforce_identity_and_ingress_boundaries(compiled_profiles):
-    _, template = compiled_profiles["core"]
-    modules = resource_map(template)
-    core = list(resource_map(modules["core"]["properties"]["template"]).values())
-    core_types = {resource["type"] for resource in core}
-    assert not any(resource_type.startswith(("Microsoft.Storage/", "Microsoft.CognitiveServices/")) for resource_type in core_types)
-    registry = next(resource for resource in core if resource["type"] == "Microsoft.ContainerRegistry/registries")
-    assert registry["properties"]["adminUserEnabled"] is False
-    environment = next(resource for resource in core if resource["type"] == "Microsoft.App/managedEnvironments")
-    assert environment["properties"]["appLogsConfiguration"] == {"destination": "azure-monitor"}
-    assert "sharedKey" not in json.dumps(core)
-    apps = list(resource_map(modules["apps"]["properties"]["template"]).values())
-    api_environment = modules["apps"]["properties"]["parameters"]["apiEnvironment"]["value"]
-    assert next(item for item in api_environment if item["name"] == "FOUNDRY_CHAT_ENABLED")["value"] == "[string(and(and(variables('aiEnabled'), parameters('enableChatRuntime')), not(empty(parameters('modelRouterDeploymentName')))))]"
-    api = next(resource for resource in apps if "ca-api-" in resource["name"])
-    web = next(resource for resource in apps if "ca-web-" in resource["name"])
-    assert api["properties"]["configuration"]["ingress"]["external"] is False
-    assert web["properties"]["configuration"]["ingress"]["external"] is True
-    for app in (api, web):
-        assert app["identity"]["type"] == "UserAssigned"
-        assert app["properties"]["workloadProfileName"] == "Consumption"
-        assert app["properties"]["configuration"]["ingress"]["allowInsecure"] is False
-        assert len(app["properties"]["template"]["containers"][0]["probes"]) == 3
+@pytest.mark.parametrize("root", TERRAFORM_ROOTS)
+def test_terraform_contract_tests_pass_against_mocked_providers(terraform_roots, root):
+    terraform, roots = terraform_roots
+    copy, environment = roots[root]
+    result = subprocess.run([terraform, f"-chdir={copy}", "test", "-no-color"],
+                            env=environment, capture_output=True, text=True, timeout=900)
+    assert result.returncode == 0, result.stdout[-6000:] + result.stderr
+    assert re.search(r"Success! \d+ passed, 0 failed\.", result.stdout), result.stdout[-2000:]
 
 
-def test_compiled_data_ai_and_processor_do_not_add_queues_or_implicit_credentials(compiled_profiles):
-    _, template = compiled_profiles["ai"]
-    modules = resource_map(template)
-    data = list(resource_map(modules["data"]["properties"]["template"]).values())
-    storage = next(resource for resource in data if resource["type"] == "Microsoft.Storage/storageAccounts")
-    assert storage["properties"]["isHnsEnabled"] is False
-    assert storage["properties"]["allowSharedKeyAccess"] is False
-    assert storage["properties"]["allowBlobPublicAccess"] is False
-    assert storage["properties"]["networkAcls"]["defaultAction"] == "Deny"
-    assert storage["properties"]["publicNetworkAccess"] == "[if(parameters('allowNativeExportTrustedServices'), 'Enabled', 'Disabled')]"
-    ai = list(resource_map(modules["ai"]["properties"]["template"]).values())
-    account = next(resource for resource in ai if resource["type"] == "Microsoft.CognitiveServices/accounts")
-    assert account["location"] == "[parameters('foundryLocation')]"
-    assert account["properties"]["disableLocalAuth"] is True
-    assert account["properties"]["publicNetworkAccess"] == "Disabled"
-    endpoint = next(resource for resource in ai if resource["type"] == "Microsoft.Network/privateEndpoints")
-    assert endpoint["location"] == "[parameters('networkLocation')]"
-    existing_ai = list(resource_map(modules["existingAi"]["properties"]["template"]).values())
-    existing_account = next(resource for resource in existing_ai if resource["type"] == "Microsoft.CognitiveServices/accounts")
-    assert existing_account["existing"] is True
-    assert not {"properties", "location", "sku", "identity"}.intersection(existing_account)
-    assert any(resource["type"] == "Microsoft.CognitiveServices/accounts/projects" for resource in existing_ai)
-    existing_endpoint = next(resource for resource in existing_ai if resource["type"] == "Microsoft.Network/privateEndpoints")
-    assert any("project" in dependency for dependency in existing_endpoint.get("dependsOn", []))
-    existing_models = [resource for resource in existing_ai if resource["type"] == "Microsoft.CognitiveServices/accounts/deployments"]
-    if existing_models:
-        assert any("endpoint" in dependency for dependency in existing_models[0].get("dependsOn", []))
-    processor = list(resource_map(modules["processor"]["properties"]["template"]).values())
-    job = next(resource for resource in processor if resource["type"] == "Microsoft.App/jobs")
-    assert job["properties"]["configuration"]["triggerType"] == "Schedule"
-    assert job["properties"]["configuration"]["scheduleTriggerConfig"]["parallelism"] == 1
+def _terraform_variables():
+    source = (PROJECT_ROOT / "infra" / "variables.tf").read_text()
+    return re.findall(r'^variable "([a-z0-9_]+)"', source, re.MULTILINE)
 
 
-def test_compiled_storage_expires_daily_snapshots_sooner_than_closed_months(compiled_profiles):
-    parameters, template = compiled_profiles["data"]
-    values = {name: item["value"] for name, item in parameters["parameters"].items()}
-    assert values["dailyExportRetentionDays"] == 60 and values["closedMonthRetentionDays"] == 214
-    assert values["processorSchedule"] == "*/5 * * * *" and values["exportParallelMonths"] == 1
-    modules = resource_map(template)
-    data = list(resource_map(modules["data"]["properties"]["template"]).values())
-    policy = next(resource for resource in data if resource["type"] == "Microsoft.Storage/storageAccounts/managementPolicies")
-    rules = {rule["name"]: rule["definition"] for rule in policy["properties"]["policy"]["rules"]}
-    assert rules["focus-daily-snapshots"]["filters"]["prefixMatch"] == ["cost-exports/focus-daily/"]
-    assert rules["focus-closed-months"]["filters"]["prefixMatch"] == ["cost-exports/focus/"]
-    assert "parameters('dailyExportRetentionDays')" in json.dumps(rules["focus-daily-snapshots"]["actions"])
-    assert "parameters('closedMonthRetentionDays')" in json.dumps(rules["focus-closed-months"]["actions"])
-    api_environment = {item["name"]: item["value"] for item in modules["apps"]["properties"]["parameters"]["apiEnvironment"]["value"]}
-    assert api_environment["COST_EXPORT_DAILY_NAME"] == "[variables('dailyExportName')]"
-    assert api_environment["FOCUS_EXPORT_PARALLEL_MONTHS"] == "[string(parameters('exportParallelMonths'))]"
-    processor = list(resource_map(modules["processor"]["properties"]["template"]).values())
-    job = next(resource for resource in processor if resource["type"] == "Microsoft.App/jobs")
-    environment = {item["name"]: item["value"] for item in job["properties"]["template"]["containers"][0]["env"]}
-    assert environment["COST_EXPORT_DAILY_NAME"] == "[parameters('dailyExportName')]"
-    assert environment["FOCUS_EXPORT_PARALLEL_MONTHS"] == "[string(parameters('exportParallelMonths'))]"
+def _terraform_outputs():
+    source = (PROJECT_ROOT / "infra" / "outputs.tf").read_text()
+    return set(re.findall(r'^output "([A-Z0-9_]+)"', source, re.MULTILINE))
 
 
-def test_operational_model_router_template_only_targets_the_existing_account_child():
-    compiler = shutil.which("bicep") or str(Path.home() / ".azure" / "bin" / "bicep.exe")
-    if not Path(compiler).is_file():
-        pytest.skip("Standalone Bicep is required for generated-template checks")
-    result = subprocess.run(
-        [compiler, "build", str(PROJECT_ROOT / "infra" / "model-router.bicep"), "--stdout"],
-        capture_output=True, text=True, timeout=60,
-    )
-    assert result.returncode == 0, result.stderr
-    template = json.loads(result.stdout)
-    resources = list(resource_map(template).values())
-    assert len(resources) == 1
-    deployment = resources[0]
-    assert deployment["type"] == "Microsoft.CognitiveServices/accounts/deployments"
-    assert deployment["name"] == "[format('{0}/{1}', parameters('accountName'), 'model-router')]"
-    assert deployment["sku"] == {"name": "GlobalStandard", "capacity": 20}
-    assert deployment["properties"]["model"] == {
-        "format": "OpenAI", "name": "model-router", "version": "2025-11-18",
+def _azd_substitute(template, values):
+    # The subset of drone/envsubst that main.tfvars.json uses: ${NAME} and ${NAME=default} (default when empty).
+    def replace(match):
+        value = values.get(match.group(1), "")
+        return value if value else (match.group(3) or "")
+    return re.sub(r"\$\{([A-Z0-9_]+)(=([^}]*))?\}", replace, template)
+
+
+def test_azd_parameter_file_maps_every_terraform_variable_from_the_environment():
+    template = (PROJECT_ROOT / "infra" / "main.tfvars.json").read_text()
+    variables = _terraform_variables()
+    defaults = json.loads(_azd_substitute(template, {"AZURE_ENV_NAME": "dev"}))
+    assert sorted(defaults) == sorted(variables)
+    assert defaults["environment_name"] == "dev"
+    assert defaults["profile"] == "core" and defaults["provisioned_profile"] == ""
+    assert defaults["model_deployments"] == []
+    assert defaults["enable_processor"] == "false" and defaults["allow_native_export_trusted_services"] == "false"
+    assert defaults["processor_schedule"] == "*/5 * * * *"
+    assert defaults["aks_zones"] == "1,2,3" and defaults["aks_sku_tier"] == "Standard"
+    assert defaults["aks_system_vm_size"] == "Standard_D2ds_v5" and defaults["aks_user_vm_size"] == "Standard_D4ds_v5"
+    assert defaults["tls_cluster_issuer"] == "letsencrypt"
+    assert '"principal_id": "${AZURE_PRINCIPAL_ID}"' in template
+    for name in ("daily_export_retention_days", "closed_month_retention_days", "export_parallel_months", "log_retention_days",
+                 "aks_system_min_nodes", "aks_system_max_nodes", "aks_user_min_nodes", "aks_user_max_nodes"):
+        assert defaults[name].isdigit(), name
+    router = '[{"name":"model-router","modelFormat":"OpenAI","modelName":"model-router","modelVersion":"2025-11-18","sku":"GlobalStandard","capacity":20}]'
+    configured = json.loads(_azd_substitute(template, {"AZURE_ENV_NAME": "dev", "APP_PROFILE": "ai", "APP_MODEL_DEPLOYMENTS": router,
+                                                       "APP_AKS_ZONES": "none", "AZURE_RESOURCE_GROUP": "rg-dev"}))
+    assert configured["model_deployments"][0]["capacity"] == 20
+    assert configured["aks_zones"] == "none" and configured["resource_group_name"] == "rg-dev"
+
+
+AZD_PARAMETERS_TEST = """
+mock_provider "azurerm" {
+  mock_data "azurerm_client_config" {
+    defaults = {
+      tenant_id       = "11111111-1111-1111-1111-111111111111"
+      subscription_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      object_id       = "22222222-2222-2222-2222-222222222222"
+      client_id       = "33333333-3333-3333-3333-333333333333"
     }
-    assert deployment["properties"]["versionUpgradeOption"] == "NoAutoUpgrade"
-    all_text = json.dumps(template)
-    for forbidden in ("Microsoft.ServiceBus/", "queueServices/queues", "Microsoft.DocumentDB/", "Microsoft.Synapse/", "Microsoft.Kusto/"):
-        assert forbidden not in all_text
-    assert "passwordCredentials" not in all_text
-    assert "616dc9b8-b4aa-415f-8dcb-71bc462916c5" not in all_text
+  }
+}
+
+mock_provider "time" {}
+
+run "azd_strings_convert_to_the_declared_types" {
+  command = plan
+
+  assert {
+    condition = (
+      var.enable_processor == true && var.allow_native_export_trusted_services == true &&
+      var.enable_chat_runtime == true && var.enable_ai_runtime == false &&
+      var.daily_export_retention_days == 60 && var.closed_month_retention_days == 214 &&
+      var.aks_user_min_nodes == 2 && var.model_deployments[0].capacity == 20 &&
+      var.principal_id == "99999999-9999-9999-9999-999999999999" && var.resource_group_name == "rg-dev"
+    )
+    error_message = "azd's substituted strings did not convert to the declared variable types."
+  }
+
+  assert {
+    condition = (
+      output.APP_PROFILE == "ai" && output.APP_PROVISIONED_PROFILE == "ai" &&
+      output.FOUNDRY_CHAT_ENABLED == "true" && output.MEGHKOSHA_AI_ENABLED == "false" &&
+      output.APP_PROCESSOR_DEPLOYED == "true" && output.APP_PROCESSOR_CRON == "*/5 * * * *" &&
+      output.AZURE_AKS_NAMESPACE == "cloudlens" && output.APP_TLS_CLUSTER_ISSUER == "letsencrypt"
+    )
+    error_message = "The recommended settings must produce the outputs the manifests read."
+  }
+}
+"""
+
+
+def test_terraform_accepts_the_recommended_settings_exactly_as_azd_substitutes_them(terraform_roots, tmp_path):
+    terraform, roots = terraform_roots
+    copy, environment = roots["infra"]
+    router = '[{"name":"model-router","modelFormat":"OpenAI","modelName":"model-router","modelVersion":"2025-11-18","sku":"GlobalStandard","capacity":20}]'
+    settings = {
+        "AZURE_ENV_NAME": "dev", "AZURE_LOCATION": "centralindia", "AZURE_RESOURCE_GROUP": "rg-dev",
+        "AZURE_PRINCIPAL_ID": "99999999-9999-9999-9999-999999999999", "APP_PROFILE": "ai", "APP_PROVISIONED_PROFILE": "ai",
+        "APP_EXPORT_TRUSTED_SERVICES": "true", "APP_MODEL_DEPLOYMENTS": router, "MODEL_ROUTER_DEPLOYMENT_NAME": "model-router",
+        "APP_ENABLE_CHAT_RUNTIME": "true", "APP_AI_VALIDATED": "true", "APP_ENABLE_AI_RUNTIME": "false", "APP_ENABLE_PROCESSOR": "true",
+    }
+    parameters = tmp_path / "main.tfvars.json"
+    parameters.write_text(_azd_substitute((PROJECT_ROOT / "infra" / "main.tfvars.json").read_text(), settings))
+    tests = copy / "azd-tests"
+    tests.mkdir(exist_ok=True)
+    (tests / "azd_parameters.tftest.hcl").write_text(AZD_PARAMETERS_TEST)
+    result = subprocess.run([terraform, f"-chdir={copy}", "test", "-no-color", "-test-directory=azd-tests", f"-var-file={parameters}"],
+                            env=environment, capture_output=True, text=True, timeout=600)
+    assert result.returncode == 0, result.stdout[-6000:] + result.stderr
+    assert "Success! 1 passed, 0 failed." in result.stdout
+
+
+MANIFESTS = {
+    "api": PROJECT_ROOT / "api" / "manifests" / "api.tmpl.yaml",
+    "processor": PROJECT_ROOT / "api" / "manifests" / "processor.tmpl.yaml",
+    "web": PROJECT_ROOT / "web" / "manifests" / "web.tmpl.yaml",
+}
+SAFE_TEMPLATE_ACTIONS = (
+    r'\{\{ index \.Env "[A-Z0-9_]+" \| printf "%q" \}\}',
+    r'\{\{ or \(index \.Env "[A-Z0-9_]+"\) "[^"{}]+" \| printf "%q" \}\}',
+    r'\{\{ if eq \(index \.Env "[A-Z0-9_]+"\) "true" \}\}false\{\{ else \}\}true\{\{ end \}\}',
+)
+
+
+def test_manifest_templates_use_only_quoted_lookups_that_cannot_render_no_value():
+    for name, path in MANIFESTS.items():
+        text = path.read_text()
+        remainder = text
+        for pattern in SAFE_TEMPLATE_ACTIONS:
+            remainder = re.sub(pattern, "", remainder)
+        assert "{{" not in remainder and "}}" not in remainder, f"{name}: unsupported template action"
+        assert ".Env." not in text, f"{name}: .Env.NAME renders <no value> when unset; use index"
+    for path in (PROJECT_ROOT / "api" / "manifests").glob("*.yaml"):
+        if not path.name.endswith(".tmpl.yaml"):
+            assert "{{" not in path.read_text(), f"{path.name} is applied verbatim, so it cannot use templates"
+
+
+def test_every_value_read_by_the_manifests_and_hook_is_provided():
+    produced_by_azd = {"SERVICE_API_IMAGE_NAME", "SERVICE_WEB_IMAGE_NAME", "AZURE_SUBSCRIPTION_ID"}
+    set_by_operator = {"MEGHKOSHA_API_CLIENT_ID", "MEGHKOSHA_WEB_CLIENT_ID", "APP_ACME_EMAIL"}
+    outputs = _terraform_outputs()
+    read = set()
+    for path in MANIFESTS.values():
+        for action in re.findall(r"\{\{.*?\}\}", path.read_text()):
+            read |= set(re.findall(r'index \.Env "([A-Z0-9_]+)"', action))
+    read |= set(re.findall(r"\$\{([A-Z0-9_]+)\}", (PROJECT_ROOT / "infra" / "k8s" / "cluster-bootstrap.yaml").read_text()))
+    read |= set(re.findall(r"Get-Setting '([A-Z0-9_]+)'", (PROJECT_ROOT / "scripts" / "aks-bootstrap.ps1").read_text()))
+    missing = read - outputs - produced_by_azd - set_by_operator
+    assert not missing, f"Values nothing provides: {sorted(missing)}"
+    deploy_script = (PROJECT_ROOT / "scripts" / "deploy-end-to-end.ps1").read_text()
+    for name in set(re.findall(r"Get-AzdValue '([A-Z0-9_]+)'", deploy_script)) - produced_by_azd - set_by_operator:
+        assert name in outputs or name in {"AZURE_ENV_NAME", "APP_SERVICE_MANAGEMENT_REFERENCE"}, name
+
+
+def _container_environment(text):
+    return re.findall(r"- name: ([A-Z0-9_]+)\n\s+value:", text)
+
+
+def test_api_and_processor_receive_the_same_settings_as_the_container_apps_did():
+    api = _container_environment(MANIFESTS["api"].read_text())
+    assert sorted(api) == sorted([
+        "AZURE_CLIENT_ID", "AZURE_TENANT_ID", "MEGHKOSHA_API_CLIENT_ID", "MEGHKOSHA_WEB_CLIENT_ID",
+        "MEGHKOSHA_OBO_MANAGED_IDENTITY_CLIENT_ID", "MEGHKOSHA_ACTION_WRITES_PAUSED", "APP_PROFILE", "APP_SCHEDULER_ENABLED",
+        "MEGHKOSHA_AI_ENABLED", "FOUNDRY_CHAT_ENABLED", "AI_PROJECT_ENDPOINT", "AI_SERVICES_ENDPOINT", "AGENT_NAME",
+        "MODEL_ROUTER_DEPLOYMENT_NAME", "COST_EXPORT_STORAGE_URL", "COST_EXPORT_STORAGE_RESOURCE_ID", "COST_EXPORT_CONTAINER",
+        "REPORT_SNAPSHOT_CONTAINER", "CONTROL_STATE_CONTAINER", "COST_EXPORT_NAME", "COST_EXPORT_DAILY_NAME",
+        "FOCUS_EXPORT_PARALLEL_MONTHS", "COST_EXPORT_LOCATION", "REPORT_PUBLIC_APP_URL",
+    ])
+    processor = _container_environment(MANIFESTS["processor"].read_text())
+    assert sorted(processor) == sorted([
+        "AZURE_CLIENT_ID", "AZURE_TENANT_ID", "APP_SCHEDULER_ENABLED", "COST_EXPORT_STORAGE_URL", "COST_EXPORT_STORAGE_RESOURCE_ID",
+        "COST_EXPORT_NAME", "COST_EXPORT_DAILY_NAME", "FOCUS_EXPORT_PARALLEL_MONTHS", "COST_EXPORT_CONTAINER",
+        "CONTROL_STATE_CONTAINER", "MEGHKOSHA_AI_ENABLED",
+    ])
+    assert 'name: MEGHKOSHA_ACTION_WRITES_PAUSED\n              value: "true"' in MANIFESTS["api"].read_text()
+    assert 'name: AZURE_CLIENT_ID\n                  value: {{ index .Env "AZURE_PROCESSOR_IDENTITY_CLIENT_ID"' in MANIFESTS["processor"].read_text()
+
+
+def test_workloads_run_hardened_with_workload_identity_instead_of_secrets():
+    for name, path in MANIFESTS.items():
+        text = path.read_text()
+        assert text.count("runAsNonRoot: true") == 1, name
+        assert text.count("type: RuntimeDefault") == 1, name
+        assert text.count("allowPrivilegeEscalation: false") == 1, name
+        assert text.count("readOnlyRootFilesystem: true") == 1, name
+        assert "- ALL" in text, name
+        assert "automountServiceAccountToken: false" in text, name
+        assert "privileged: true" not in text and "hostNetwork" not in text and "hostPath" not in text, name
+        assert "secretKeyRef" not in text and "kind: Secret" not in text, name
+    api, processor, web = (MANIFESTS[key].read_text() for key in ("api", "processor", "web"))
+    for text, service_account, identity in ((api, "api", "AZURE_API_IDENTITY_CLIENT_ID"),
+                                            (processor, "processor", "AZURE_PROCESSOR_IDENTITY_CLIENT_ID")):
+        assert f"serviceAccountName: {service_account}" in text
+        assert f'azure.workload.identity/client-id: {{{{ index .Env "{identity}" | printf "%q" }}}}' in text
+        assert 'azure.workload.identity/use: "true"' in text
+    assert "azure.workload.identity" not in web
+    assert "runAsUser: 65532" in api and "runAsUser: 65532" in processor and "runAsUser: 101" in web
+    for text, path in ((api, "/api/health"), (web, "/healthz")):
+        assert text.count(f"path: {path}") == 3
+        assert "kind: PodDisruptionBudget" in text and "maxUnavailable: 1" in text
+        assert "kind: HorizontalPodAutoscaler" in text and "minReplicas: 2" in text
+        assert "\n  replicas:" not in text, "the HPA owns the replica count"
+    assert 'value: "api:8000"' in web
+    for mount in ("mountPath: /tmp", "mountPath: /etc/nginx/conf.d", "mountPath: /var/cache/nginx"):
+        assert mount in web
+
+
+def test_processor_cronjob_mirrors_the_container_apps_job_and_never_overlaps():
+    text = MANIFESTS["processor"].read_text()
+    assert 'schedule: {{ or (index .Env "APP_PROCESSOR_CRON") "*/5 * * * *" | printf "%q" }}' in text
+    assert "timeZone: Etc/UTC" in text
+    assert "concurrencyPolicy: Forbid" in text
+    assert 'suspend: {{ if eq (index .Env "APP_PROCESSOR_DEPLOYED") "true" }}false{{ else }}true{{ end }}' in text
+    assert "backoffLimit: 0" in text and "activeDeadlineSeconds: 3600" in text and "restartPolicy: Never" in text
+    assert "- jobs.scheduler" in text and "- /usr/bin/python" in text
+    assert 'image: {{ index .Env "SERVICE_API_IMAGE_NAME" | printf "%q" }}' in text
+    assert 'cpu: "1"' in text and "memory: 2Gi" in text
+
+
+def test_only_the_web_pods_reach_the_api_and_tls_comes_from_cert_manager():
+    policies = (PROJECT_ROOT / "api" / "manifests" / "10-network-policies.yaml").read_text()
+    assert "name: default-deny-ingress" in policies and "podSelector: {}" in policies
+    assert "name: api-from-web" in policies and "port: 8000" in policies
+    assert "acme.cert-manager.io/http01-solver" in policies and "port: 8089" in policies
+    assert policies.count("kubernetes.io/metadata.name: app-routing-system") == 1
+    namespace = (PROJECT_ROOT / "api" / "manifests" / "00-namespace.yaml").read_text()
+    assert "name: cloudlens" in namespace and "pod-security.kubernetes.io/enforce: baseline" in namespace
+    assert "pod-security.kubernetes.io/warn: restricted" in namespace
+    web = MANIFESTS["web"].read_text()
+    assert "kind: Ingress" in web and "secretName: web-tls" in web
+    assert 'cert-manager.io/cluster-issuer: {{ index .Env "APP_TLS_CLUSTER_ISSUER" | printf "%q" }}' in web
+    assert 'ingressClassName: {{ index .Env "APP_INGRESS_CLASS" | printf "%q" }}' in web
+    assert web.count('{{ index .Env "APP_INGRESS_HOST" | printf "%q" }}') == 2
+    assert "name: web-from-ingress" in web and "port: 8080" in web
+    assert "type: LoadBalancer" not in web + MANIFESTS["api"].read_text(), "only the ingress controller is exposed"
+    bootstrap = (PROJECT_ROOT / "infra" / "k8s" / "cluster-bootstrap.yaml").read_text()
+    assert "kind: NginxIngressController" in bootstrap
+    assert 'service.beta.kubernetes.io/azure-pip-name: "${APP_INGRESS_PUBLIC_IP_NAME}"' in bootstrap
+    assert bootstrap.count("kind: ClusterIssuer") == 2 and bootstrap.count("http01:") == 2
+    hook = (PROJECT_ROOT / "scripts" / "aks-bootstrap.ps1").read_text()
+    assert re.search(r"\$CertManagerVersion = 'v\d+\.\d+\.\d+'", hook)
+    assert re.search(r"\$CertManagerSha256 = '[a-f0-9]{64}'", hook)
+    assert "Get-FileHash" in hook and "--server-side" in hook
+
+
+def test_azure_yaml_deploys_both_services_to_the_terraform_provisioned_cluster():
+    text = (PROJECT_ROOT / "azure.yaml").read_text()
+    assert re.search(r"infra:\n  provider: terraform\n  path: infra\n  module: main", text)
+    assert text.count("host: aks") == 2
+    assert text.count("namespace: cloudlens") == 2
+    assert text.count("remoteBuild: true") == 2 and text.count("platform: linux/amd64") == 2
+    assert text.count("deploymentPath: manifests") == 2
+    assert "containerapp" not in text and "resourceName" not in text
+    assert re.search(r"postprovision:\n    shell: pwsh\n    run: \./scripts/aks-bootstrap\.ps1", text)
+    assert 'namespace         = "cloudlens"' in (PROJECT_ROOT / "infra" / "main.tf").read_text()
+    assert text.index("  api:") < text.index("  web:")
+
+
+def test_no_container_apps_or_bicep_artifacts_remain():
+    assert not list((PROJECT_ROOT / "infra").rglob("*.bicep*")) and not (PROJECT_ROOT / "infra" / "main.json").exists()
+    for path in [PROJECT_ROOT / "azure.yaml", *(PROJECT_ROOT / "scripts").glob("*.ps1"), *(PROJECT_ROOT / "infra").rglob("*.tf")]:
+        text = path.read_text(encoding="utf-8")
+        assert "az containerapp" not in text and "Microsoft.App/" not in text, path.name
+        assert "616dc9b8-b4aa-415f-8dcb-71bc462916c5" not in text, path.name

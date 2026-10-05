@@ -1,0 +1,47 @@
+# Cluster-wide setup applied by scripts/aks-bootstrap.ps1 (the azd postprovision hook) once cert-manager is ready.
+# The dollar-brace placeholders come from the azd environment; a line whose optional value is empty is dropped.
+
+# App-routing NGINX controller bound to the Terraform-owned static IP, so the app keeps its
+# <label>.<region>.cloudapp.azure.com name for the life of the environment.
+apiVersion: approuting.kubernetes.azure.com/v1alpha1
+kind: NginxIngressController
+metadata:
+  name: cloudlens
+spec:
+  ingressClassName: "${APP_INGRESS_CLASS}"
+  controllerNamePrefix: cloudlens-nginx
+  loadBalancerAnnotations:
+    service.beta.kubernetes.io/azure-pip-name: "${APP_INGRESS_PUBLIC_IP_NAME}"
+    service.beta.kubernetes.io/azure-load-balancer-resource-group: "${AZURE_RESOURCE_GROUP}"
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: "${APP_ACME_EMAIL}"
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: "${APP_INGRESS_CLASS}"
+---
+# Untrusted test certificates with far higher rate limits: set APP_TLS_CLUSTER_ISSUER=letsencrypt-staging
+# while repeatedly recreating environments.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: "${APP_ACME_EMAIL}"
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: "${APP_INGRESS_CLASS}"

@@ -1,9 +1,9 @@
 """Per-user Azure RBAC authorization for onboarded subscriptions.
 
-The Container App queries ARM/Cost Management/Resource Graph under its own managed
-identity (see arm_client.py), not the signed-in user's identity - Static Web Apps'
-"authenticated" role only proves the caller is a valid Microsoft Entra account in the
-tenant, not that they have any Azure RBAC on the subscriptions being reported on.
+The API queries ARM/Cost Management/Resource Graph under its own managed identity
+(workload identity on AKS; see arm_client.py), not the signed-in user's identity - a valid
+Microsoft Entra sign-in only proves the caller is an account in the tenant, not that they
+have any Azure RBAC on the subscriptions being reported on.
 This module enforces a conservative role policy for subscription-wide operations.
 Inherited/custom grants and unrecognized conditions remain unsupported.
 """

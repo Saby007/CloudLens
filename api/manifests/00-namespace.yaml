@@ -1,0 +1,15 @@
+# azd creates the namespace before applying these manifests; this adds the Pod Security labels.
+# baseline is enforced so cert-manager's short-lived ACME solver pods are never blocked; the app's
+# own pods satisfy the stricter restricted profile, which is warned on and audited.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloudlens
+  labels:
+    app.kubernetes.io/part-of: cloudlens
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest

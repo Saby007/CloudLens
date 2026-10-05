@@ -15,12 +15,12 @@ steps:
     disableWorkingDirectoryOverride: true
     detach: true
     env:
-      - API_HOST=phase2-api
+      - API_HOST=phase2-api:8000
   - id: nginx-configuration
     cmd: '{{.Run.Registry}}/{{.Values.webImage}} nginx -t'
     disableWorkingDirectoryOverride: true
     env:
-      - API_HOST=phase2-api
+      - API_HOST=phase2-api:8000
   - id: runtime-smoke
     cmd: '{{.Run.Registry}}/{{.Values.apiImage}} /usr/bin/python /workspace/container-smoke.py'
     retries: 3

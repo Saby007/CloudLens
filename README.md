@@ -6,6 +6,8 @@ You deploy it once into a subscription of your choice, grant it three read/cost-
 
 > This is a reference deployment intended for a single organization/tenant to run for itself. It is not a multi-tenant SaaS product — every deployment is isolated to the Azure subscription it's installed into.
 
+> This is the **AKS + Terraform** variant of CloudLens (branch `cloudlensdev`): the app runs on Azure Kubernetes Service and its infrastructure is provisioned with Terraform. The `main` branch deploys the same app to Azure Container Apps with Bicep.
+
 ## Contents
 
 - [What it does](#what-it-does)
@@ -15,6 +17,7 @@ You deploy it once into a subscription of your choice, grant it three read/cost-
 - [Prerequisites](#prerequisites)
 - [Deploying to Azure](#deploying-to-azure)
 - [The three manual role assignments](#the-three-manual-role-assignments)
+- [Running on AKS](#running-on-aks)
 - [Local development](#local-development)
 - [Security notes](#security-notes)
 
@@ -35,18 +38,22 @@ flowchart TB
     end
 
     subgraph Azure["Your Azure subscription"]
-        subgraph CAE["Container Apps environment"]
-            Web["Web container<br/>(static SPA + nginx, public HTTPS)"]
-            API["API container<br/>(FastAPI, internal ingress only)"]
+        PIP["Static public IP<br/>label.region.cloudapp.azure.com"]
+        subgraph AKS["AKS cluster (Entra ID + Azure RBAC, Azure CNI Overlay + Cilium)"]
+            Ingress["App routing NGINX ingress<br/>(TLS from cert-manager + Let's Encrypt)"]
+            subgraph NS["Namespace cloudlens"]
+                Web["web pods<br/>(static SPA + nginx)"]
+                API["api pods<br/>(FastAPI, cluster-internal only)"]
+                Processor["processor CronJob<br/>(scheduled export runner, opt-in)"]
+            end
         end
-        Processor["Processor container<br/>(scheduled export runner, opt-in)"]
 
-        subgraph Identities["Managed identities"]
+        subgraph Identities["Managed identities (workload identity, no secrets)"]
             ApiMI["API identity"]
             ProcMI["Processor identity"]
         end
 
-        ADLS["ADLS Gen2 storage<br/>control-state + cost-exports containers"]
+        Storage["Private Blob storage<br/>cost-exports, report-snapshots, control-state"]
         CM["Azure Cost Management<br/>native FOCUS export"]
         Foundry["Microsoft Foundry project<br/>(AI narration + chat, opt-in)"]
         Targets["Target subscriptions<br/>(Reader / Cost Management Contributor)"]
@@ -54,37 +61,37 @@ flowchart TB
 
     Entra["Microsoft Entra ID"]
 
-    Browser -- "delegated access_as_user token" --> Web
-    Web -- "/api reverse proxy" --> API
+    Browser -- "HTTPS" --> PIP --> Ingress --> Web
+    Web -- "/api reverse proxy (only web may reach the API)" --> API
     Browser -. "sign-in" .-> Entra
     API -. "validate bearer token" .-> Entra
-    API == "ManagedIdentityCredential" ==> ApiMI
+    API == "workload identity" ==> ApiMI
     ApiMI -- "Reader + Cost Mgmt Contributor" --> Targets
-    ApiMI -- "read/write schedule metadata" --> ADLS
+    ApiMI -- "read/write schedule metadata" --> Storage
     ApiMI -- "create/verify export" --> CM
-    Processor == "ManagedIdentityCredential" ==> ProcMI
+    Processor == "workload identity" ==> ProcMI
     ProcMI -- "Cost Mgmt Contributor" --> Targets
-    ProcMI -- "run monthly export + checkpoints" --> ADLS
-    CM -- "FOCUS CSV/gzip files" --> ADLS
-    API -- "stream + parse FOCUS files" --> ADLS
-    API -. "optional narration/chat" .-> Foundry
+    ProcMI -- "run exports + checkpoints" --> Storage
+    CM -- "FOCUS CSV/gzip files" --> Storage
+    API -- "stream + parse FOCUS files (private endpoint)" --> Storage
+    API -. "optional narration/chat (private endpoint)" .-> Foundry
 ```
 
-**Deployable profiles.** The Bicep template is additive across three profiles, so you only provision what you plan to use:
+**Deployable profiles.** The Terraform configuration in [infra/](infra) is additive across three profiles, so you only provision what you plan to use:
 
 | Profile | Adds | Use it when |
 | --- | --- | --- |
-| `core` | Network, Container Apps environment, registry, logging, API/web managed identities | You just want the foundation up, or you're not ready to run exports yet |
-| `data` | HNS-enabled ADLS Gen2 storage, private Blob/DFS endpoints, container-scoped data roles, the processor identity | You want the app to create exports and run the rolling monthly and daily pulls |
+| `core` | Network, AKS cluster (system and application node pools), container registry, logging, static ingress IP, the API identities | You just want the foundation up, or you're not ready to run exports yet |
+| `data` | Private, key-less Blob storage behind a private endpoint, retention rules, container-scoped data roles, the processor identity | You want the app to create exports and run the rolling monthly and daily pulls |
 | `ai` | A private Foundry account/project and model deployments | You want the executive-summary narrative and the Chat tab |
 
-Each profile is a superset of the previous one. Application containers only deploy once you supply built image references (see [Deploying to Azure](#deploying-to-azure)); the AI runtime and processor stay disabled until you explicitly enable them, even after the underlying infrastructure exists.
+Each profile is a superset of the previous one. Lowering an environment's profile is refused, because Terraform would delete the storage or Foundry resources the higher profile created. `azd deploy` builds and runs both containers in every profile; the AI runtime and the scheduled processor stay off until you explicitly enable them, even after the underlying infrastructure exists.
 
 ## System design
 
-**Identity and authorization.** The single-page app requests only its own API's `access_as_user` delegated scope from Entra ID — never an Azure Resource Manager scope. The API independently validates that bearer token's issuer, audience, tenant, and client before trusting it. Azure-side calls (discovering subscriptions, reading resources, creating exports) are made with the API's own **user-assigned managed identity** via `ManagedIdentityCredential`, then filtered against the signed-in user's own Azure RBAC role on each subscription — so a user only ever sees subscriptions they themselves have access to, not everything the identity can reach.
+**Identity and authorization.** The single-page app requests only its own API's `access_as_user` delegated scope from Entra ID — never an Azure Resource Manager scope. The API independently validates that bearer token's issuer, audience, tenant, and client before trusting it. Azure-side calls (discovering subscriptions, reading resources, creating exports) are made with the API's own **user-assigned managed identity** via `ManagedIdentityCredential` (workload identity on AKS), then filtered against the signed-in user's own Azure RBAC role on each subscription — so a user only ever sees subscriptions they themselves have access to, not everything the identity can reach.
 
-**Export creation and scheduling.** Once a target subscription's Reader and Cost Management Contributor grants are visible to the API identity, opening **Schedules** automatically creates two native FOCUS exports (CSV/gzip, partitioned, overwrite-enabled) in the deployment's own storage account — closed months under `cost-exports/focus/` and daily month-to-date snapshots under `cost-exports/focus-daily/` — and saves an active schedule — no manual export configuration step is required. Each schedule keeps 3–6 closed months of history (default 6; anomaly detection needs at least 60 days). **Export** re-pulls that whole window. On the schedule's monthly day the worker pulls only closed months that have no copy taken after Azure finalized them (Azure adds late charges for up to 72 hours after a month ends), which is normally just the month that closed. Every day after the schedule's UTC daily-pull time it also pulls the current month through yesterday, plus last month during the first five days. A separate **processor** identity (kept intentionally distinct from the API identity) runs these export executions every 5 minutes (`APP_PROCESSOR_CRON`), checkpointing progress per subscription so a restart or a missed tick doesn't re-run months that already succeeded. A month that finishes is followed by the next one in the same tick; throttled requests wait as long as Azure asks (1–15 minutes) without counting as failures, and `APP_EXPORT_PARALLEL_MONTHS` (default 1) sets how many months run at once.
+**Export creation and scheduling.** Once a target subscription's Reader and Cost Management Contributor grants are visible to the API identity, opening **Schedules** automatically creates two native FOCUS exports (CSV/gzip, partitioned, overwrite-enabled) in the deployment's own storage account — closed months under `cost-exports/focus/` and daily month-to-date snapshots under `cost-exports/focus-daily/` — and saves an active schedule — no manual export configuration step is required. Each schedule keeps 3–6 closed months of history (default 6; anomaly detection needs at least 60 days). **Export** re-pulls that whole window. On the schedule's monthly day the worker pulls only closed months that have no copy taken after Azure finalized them (Azure adds late charges for up to 72 hours after a month ends), which is normally just the month that closed. Every day after the schedule's UTC daily-pull time it also pulls the current month through yesterday, plus last month during the first five days. A separate **processor** identity (kept intentionally distinct from the API identity) runs these export executions from a Kubernetes CronJob every 5 minutes (`APP_PROCESSOR_CRON`), checkpointing progress per subscription so a restart or a missed tick doesn't re-run months that already succeeded. A month that finishes is followed by the next one in the same tick; throttled requests wait as long as Azure asks (1–15 minutes) without counting as failures, and `APP_EXPORT_PARALLEL_MONTHS` (default 1) sets how many months run at once.
 
 **Retention.** Storage lifecycle rules delete daily snapshots after 60 days (`APP_DAILY_EXPORT_RETENTION_DAYS`) and closed-month files after 214 days (`APP_CLOSED_MONTH_RETENTION_DAYS`, at least 190 so the longest 6-month window is always covered). Reports read history from the files that remain: the month to date appears in daily views as an estimate and is left out of monthly totals until the month closes.
 
@@ -114,36 +121,54 @@ Two other top-level views round out the app:
 
 ## Prerequisites
 
-The subscription you deploy CloudLens **into** must have the [`Microsoft.CostManagementExports` resource provider](https://learn.microsoft.com/azure/azure-resource-manager/management/resource-providers-and-types) registered. Azure Cost Management uses it to reach the export destination storage account that this deployment creates. Register it once, before your first deployment:
+**Tools** on the machine you deploy from — no local Docker is needed, the images are built in Azure Container Registry:
+
+- [git](https://git-scm.com/) and **PowerShell 7+** (`pwsh`); the deployment hook and helper scripts are PowerShell.
+- The [Azure CLI](https://learn.microsoft.com/cli/azure/), signed in with `az login`. Terraform authenticates through it, not through azd.
+- The [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/) 1.32 or later.
+- [Terraform](https://developer.hashicorp.com/terraform/install) 1.9 or later (for example `winget install Hashicorp.Terraform`).
+- **kubectl** and **kubelogin**. `az aks install-cli` installs both; the one-command script offers to run it for you.
+
+**Permissions.** Owner (or Contributor plus User Access Administrator) on the subscription you deploy into: Terraform creates role assignments for the app's identities and makes you an administrator of the new cluster. The three per-subscription role assignments described [below](#the-three-manual-role-assignments) need Owner or User Access Administrator on each subscription you assess.
+
+**vCPU quota.** The default node pools use Ddsv5 virtual machines: two `Standard_D2ds_v5` system nodes and two `Standard_D4ds_v5` application nodes — 12 vCPUs of the *Standard DDSv5 Family* quota, growing to 26 at the autoscaler maximum. Check with `az vm list-usage --location centralindia --output table`, or pick other sizes (see [Settings](#settings)).
+
+**Resource providers.** The first `azd provision` registers the resource providers this deployment needs, including the [`Microsoft.CostManagementExports` resource provider](https://learn.microsoft.com/azure/azure-resource-manager/management/resource-providers-and-types) that Azure Cost Management uses to reach the export destination storage account. Registering requires **Contributor** or **Owner** on the subscription. If your account can't register providers, have an administrator run this once, before your first deployment:
 
 ```powershell
 az provider register --namespace Microsoft.CostManagementExports --subscription <subscription-id>
 ```
 
-Registration usually completes in under a minute. Confirm it reports `Registered` before deploying:
+Registration usually completes in under a minute. Confirm it reports `Registered`:
 
 ```powershell
 az provider show --namespace Microsoft.CostManagementExports --subscription <subscription-id> --query registrationState -o tsv
 ```
 
-**Register the subscription that hosts the export destination storage account** — that is, the subscription you deploy this app into. The subscriptions you only *assess* do not need it, so a deployment can happily export cost data for an unregistered subscription as long as its own storage account lives in a registered one. Registering requires **Contributor** or **Owner** on that subscription.
+**Register the subscription that hosts the export destination storage account** — that is, the subscription you deploy this app into. The subscriptions you only *assess* do not need it, so a deployment can happily export cost data for an unregistered subscription as long as its own storage account lives in a registered one.
 
 > Creating an export in the Azure portal registers this provider for you automatically, but CloudLens creates its export through the [Cost Management REST API](https://learn.microsoft.com/rest/api/cost-management/exports/create-or-update), which does not. If the provider is missing, Azure rejects the export-creation call with `400 Bad Request`, the **Schedules** tab shows **Export status unavailable** with *"FOCUS export configuration could not be confirmed"*, and no export is ever created — regardless of how correct your role assignments and storage firewall settings are. Registering the provider and then using **Refresh schedules** resolves it; nothing needs redeploying.
 
 ## Deploying to Azure
 
-There are three ways to deploy: one command that does the whole thing, the step-by-step Azure Developer CLI workflow, or a portal-button path (ARM/Bicep templates can only reference already-built container images — they cannot build code from a repository by themselves).
+There are two ways to deploy: one command that does the whole thing, or the step-by-step Azure Developer CLI workflow. Both use [azure.yaml](azure.yaml), and one `azd up` does all of this:
+
+1. **`azd provision` runs Terraform** ([infra/](infra)): resource group, network, AKS cluster, container registry, Log Analytics, managed identities with their workload-identity federation, and — per profile — the export storage and the Foundry account. Terraform state is kept in `.azure/<environment>/infra/`.
+2. **The postprovision hook** ([scripts/aks-bootstrap.ps1](scripts/aks-bootstrap.ps1)) prepares the cluster: it installs a pinned, checksum-verified cert-manager release, creates an app-routing NGINX ingress controller on the Terraform-owned static IP, and adds the Let's Encrypt issuers. It is safe to rerun.
+3. **`azd deploy`** builds both container images remotely in Azure Container Registry, then applies [api/manifests](api/manifests) and [web/manifests](web/manifests) to the `cloudlens` namespace and waits for the rollout.
+4. **cert-manager** obtains the Let's Encrypt certificate for the app's host name, usually within a minute or two, and renews it automatically.
+
+The app is then served at `https://<label>.<region>.cloudapp.azure.com` (the `APP_WEB_ORIGIN` value in the azd environment), or at your own domain once you [add one](#https-and-custom-domains).
 
 ### Option 1 — One command, end to end (recommended)
 
-`scripts/deploy-end-to-end.ps1` is this entire page in a single self-contained script: clone, sign in, environment settings, preview, the repeated `azd up` passes with automatic retries, the scheduled processor, `bootstrap-identity.ps1` plus the client-ID redeploy, and the three role assignments on every subscription you name. When it finishes, the app is deployed, sign-in works, and the subscriptions you listed are ready to assess — no manual follow-up steps.
-
-Requires [git](https://git-scm.com/), the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/), the [Azure CLI](https://learn.microsoft.com/cli/azure/), **PowerShell 7+** (`pwsh`), and the [provider registration above](#prerequisites).
+`scripts/deploy-end-to-end.ps1` is this entire page in a single self-contained script: prerequisites, sign-in, environment settings, the Terraform preview, `azd up` with automatic retries, `bootstrap-identity.ps1` plus the client-ID rollout, and the three role assignments on every subscription you name. When it finishes, the app is deployed, sign-in works, and the subscriptions you listed are ready to assess — no manual follow-up steps.
 
 ```powershell
-git clone https://github.com/Saby007/CloudLens.git
+git clone --branch cloudlensdev https://github.com/Saby007/CloudLens.git
 cd CloudLens
 azd auth login
+az login
 pwsh ./scripts/deploy-end-to-end.ps1 `
   -EnvironmentName my-environment `
   -Location centralindia `
@@ -152,45 +177,43 @@ pwsh ./scripts/deploy-end-to-end.ps1 `
 
 `-TargetSubscriptionId` takes a comma-separated list (or several values) so one run can grant access to every subscription you want to assess; omit it and only the subscription you deploy into is granted. The deployment subscription itself defaults to the Azure CLI's current one — pass `-SubscriptionId` to deploy somewhere else. The script pins that subscription into the azd environment and into every `az` lookup, so no step stops to prompt you halfway through a long run.
 
-**Expect the run to take roughly 30–60 minutes, and expect it to retry itself.** A brand-new environment reliably hits one or more of [the four known transient errors](#known-transient-azd-up-errors) — the Foundry account still settling in `Accepted`, the container images landing after infrastructure planning, a still-active ARM deployment, or the ACR data plane lagging behind its AcrPull grant. The script recognizes each one, applies the documented fix (including switching to `APP_REUSE_AI_ACCOUNT=true`), waits, and retries. Warnings like *"The AI Foundry account is still settling"* are normal progress, not failures. Raise `-MaxAttempts` (default 3) if a slow subscription needs more passes.
+**Expect the first run to take roughly 30–45 minutes** — creating the cluster alone takes 10–15 minutes. A failed `azd up` or `azd deploy` is retried after a wait (`-MaxAttempts`, default 3). The usual reasons on a brand-new environment are a role assignment that hasn't reached Azure or the cluster yet, or Azure still finishing an earlier operation on the cluster or the Foundry account; warnings about them are normal progress, not failures. Every phase is idempotent, so a run that stops partway can simply be rerun — it reapplies the current code once and skips whatever is already in place.
 
-Every phase is idempotent, so a run that stops partway can simply be rerun — it redeploys the current code once and then skips whatever is already settled, without deleting the environment. Because the run is long, prefer a terminal that won't be closed or recycled underneath it.
-
-**The run never waits on a question you can't see.** Every `azd` command runs with `--no-prompt`, so a new environment is created and becomes the folder's default azd environment without asking. If `azd` still needs an answer, the script reruns that command in the terminal so you can answer it. If your tenant requires a Service Tree ID on the sign-in app registrations, the script asks for it there too.
+**The run never waits on a question you can't see.** Every `azd` command runs with `--no-prompt`, so a new environment is created and becomes the folder's default azd environment without asking. If `azd` still needs an answer, the script reruns that command in the terminal so you can answer it. If kubectl or kubelogin is missing, or your tenant requires a Service Tree ID on the sign-in app registrations, the script asks there too.
 
 | Switch | Use it when |
 | --- | --- |
 | `-PlanOnly` | Print exactly what would happen without touching Azure. |
 | `-SubscriptionId` | Deploy into a subscription other than the Azure CLI's current one. |
-| `-MaxAttempts` | Allow more `azd up` retries (default 3). |
+| `-MaxAttempts` | Allow more retries (default 3). |
+| `-InstallKubernetesTools` | Install kubectl and kubelogin with `az aks install-cli` without asking. |
+| `-AcmeEmail` | Register a contact address with Let's Encrypt for the TLS certificate. |
 | `-SkipIdentityBootstrap` | A separate Entra administrator creates the app registrations. |
 | `-ServiceManagementReference` | Your tenant requires a Service Tree ID on app registrations. If you leave it out, the script asks when the tenant refuses, suggests the ID your existing registrations use, and remembers your answer. |
 | `-SkipRoleAssignments` | A subscription Owner grants the three roles separately. |
-| `-SkipProcessor` | Scheduled exports are intentionally out of scope. |
-| `-SkipPreview` | Skip `azd provision --preview` on a rerun you have already reviewed. |
+| `-SkipProcessor` | Scheduled exports are intentionally out of scope (the processor setting is left as it is). |
+| `-SkipPreview` | Skip `azd provision --preview` (the Terraform plan) on a rerun you have already reviewed. |
 
 ### Option 2 — Azure Developer CLI, step by step
 
-Use this when you want to drive each stage yourself. Requires the same tooling as Option 1, plus the [provider registration above](#prerequisites). Clone the repo first — `azd` reads `azure.yaml`/`infra/`/`api/`/`web/` from your local copy, it doesn't deploy directly from GitHub:
+Use this when you want to drive each stage yourself. Clone the `cloudlensdev` branch first — `azd` reads `azure.yaml`/`infra/`/`api/`/`web/` from your local copy:
 
 ```powershell
-git clone https://github.com/Saby007/CloudLens.git
+git clone --branch cloudlensdev https://github.com/Saby007/CloudLens.git
 cd CloudLens
 azd auth login
+az login
 pwsh ./scripts/deploy-ai.ps1 -EnvironmentName my-environment -Location centralindia
 ```
 
-The helper previews before deploying, configures the recommended `ai` profile, deploys the app-local Model Router, builds remotely in ACR, retries only the known Foundry-readiness and first-image-handoff conditions, enables the scheduled processor after the API image exists, and verifies `/api/health`. Use `-SkipProcessor` only when schedules are intentionally out of scope.
+The helper is Option 1 without its sign-in and role-assignment phases: it checks the tools, applies the recommended `ai` profile with the app-local Model Router and the scheduled processor, previews the Terraform plan, and runs `azd up` with the same retries. You then do [step 4 (sign-in)](#4-configure-sign-in) and [step 5 (role assignments)](#5-grant-access-to-the-subscriptions-you-want-to-assess) yourself.
 
-Unlike Option 1, this helper stops once the app is running — you still do [step 4 (sign-in)](#4-configure-sign-in) and [step 5 (role assignments)](#5-grant-access-to-the-subscriptions-you-want-to-assess) yourself.
-
-The equivalent settings applied by the helper are:
+The equivalent raw commands are:
 
 ```powershell
 $modelRouter = '[{"name":"model-router","modelFormat":"OpenAI","modelName":"model-router","modelVersion":"2025-11-18","sku":"GlobalStandard","capacity":20}]'
 
-azd env new my-environment
-azd env set AZURE_LOCATION centralindia
+azd env new my-environment --location centralindia
 azd env set APP_PROFILE ai
 azd env set APP_EXPORT_TRUSTED_SERVICES true
 azd env set APP_MODEL_DEPLOYMENTS $modelRouter
@@ -198,136 +221,24 @@ azd env set MODEL_ROUTER_DEPLOYMENT_NAME model-router
 azd env set APP_ENABLE_CHAT_RUNTIME true
 azd env set APP_AI_VALIDATED true
 azd env set APP_ENABLE_AI_RUNTIME false
+azd env set APP_ENABLE_PROCESSOR true
 azd provision --preview
 azd up
 ```
 
-Set every value above before the first `azd up`. `APP_PROFILE=ai` includes the data/export infrastructure and adds the deployment's own private Foundry project and Model Router. `APP_ENABLE_AI_RUNTIME=false` keeps the separate hosted-agent Executive Summary narrator disabled; Chat still uses Model Router, while deterministic API/FOCUS code remains responsible for rankings, amounts, and other quantitative facts.
+Boolean settings must be lowercase `true` or `false`. Re-running `azd up` (or `azd deploy` alone, for code changes) later updates the deployment in place.
 
-`azd up` provisions the infrastructure, including the app-specific `cost-agent-project` and `model-router` deployment for the `ai` profile, builds both container images **remotely in Azure Container Registry** (no local Docker or Podman needed — [azd's `remoteBuild` option](https://learn.microsoft.com/azure/developer/azure-developer-cli/azd-schema#docker) is enabled in this repo's [azure.yaml](azure.yaml)), pushes them, and deploys the running app.
+If you intentionally want exports without Foundry chat, set `APP_PROFILE=data` and omit the five Model Router/chat settings. That is an opt-out path, not the recommended deployment.
 
-#### Known transient `azd up` errors
+For both `data` and `ai`, keep `APP_EXPORT_TRUSTED_SERVICES=true` — otherwise the storage account's network rules keep `bypass` at `None`, which blocks Cost Management's export-creation call (the Schedules tab always shows **Export status unavailable**, regardless of subscription type or RBAC grants, until this is set).
 
-> **A brand-new environment can require repeated `azd up` runs. Do not delete the environment between retries.** These are all transient — both helpers detect and retry all four automatically; if you're running raw `azd up`, three of them just need a plain rerun, but the Foundry `Accepted` race needs one extra manual step from its **second** failure onward:
->
-> | Error you see | Cause | What to do |
-> | --- | --- | --- |
-> | `resource not found: unable to find a resource with name 'ca-api-...'`/`'ca-web-...'` | The first pass provisions infrastructure and builds images in parallel; [main.bicep](infra/main.bicep) creates `ca-api-*`/`ca-web-*` only after those image names exist, and provisioning usually finishes before the remote image build does. | Just rerun `azd up`. The image names are now persisted in `azd env`, so this time Bicep creates the apps. |
-> | `RequestConflict`/`AccountProvisioningStateInvalid` (`Accepted`) — **first occurrence** | The new AI Foundry account briefly stays `Accepted` while Azure finishes provisioning it. | Just rerun `azd up` once it reaches `Succeeded` (`az cognitiveservices account show -n <account> -g <resource-group> --query properties.provisioningState`). |
-> | Same `RequestConflict`/`AccountProvisioningStateInvalid` — **still failing on the second+ retry** | Plain `azd up` re-declares (re-PUTs) the Cognitive Services account on **every** attempt, even with no changes — that PUT itself resets an already-`Succeeded` account back into a brief `Accepted` window right before the project/private-endpoint steps run, so a bare rerun can fail the same way indefinitely. | Run `azd env set APP_REUSE_AI_ACCOUNT true` once for this environment, then rerun `azd up`. This switches the project/model/private-endpoint resources to *reference* the existing account instead of re-declaring it, so it's never PUT again. |
-> | `... cannot be saved, because this would overwrite an existing deployment which is still active` (`DeploymentActive`) | ARM keeps executing the previous `azd up`'s deployment graph even after its CLI process reported an error; retrying immediately can collide with that still-finishing deployment. | Wait roughly a minute for the prior deployment to finish, then rerun. |
-> | `unable to pull image using Managed identity ... for registry ...` (usually on `Container App Job`) | The AcrPull role assignment for the processor's managed identity is granted in ARM immediately, but the registry's own data-plane authorization cache can lag behind by up to ~2 minutes. | Wait roughly 1–2 minutes for the role assignment to propagate, then rerun. |
->
-> None of these require deleting the environment, the resource group, or setting `APP_RESTORE_AI_ACCOUNT=true` — that flag is unrelated (see the Troubleshooting section below) and setting it here makes things worse, not better.
+> This grants Azure's own "trusted Microsoft services" exception (`Microsoft.CostManagementExports`) on the storage account's firewall — it's scoped to first-party Azure services, not a public network opening, and is required for native FOCUS exports to reach a firewalled/private-endpoint-only storage account at all. In tenants with central governance policies (for example `StorageAccount_PublicNetwork_Modify`), `publicNetworkAccess` may still end up `Disabled` regardless of `APP_EXPORT_TRUSTED_SERVICES` — that's expected and fine; the `AzureServices` bypass is what actually matters.
 
-If deploying with raw `azd up` instead of the helper, verify image handoff after a failed or partial first pass:
+> If `azd up`/`azd provision` crashes with a Go panic mentioning `HooksMiddleware`, that's a known `azd` bug ([azure-dev#10037](https://github.com/Azure/azure-dev/issues/10037)) unrelated to this repo — upgrade `azd` (`azd version` to check, then reinstall the latest).
 
-```powershell
-azd env get-value SERVICE_API_IMAGE_NAME
-azd env get-value SERVICE_WEB_IMAGE_NAME
-azd up
-```
+### Then, for Option 2
 
-If either image key is not set yet, rerun `azd up`; remote packaging will populate it.
-
-If you intentionally want exports without Foundry chat, set `APP_PROFILE=data` and omit the five Model Router/chat settings. That is an opt-out path, not the recommended MeghKoshaAI/CloudLens deployment.
-
-For both `data` and `ai`, keep `APP_EXPORT_TRUSTED_SERVICES=true` — [modules/data.bicep](infra/modules/data.bicep) otherwise leaves the storage account's `networkAcls.bypass` at `'None'`, which blocks Cost Management's export-creation call (it always shows **Export status unavailable**, regardless of subscription type or RBAC grants, until this is set).
-
-> This grants Azure's own "trusted Microsoft services" exception (`Microsoft.CostManagementExports`) on the storage account's firewall — it's scoped to first-party Azure services, not a public network opening, and is required for native FOCUS exports to reach a firewalled/private-endpoint-only storage account at all. If your environment already exists without this set, apply it directly: `az storage account update -n <storage-account> -g <resource-group> --bypass AzureServices --default-action Deny`, then reload the Schedules tab.
-
-> The export storage account is plain Blob storage (`isHnsEnabled: false`), not ADLS Gen2 — this matches every prior environment (Dev, Phase1) that has reliably created FOCUS exports. An earlier revision of this repo briefly enabled the hierarchical namespace and fully disabled `publicNetworkAccess`; that combination is untested with Cost Management's export-creation call and is not required by Microsoft's own documented firewall setup (`networkAcls.defaultAction: Deny` + `bypass: AzureServices` is sufficient). Note that in tenants with central governance policies (for example `StorageAccount_PublicNetwork_Modify`), `publicNetworkAccess` may still end up `Disabled` regardless of `APP_EXPORT_TRUSTED_SERVICES` — that's expected and fine; the `AzureServices` bypass is what actually matters, not the `publicNetworkAccess` value itself.
-
-The helper enables the scheduled FOCUS worker automatically once `SERVICE_API_IMAGE_NAME` exists. When using raw `azd up`, point the processor at the **same image `azd` built for the API service** after the first image publication:
-
-```powershell
-azd env set APP_ENABLE_PROCESSOR true
-azd env set SERVICE_PROCESSOR_IMAGE_NAME (azd env get-value SERVICE_API_IMAGE_NAME)
-azd up
-```
-
-Re-running `azd up` (or `azd deploy` alone) later picks up any code changes and updates the deployment in place.
-
-> If `azd up`/`azd provision` crashes with a Go panic mentioning `HooksMiddleware`, that's a known `azd` bug ([azure-dev#10037](https://github.com/Azure/azure-dev/issues/10037)) unrelated to this repo — try upgrading `azd` (`azd version` to check, then reinstall the latest). If it persists, use Option 3 below instead.
-
-### Troubleshooting: `azd up` fails on the AI Foundry account
-
-These two errors are opposites of each other — only act on whichever one you actually see, and only for the environment name that's currently failing:
-
-- **`FlagMustBeSetForRestore`** (`Microsoft.CognitiveServices/accounts` soft-deleted): a prior `azd down` on this *same* environment name left the AI Foundry account soft-deleted instead of purged. Fix it and retry:
-  ```powershell
-  azd env set APP_RESTORE_AI_ACCOUNT true
-  azd up
-  ```
-- **`CanNotRestoreANonExistingResource`**: `APP_RESTORE_AI_ACCOUNT` is set to `true` on an environment that has nothing to restore — almost always because it was left set from a previous environment, or copied from another `.env`. Fix it and retry:
-  ```powershell
-  azd env set APP_RESTORE_AI_ACCOUNT false
-  azd up
-  ```
-
-`APP_RESTORE_AI_ACCOUNT` defaults to `false` and is **not** part of the normal setup sequence above — it only matters when one of these two specific errors shows up, and it's scoped per environment (`azd env new` does not carry it over), so re-check it explicitly rather than assuming its value from a prior environment.
-
-### Option 3 — Azure portal button (no CLI tooling required)
-
-
-> **The Deploy to Azure button below only provisions infrastructure** — a resource group, network, Container Apps environment, container registry, and managed identities. It does **not** build or run the application by itself. You click the button **twice** in total (steps 1 and 3 — step 2 is just two terminal commands, no portal interaction): the second click reuses the **same environment name**, so it updates your existing deployment instead of creating a new one.
-
-#### 1. Deploy the foundation
-
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FSaby007%2FCloudLens%2Fmain%2Finfra%2Fmain.json)
-
-Clicking the button opens the Azure portal's subscription-scope custom deployment experience against this repo's [ARM template](infra/main.json) (compiled from [main.bicep](infra/main.bicep)). Pick the target subscription, choose an **environment name** (write it down — you'll reuse it in step 3) and a **profile** (`core`, `data`, or `ai`), leave `apiImage`/`webImage` blank, and provision. If you picked `data` or `ai`, also set **`allowNativeExportTrustedServices`** to `true` — otherwise the storage account's firewall never grants Cost Management's export-creation call an exception, and the Schedules tab will permanently show **Export status unavailable** no matter what subscription or RBAC grants you have.
-
-When it finishes, open the deployment's **Outputs** tab and note:
-
-- `AZURE_RESOURCE_GROUP`
-- `AZURE_CONTAINER_REGISTRY_NAME`
-- `AZURE_CONTAINER_REGISTRY_ENDPOINT`
-
-#### 2. Push the code as container images
-
-Step 1 created an Azure Container Registry (ACR) but left it empty — this step builds [api/Dockerfile](api/Dockerfile) and [web/Dockerfile](web/Dockerfile) from this repo and pushes them into it.
-
-**No local Docker needed — build directly in ACR:**
-
-```powershell
-az acr build --registry <AZURE_CONTAINER_REGISTRY_NAME> --image cost-app/api:latest --file api/Dockerfile ./api
-az acr build --registry <AZURE_CONTAINER_REGISTRY_NAME> --image cost-app/web:latest --file web/Dockerfile ./web
-```
-
-**Or, with local Docker installed:**
-
-```powershell
-az acr login --name <AZURE_CONTAINER_REGISTRY_NAME>
-docker build -t <AZURE_CONTAINER_REGISTRY_ENDPOINT>/cost-app/api:latest -f api/Dockerfile ./api
-docker build -t <AZURE_CONTAINER_REGISTRY_ENDPOINT>/cost-app/web:latest -f web/Dockerfile ./web
-docker push <AZURE_CONTAINER_REGISTRY_ENDPOINT>/cost-app/api:latest
-docker push <AZURE_CONTAINER_REGISTRY_ENDPOINT>/cost-app/web:latest
-```
-
-#### 3. Point the deployment at your images
-
-Re-run the **same** deployment — same `environmentName` (and `resourceGroupName`, if you set one) as step 1 — this time supplying the images you just pushed, so it updates the existing resources in place rather than creating new ones.
-
-**Portal:** Use the Deploy to Azure button again with identical `environmentName`/`profile`, and fill in:
-
-- `apiImage`: `<AZURE_CONTAINER_REGISTRY_ENDPOINT>/cost-app/api:latest`
-- `webImage`: `<AZURE_CONTAINER_REGISTRY_ENDPOINT>/cost-app/web:latest`
-
-**CLI:**
-
-```powershell
-az deployment sub create --location <location> --template-file infra/main.json `
-  --parameters environmentName=<same-environment-name> profile=<same-profile> `
-  apiImage=<AZURE_CONTAINER_REGISTRY_ENDPOINT>/cost-app/api:latest `
-  webImage=<AZURE_CONTAINER_REGISTRY_ENDPOINT>/cost-app/web:latest
-```
-
-Both containers only start once **both** image parameters are non-empty. Wait for the two Container Apps (`ca-api-*`, `ca-web-*`) to report **Running** before continuing.
-
-### Then, for Options 2 and 3
-
-> Option 1 already did both of these steps for you. Continue here only if you deployed with Option 2 or Option 3.
+> Option 1 already did both of these steps for you. Continue here only if you deployed with Option 2.
 
 #### 4. Configure sign-in
 
@@ -346,8 +257,6 @@ $AZURE_ENV_NAME = azd env get-value AZURE_ENV_NAME
 $APP_WEB_ORIGIN = azd env get-value APP_WEB_ORIGIN
 $MEGHKOSHA_OBO_MANAGED_IDENTITY_RESOURCE_ID = azd env get-value MEGHKOSHA_OBO_MANAGED_IDENTITY_RESOURCE_ID
 ```
-
-If you deployed via the portal button instead, get the equivalent values from the deployment's **Outputs** tab and the resource group's `id-obo-*` managed identity resource ID, and set the four PowerShell variables above manually.
 
 **Preview first — this is always safe and creates nothing:**
 
@@ -376,15 +285,15 @@ az logout
 az login --tenant $AZURE_TENANT_ID --scope 'https://graph.microsoft.com/.default'
 ```
 
-The output includes the two client IDs it just created. Feed them back into the deployment and redeploy:
+The output includes the two client IDs it just created. Feed them back into the deployment and redeploy the services (the IDs only feed the pods' settings, so no provisioning is needed):
 
 ```powershell
 azd env set MEGHKOSHA_API_CLIENT_ID <api-app-client-id>
 azd env set MEGHKOSHA_WEB_CLIENT_ID <web-app-client-id>
-azd up
+azd deploy
 ```
 
-(Using the portal button instead? Redeploy with `apiClientId`/`webClientId` filled in with those same two values.) Reload the app afterward — it should show a real Microsoft sign-in screen instead of an identity-configuration error.
+Reload the app afterward — it should show a real Microsoft sign-in screen instead of an identity-configuration error.
 
 #### 5. Grant access to the subscriptions you want to assess
 
@@ -408,14 +317,11 @@ Subscription access is deliberately kept **outside** the application — there i
 
 **Portal:** find both identities in **Azure portal → your resource group → id-api-\* / id-processor-\*** (their names start with those prefixes), then **Subscriptions → target subscription → Access control (IAM) → Add role assignment** for each role/identity pair above.
 
-**CLI:** the identity names/principal IDs aren't in `azd`'s top-level outputs (only the OBO identity's are) — list them from the resource group instead:
+**CLI:** both principal IDs are in the azd environment:
 
 ```powershell
-$RG = azd env get-value AZURE_RESOURCE_GROUP
-az identity list -g $RG --query "[].{name:name, principalId:principalId}" -o table
-
-$apiPrincipalId = az identity list -g $RG --query "[?starts_with(name,'id-api-')].principalId | [0]" -o tsv
-$processorPrincipalId = az identity list -g $RG --query "[?starts_with(name,'id-processor-')].principalId | [0]" -o tsv
+$apiPrincipalId = azd env get-value AZURE_API_IDENTITY_PRINCIPAL_ID
+$processorPrincipalId = azd env get-value AZURE_PROCESSOR_IDENTITY_PRINCIPAL_ID
 $targetSubscriptionId = "<subscription-id-you-want-to-assess>"
 
 az role assignment create --assignee-object-id $apiPrincipalId --assignee-principal-type ServicePrincipal --role "Reader" --scope "/subscriptions/$targetSubscriptionId"
@@ -428,6 +334,76 @@ Allow a few minutes for RBAC propagation, then use **Refresh schedules** in the 
 > [`scripts/deploy-end-to-end.ps1`](#option-1--one-command-end-to-end-recommended) performs exactly these three assignments for every subscription passed to `-TargetSubscriptionId` (comma-separated), skipping any that already exist. It still needs a signed-in user with **Owner** or **User Access Administrator** on each target subscription — the script cannot grant itself that.
 
 > Use **Cost Management Contributor**, not **Cost Management Reader**, on both identities — creating and running a native export are both write actions (`.../exports/write` and `.../exports/run/action`), which Reader's `*/read` permissions do not cover.
+
+## Running on AKS
+
+### Cluster access
+
+The cluster has no local accounts: kubectl signs in with Entra ID and is authorized by Azure RBAC. Terraform makes the identity that ran `azd provision` an **Azure Kubernetes Service RBAC Cluster Admin**; grant colleagues *Azure Kubernetes Service RBAC Reader* or *Writer* on the cluster as needed.
+
+```powershell
+az aks get-credentials --resource-group (azd env get-value AZURE_RESOURCE_GROUP) --name (azd env get-value AZURE_AKS_CLUSTER_NAME)
+kubelogin convert-kubeconfig --login azurecli
+kubectl get pods --namespace cloudlens
+kubectl get certificate --namespace cloudlens
+kubectl get cronjob processor --namespace cloudlens
+```
+
+### Settings
+
+Set these with `azd env set <name> <value>` before `azd provision`. Values marked **Day-0** are hard to change later: changing them recreates the cluster, a node pool or the ingress IP.
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `APP_AKS_SKU_TIER` | `Standard` | `Standard` includes the API-server uptime SLA; `Free` is fine for dev/test. |
+| `APP_AKS_SYSTEM_VM_SIZE`, `APP_AKS_SYSTEM_MIN_NODES`, `APP_AKS_SYSTEM_MAX_NODES` | `Standard_D2ds_v5`, `2`, `3` | Dedicated system pool (tainted `CriticalAddonsOnly`). Sizes need a local temp disk (a `d` size) for the ephemeral OS disk. |
+| `APP_AKS_USER_VM_SIZE`, `APP_AKS_USER_MIN_NODES`, `APP_AKS_USER_MAX_NODES` | `Standard_D4ds_v5`, `2`, `5` | Application pool, scaled by the cluster autoscaler. |
+| `APP_AKS_ZONES` | `1,2,3` | **Day-0.** Node pools and the ingress IP spread across these zones; `none` for regions without availability zones. |
+| `APP_AKS_KUBERNETES_VERSION` | region default | The `stable` auto-upgrade channel keeps the cluster current inside the maintenance window. |
+| `APP_AKS_MAINTENANCE_DAY`, `APP_AKS_MAINTENANCE_START` | `Sunday`, `02:00` | Weekly four-hour UTC window for cluster and node-image upgrades. |
+| `APP_AKS_API_AUTHORIZED_IP_RANGES` | *(any)* | Comma-separated CIDR ranges allowed to reach the Kubernetes API server. Include the machine that runs `azd`. |
+| `APP_VNET_PREFIX`, `APP_AKS_SUBNET_PREFIX`, `APP_PRIVATE_ENDPOINT_SUBNET_PREFIX` | `10.42.0.0/23`, `10.42.0.0/24`, `10.42.1.0/27` | **Day-0.** Nodes take addresses from the AKS subnet; pods use the overlay range. |
+| `APP_AKS_POD_CIDR`, `APP_AKS_SERVICE_CIDR` | `10.244.0.0/16`, `10.0.0.0/16` | **Day-0.** Cluster-internal ranges; must not overlap the VNet or networks it is peered with. |
+| `APP_INGRESS_DNS_LABEL` | `cloudlens-<token>` | **Day-0.** The `<label>` in `<label>.<region>.cloudapp.azure.com`; must be unique in the region. |
+| `APP_CUSTOM_DOMAIN` | *(none)* | Serve the app on your own host name — see below. |
+| `APP_TLS_CLUSTER_ISSUER` | `letsencrypt` | `letsencrypt-staging` issues untrusted test certificates with much higher rate limits. |
+| `APP_ACME_EMAIL` | *(none)* | Optional contact address registered with Let's Encrypt. |
+| `APP_PROCESSOR_CRON` | `*/5 * * * *` | Processor CronJob schedule (UTC). Ticks never overlap. |
+
+`scripts/validate-deployment-inputs.ps1` checks these settings offline (network overlaps, sizes, zones, profiles) before you provision. To save cost on a dev/test cluster, stop it when idle with `az aks stop` and start it again with `az aks start`.
+
+### HTTPS and custom domains
+
+Terraform gives the ingress a static public IP whose DNS label provides the app's stable host name before anything is deployed. cert-manager proves control of that name to Let's Encrypt with an HTTP-01 challenge on port 80, stores the certificate in the `web-tls` secret and renews it automatically. If you recreate environments often, switch to `APP_TLS_CLUSTER_ISSUER=letsencrypt-staging` while testing so you don't hit Let's Encrypt's duplicate-certificate limits, then run `azd deploy web`.
+
+To serve the app on your own domain:
+
+1. Create a CNAME record from your host name (for example `cloudlens.contoso.com`) to the Azure-provided name in `azd env get-value APP_INGRESS_AZURE_FQDN`.
+2. `azd env set APP_CUSTOM_DOMAIN cloudlens.contoso.com`.
+3. In the Entra portal, open the `<environment>-web-spa` app registration, **Authentication** → **Single-page application**, and change the redirect URI to `https://cloudlens.contoso.com/auth-callback.html`. `bootstrap-identity.ps1` deliberately never replaces an existing redirect URI by itself.
+4. Rerun `pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName <environment> -SkipPreview` (or `azd up`). The ingress switches to the new host name and cert-manager issues its certificate.
+
+### Terraform state
+
+azd keeps the Terraform state in `.azure/<environment>/infra/terraform.tfstate` on the machine that ran `azd provision`. Keep it — later provisions and `azd down` rely on it — and treat it as sensitive: it describes every resource and identity in the deployment. To share an environment with a team or a pipeline, use [remote state](https://learn.microsoft.com/azure/developer/azure-developer-cli/use-terraform-for-azd#enable-remote-state): add a `backend "azurerm" {}` block to `infra/main.tf`, an `infra/provider.conf.json` naming the storage account, container and key, and set the values it references with `azd env set`.
+
+`azd down` runs `terraform destroy`, which removes the resource group (and with it the AKS node resource group) and purges the Foundry account so the same environment name can be redeployed.
+
+### Optional operator templates
+
+- [infra/export-access](infra/export-access) grants least-privilege custom roles — configure/run exports for the API, run exports for the processor, and setup rights on the destination storage account — as an alternative to the broader *Cost Management Contributor* role on a subscription: `terraform -chdir=infra/export-access init`, then `terraform -chdir=infra/export-access apply -var storage_resource_group_name=<rg> -var storage_account_name=<st...> -var api_principal_id=<id> -var worker_principal_id=<id>` with the target subscription selected in the Azure CLI.
+- [infra/model-router](infra/model-router) adds the approved `model-router` deployment to an existing Foundry account: `terraform -chdir=infra/model-router apply -var resource_group_name=<rg> -var account_name=<ai-...>`.
+
+### Troubleshooting on AKS
+
+| Symptom | What to do |
+| --- | --- |
+| The postprovision hook says the account *still cannot administer* the cluster | The cluster-admin role assignment hadn't reached the API server yet. Rerun `azd provision`. |
+| The browser warns about the certificate, or `kubectl get certificate --namespace cloudlens` shows `READY False` | Inspect `kubectl describe certificate web-tls --namespace cloudlens` and `kubectl get challenges --all-namespaces`. Port 80 must be reachable from the internet; a `rateLimited` error means switch to `letsencrypt-staging` for a while. |
+| Pods stay `Pending` | `kubectl describe pod <name> --namespace cloudlens`: usually vCPU quota or node size — raise the quota, or adjust `APP_AKS_USER_*`. |
+| `Error acquiring the state lock` | An earlier `azd` run was interrupted. Make sure none is still running, delete `.azure/<environment>/infra/.terraform.tfstate.lock.info`, and rerun. |
+| `FlagMustBeSetForRestore` on the Foundry account | An account with this name was deleted outside Terraform and is soft-deleted. Purge it with `az cognitiveservices account purge --name <ai-account> --resource-group <rg> --location <foundry-location>`, then rerun. |
+| API calls fail with *managed identity is not configured* or 401s from Azure | Check workload identity: `kubectl get serviceaccount api --namespace cloudlens --output yaml` must carry the `azure.workload.identity/client-id` annotation, and `az identity federated-credential list --identity-name <id-api-...> --resource-group <rg>` must list the cluster's issuer. |
 
 ## Local development
 
@@ -460,7 +436,9 @@ Individual suites are `Backend`, `Frontend`, `Build`, and `Browser`. The runner 
 ## Security notes
 
 - The app never requests Entra admin consent, never requests an Azure Resource Manager scope from the browser, and never persists user bearer tokens.
-- Its managed identities hold only the roles you explicitly grant (see above) plus whatever the deployment itself provisions (scoped ADLS container roles for reading/writing its own control-state and export data).
-- Container images run as a non-root user on a minimal, digest-pinned base with no shell or package manager in the production image.
+- Its managed identities hold only the roles you explicitly grant (see above) plus what the deployment itself provisions (container-scoped storage roles for its own control-state and export data). Pods reach them through workload identity federation — there are no client secrets, storage keys or registry passwords anywhere.
+- The cluster API accepts Entra ID only (local accounts are disabled) and is authorized by Azure RBAC; restrict it further with `APP_AKS_API_AUTHORIZED_IP_RANGES`.
+- TLS ends at the ingress controller. Network policies admit only the ingress controller to the web pods and only the web pods to the API; the API has no public endpoint. Storage and Foundry are reachable only through private endpoints.
+- Pods run as non-root users with read-only root filesystems, no privilege escalation, all Linux capabilities dropped and the runtime-default seccomp profile. Container images run on a minimal, digest-pinned base with no shell or package manager in the production API image.
 - All API responses that could contain cost or identity data are marked private/no-store.
-- This is a reference implementation, not an audited commercial product — review the Bicep templates and RBAC grants before deploying into a production tenant.
+- This is a reference implementation, not an audited commercial product — review the Terraform configuration, the Kubernetes manifests and the RBAC grants before deploying into a production tenant.

@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+    Offline preflight for the azd environment settings: checks the values Terraform and the Kubernetes
+    manifests will receive, without contacting Azure. Prints a JSON summary of what would be deployed.
+#>
 [CmdletBinding()]
 param(
     [ValidateSet('Local', 'Provision', 'Publish', 'Deploy', 'Down')]
@@ -16,9 +21,8 @@ function Get-Setting([string] $Name, [string] $Default = '') {
 
 function Get-BooleanSetting([string] $Name) {
     $value = Get-Setting $Name 'false'
-    $parsed = $false
-    if (-not [bool]::TryParse($value, [ref]$parsed)) { throw "$Name must be true or false." }
-    return $parsed
+    if ($value -cnotin @('true', 'false')) { throw "$Name must be true or false (lowercase)." }
+    return $value -eq 'true'
 }
 
 function Assert-Identifier([string] $Name) {
@@ -29,14 +33,15 @@ function Assert-Identifier([string] $Name) {
     }
 }
 
+function Test-Overlap([System.Net.IPNetwork] $First, [System.Net.IPNetwork] $Second) {
+    return $First.Contains($Second.BaseAddress) -or $Second.Contains($First.BaseAddress)
+}
+
 if ($Operation -ne 'Local' -and -not (Get-BooleanSetting 'APP_ALLOW_AZURE_CHANGES')) {
-        throw 'Azure changes are not approved. Complete the required approval gates and explicitly set APP_ALLOW_AZURE_CHANGES=true.'
+    throw 'Azure changes are not approved. Complete the required approval gates and explicitly set APP_ALLOW_AZURE_CHANGES=true.'
 }
 if ($Operation -eq 'Down' -and -not (Get-BooleanSetting 'APP_ALLOW_DESTRUCTIVE_CHANGES')) {
     throw 'Destructive cleanup requires separate approval and APP_ALLOW_DESTRUCTIVE_CHANGES=true.'
-}
-if ($Operation -eq 'Deploy') {
-        throw 'Direct azd deploy is not enabled yet. Publish reviewed images, resolve their digests, then use the approved Bicep provision flow. A future guided delivery pipeline will orchestrate this.'
 }
 
 $environmentName = Get-Setting 'AZURE_ENV_NAME'
@@ -47,62 +52,73 @@ $profileOrder = @{ core = 0; data = 1; ai = 2 }
 $previousProfile = Get-Setting 'APP_PROVISIONED_PROFILE'
 if ($Operation -ne 'Down' -and $previousProfile -and
     (-not $profileOrder.ContainsKey($previousProfile) -or $profileOrder[$profile] -lt $profileOrder[$previousProfile])) {
-    throw 'Profile downgrade is not supported by this incremental template. It does not remove already provisioned data or AI resources.'
+    throw 'Profile downgrade would delete the provisioned data or AI resources. Use azd down for the environment instead.'
 }
 foreach ($name in @('AZURE_LOCATION', 'FOUNDRY_LOCATION')) {
     $default = if ($name -eq 'AZURE_LOCATION') { 'centralindia' } else { 'eastus2' }
     if ((Get-Setting $name $default) -cnotmatch '^[a-z][a-z0-9]+$') { throw "$name must use an Azure location code." }
 }
 
+# Network: the node and private-endpoint subnets live in the VNet; the overlay pod range and the service
+# range are cluster-internal but must not collide with the VNet (or each other).
 $vnet = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_VNET_PREFIX' '10.42.0.0/23'))
-$containers = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_CONTAINER_SUBNET_PREFIX' '10.42.0.0/24'))
+$nodes = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_AKS_SUBNET_PREFIX' '10.42.0.0/24'))
 $endpoints = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_PRIVATE_ENDPOINT_SUBNET_PREFIX' '10.42.1.0/27'))
-foreach ($subnet in @($containers, $endpoints)) {
+foreach ($subnet in @($nodes, $endpoints)) {
     if ($subnet.BaseAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
         -not $vnet.Contains($subnet.BaseAddress) -or $subnet.PrefixLength -lt $vnet.PrefixLength -or $subnet.PrefixLength -gt 27) {
         throw 'Each subnet must be IPv4, within the VNet, and /27 or larger.'
     }
 }
-if ($containers.Contains($endpoints.BaseAddress) -or $endpoints.Contains($containers.BaseAddress)) { throw 'Container and private-endpoint subnets must not overlap.' }
-$reserved = [System.Net.IPNetwork]::Parse('172.17.0.0/16')
-if ($vnet.Contains($reserved.BaseAddress) -or $reserved.Contains($vnet.BaseAddress)) { throw 'The VNet must not overlap Docker-reserved 172.17.0.0/16.' }
-
-$apiImage = Get-Setting 'SERVICE_API_IMAGE_NAME'
-$webImage = Get-Setting 'SERVICE_WEB_IMAGE_NAME'
-if ([string]::IsNullOrEmpty($apiImage) -xor [string]::IsNullOrEmpty($webImage)) { throw 'Provide both application images, or leave both empty for the foundation stage.' }
-$applications = -not [string]::IsNullOrEmpty($apiImage)
-if ($Operation -ne 'Down' -and (Get-BooleanSetting 'APP_APPLICATIONS_DEPLOYED') -and -not $applications) {
-    throw 'Do not clear deployed application image settings; incremental provisioning would leave the existing apps running.'
+if (Test-Overlap $nodes $endpoints) { throw 'AKS node and private-endpoint subnets must not overlap.' }
+$pods = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_AKS_POD_CIDR' '10.244.0.0/16'))
+$services = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_AKS_SERVICE_CIDR' '10.0.0.0/16'))
+foreach ($range in @(@{ Name = 'APP_AKS_POD_CIDR'; Value = $pods }, @{ Name = 'APP_AKS_SERVICE_CIDR'; Value = $services })) {
+    if ($range.Value.BaseAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { throw "$($range.Name) must be IPv4." }
+    if (Test-Overlap $range.Value $vnet) { throw "$($range.Name) must not overlap the VNet." }
 }
-if ($applications) {
+if (Test-Overlap $pods $services) { throw 'APP_AKS_POD_CIDR and APP_AKS_SERVICE_CIDR must not overlap.' }
+if ($services.PrefixLength -gt 28) { throw 'APP_AKS_SERVICE_CIDR must be /28 or larger.' }
+$reserved = [System.Net.IPNetwork]::Parse('172.17.0.0/16')
+foreach ($range in @($vnet, $pods, $services)) {
+    if (Test-Overlap $range $reserved) { throw 'The VNet, pod and service ranges must not overlap Docker-reserved 172.17.0.0/16.' }
+}
+
+# Cluster, ingress and TLS settings that Terraform would otherwise reject only at plan time.
+if ((Get-Setting 'APP_AKS_SKU_TIER' 'Standard') -cnotin @('Free', 'Standard', 'Premium')) { throw 'APP_AKS_SKU_TIER must be Free, Standard or Premium.' }
+$zones = Get-Setting 'APP_AKS_ZONES' '1,2,3'
+if ($zones -cne 'none' -and ($zones -replace '\s', '') -cnotmatch '^[1-3](,[1-3]){0,2}$') { throw 'APP_AKS_ZONES must be none or a comma-separated list of zones 1-3.' }
+foreach ($name in @('APP_AKS_SYSTEM_VM_SIZE', 'APP_AKS_USER_VM_SIZE')) {
+    $size = Get-Setting $name
+    if ($size -and $size -cnotmatch '^Standard_[A-Z]+[0-9]+[a-z]*d[a-z]*_v[0-9]+$') {
+        throw "$name must be a VM size with a local temp disk for the ephemeral OS disk, for example Standard_D4ds_v5."
+    }
+}
+if ((Get-Setting 'APP_TLS_CLUSTER_ISSUER' 'letsencrypt') -cnotin @('letsencrypt', 'letsencrypt-staging')) {
+    throw 'APP_TLS_CLUSTER_ISSUER must be letsencrypt or letsencrypt-staging.'
+}
+$label = Get-Setting 'APP_INGRESS_DNS_LABEL'
+if ($label -and $label -cnotmatch '^[a-z][a-z0-9-]{1,61}[a-z0-9]$') { throw 'APP_INGRESS_DNS_LABEL must be 3-63 lowercase letters, digits or hyphens and start with a letter.' }
+$domain = Get-Setting 'APP_CUSTOM_DOMAIN'
+if ($domain -and $domain.ToLowerInvariant() -cnotmatch '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { throw 'APP_CUSTOM_DOMAIN must be a host name such as cloudlens.contoso.com.' }
+$email = Get-Setting 'APP_ACME_EMAIL'
+if ($email -and $email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'APP_ACME_EMAIL must be an email address.' }
+
+if ($Operation -eq 'Publish' -and (Get-Setting 'AZURE_CONTAINER_REGISTRY_ENDPOINT') -cnotmatch '^[a-z0-9]+\.azurecr\.io$') {
+    throw 'Publish requires the provisioned environment registry (run azd provision first).'
+}
+$signInConfigured = -not [string]::IsNullOrEmpty((Get-Setting 'MEGHKOSHA_API_CLIENT_ID')) -or -not [string]::IsNullOrEmpty((Get-Setting 'MEGHKOSHA_WEB_CLIENT_ID'))
+if ($signInConfigured) {
     foreach ($name in @('AZURE_TENANT_ID', 'MEGHKOSHA_API_CLIENT_ID', 'MEGHKOSHA_WEB_CLIENT_ID')) { Assert-Identifier $name }
     if ((Get-Setting 'MEGHKOSHA_API_CLIENT_ID') -eq (Get-Setting 'MEGHKOSHA_WEB_CLIENT_ID')) { throw 'API and SPA must use separate registrations.' }
 }
-if ($Operation -eq 'Publish' -and (Get-Setting 'AZURE_CONTAINER_REGISTRY_ENDPOINT') -cnotmatch '^[a-z0-9]+\.azurecr\.io$') {
-    throw 'Publish requires the provisioned environment registry; no image digest is required before its first publication.'
-}
-if ($applications) {
-    $registry = Get-Setting 'AZURE_CONTAINER_REGISTRY_ENDPOINT'
-    foreach ($image in @($apiImage, $webImage)) {
-        if ($image -notmatch '^[a-z0-9]+\.azurecr\.io/[a-z0-9][a-z0-9/_.-]*@sha256:[a-f0-9]{64}$' -or
-            -not $registry -or -not $image.StartsWith("$registry/", [StringComparison]::Ordinal)) {
-            throw 'Application images must be immutable digests in this environment registry.'
-        }
-    }
+if ($Operation -eq 'Deploy' -and (Get-Setting 'AZURE_AKS_CLUSTER_NAME') -cnotmatch '^aks-[a-f0-9]{13}$') {
+    throw 'Deploy requires the provisioned AKS cluster (run azd provision first).'
 }
 
 $processor = Get-BooleanSetting 'APP_ENABLE_PROCESSOR'
-if ($Operation -ne 'Down' -and (Get-BooleanSetting 'APP_PROCESSOR_DEPLOYED') -and -not $processor) {
-    throw 'Disabling this module does not stop an existing scheduled job. Use the separately approved processor lifecycle operation.'
-}
 if ($processor) {
     if ($profile -eq 'core') { throw 'The processor requires the data or ai stage.' }
-    $processorImage = Get-Setting 'SERVICE_PROCESSOR_IMAGE_NAME'
-    $registry = Get-Setting 'AZURE_CONTAINER_REGISTRY_ENDPOINT'
-    if ($processorImage -cnotmatch '^[a-z0-9]+\.azurecr\.io/[a-z0-9][a-z0-9/_.-]*@sha256:[a-f0-9]{64}$' -or
-        -not $registry -or -not $processorImage.StartsWith("$registry/", [StringComparison]::Ordinal)) {
-        throw 'The processor requires its own immutable image digest in the environment registry.'
-    }
     if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot '../api/jobs/scheduler.py'))) {
         throw 'The scheduled processor is not implemented yet. Complete the processor implementation before enabling it.'
     }
@@ -137,33 +153,26 @@ foreach ($model in $models) {
 }
 $aiRuntime = Get-BooleanSetting 'APP_ENABLE_AI_RUNTIME'
 if ($aiRuntime -and ($profile -ne 'ai' -or -not $models.Count -or -not (Get-BooleanSetting 'APP_AI_VALIDATED'))) {
-        throw 'AI runtime requires the ai stage, configured models and explicit validation (APP_AI_VALIDATED=true).'
+    throw 'AI runtime requires the ai stage, configured models and explicit validation (APP_AI_VALIDATED=true).'
 }
 $chatRuntime = Get-BooleanSetting 'APP_ENABLE_CHAT_RUNTIME'
-$restoreAiAccount = Get-BooleanSetting 'APP_RESTORE_AI_ACCOUNT'
-$reuseAiAccount = Get-BooleanSetting 'APP_REUSE_AI_ACCOUNT'
-if ($restoreAiAccount -and $reuseAiAccount) {
-    throw 'Foundry account restore and reuse cannot both be enabled.'
-}
-if ($reuseAiAccount -and $profile -ne 'ai') {
-    throw 'Foundry account reuse requires the ai stage.'
-}
 $modelRouterDeploymentName = Get-Setting 'MODEL_ROUTER_DEPLOYMENT_NAME'
 if ($chatRuntime -and ($profile -ne 'ai' -or -not (Get-BooleanSetting 'APP_AI_VALIDATED') -or
     [string]::IsNullOrWhiteSpace($modelRouterDeploymentName) -or -not $modelRouterNames.Contains($modelRouterDeploymentName))) {
-        throw 'Foundry chat requires the ai stage, explicit validation and MODEL_ROUTER_DEPLOYMENT_NAME matching an approved model-router deployment.'
+    throw 'Foundry chat requires the ai stage, explicit validation and MODEL_ROUTER_DEPLOYMENT_NAME matching an approved model-router deployment.'
 }
 
 [pscustomobject]@{
     operation = $Operation
     environment = $environmentName
+    hosting = 'aks'
     profile = $profile
-    applicationImagesSupplied = $applications
+    signInConfigured = $signInConfigured
     processorEnabled = $processor
     aiRuntimeEnabled = $aiRuntime
     chatRuntimeEnabled = $chatRuntime
-    aiAccountRestored = $restoreAiAccount
-    aiAccountReused = $reuseAiAccount
     nativeExportNetworkException = $trustedExports
+    tlsIssuer = Get-Setting 'APP_TLS_CLUSTER_ISSUER' 'letsencrypt'
+    customDomain = $domain
     cloudPreflightStillRequired = $true
 } | ConvertTo-Json -Compress

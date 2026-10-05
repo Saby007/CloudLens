@@ -4,27 +4,50 @@ metadata:
 requiredVersions:
   azd: '>= 1.32.0'
 infra:
-  provider: bicep
+  provider: terraform
   path: infra
   module: main
+hooks:
+  # Installs cert-manager, the static-IP ingress controller and the Let's Encrypt issuers (idempotent).
+  postprovision:
+    shell: pwsh
+    run: ./scripts/aks-bootstrap.ps1
+    interactive: false
+    continueOnError: false
 services:
+  # Deploy order matters: web's nginx resolves the api Service when it starts.
   api:
     project: ./api
     language: docker
-    host: containerapp
-    resourceName: ${SERVICE_API_RESOURCE_NAME}
+    host: aks
     docker:
       path: Dockerfile
       context: .
       platform: linux/amd64
       remoteBuild: true
+    k8s:
+      # Must match local.namespace in infra/main.tf (workload identity trusts this namespace only).
+      namespace: cloudlens
+      deploymentPath: manifests
+      deployment:
+        name: api
+      service:
+        name: api
   web:
     project: ./web
     language: docker
-    host: containerapp
-    resourceName: ${SERVICE_WEB_RESOURCE_NAME}
+    host: aks
     docker:
       path: Dockerfile
       context: .
       platform: linux/amd64
       remoteBuild: true
+    k8s:
+      namespace: cloudlens
+      deploymentPath: manifests
+      deployment:
+        name: web
+      service:
+        name: web
+      ingress:
+        name: web

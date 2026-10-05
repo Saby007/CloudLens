@@ -1,0 +1,208 @@
+# Applied by `azd deploy api`. azd renders *.tmpl.yaml files as Go templates over the azd environment:
+# `index .Env "NAME"` reads a value (empty when unset) and `printf "%q"` quotes it safely for YAML.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: cloudlens
+  annotations:
+    azure.workload.identity/client-id: {{ index .Env "AZURE_API_IDENTITY_CLIENT_ID" | printf "%q" }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: cloudlens
+spec:
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+        app.kubernetes.io/part-of: cloudlens
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: api
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+      containers:
+        - name: api
+          image: {{ index .Env "SERVICE_API_IMAGE_NAME" | printf "%q" }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: AZURE_CLIENT_ID
+              value: {{ index .Env "AZURE_API_IDENTITY_CLIENT_ID" | printf "%q" }}
+            - name: AZURE_TENANT_ID
+              value: {{ index .Env "AZURE_TENANT_ID" | printf "%q" }}
+            - name: MEGHKOSHA_API_CLIENT_ID
+              value: {{ index .Env "MEGHKOSHA_API_CLIENT_ID" | printf "%q" }}
+            - name: MEGHKOSHA_WEB_CLIENT_ID
+              value: {{ index .Env "MEGHKOSHA_WEB_CLIENT_ID" | printf "%q" }}
+            - name: MEGHKOSHA_OBO_MANAGED_IDENTITY_CLIENT_ID
+              value: {{ index .Env "MEGHKOSHA_OBO_MANAGED_IDENTITY_CLIENT_ID" | printf "%q" }}
+            - name: MEGHKOSHA_ACTION_WRITES_PAUSED
+              value: "true"
+            - name: APP_PROFILE
+              value: {{ index .Env "APP_PROFILE" | printf "%q" }}
+            - name: APP_SCHEDULER_ENABLED
+              value: {{ index .Env "APP_SCHEDULER_ENABLED" | printf "%q" }}
+            - name: MEGHKOSHA_AI_ENABLED
+              value: {{ index .Env "MEGHKOSHA_AI_ENABLED" | printf "%q" }}
+            - name: FOUNDRY_CHAT_ENABLED
+              value: {{ index .Env "FOUNDRY_CHAT_ENABLED" | printf "%q" }}
+            - name: AI_PROJECT_ENDPOINT
+              value: {{ index .Env "AI_PROJECT_ENDPOINT" | printf "%q" }}
+            - name: AI_SERVICES_ENDPOINT
+              value: {{ index .Env "AI_SERVICES_ENDPOINT" | printf "%q" }}
+            - name: AGENT_NAME
+              value: {{ index .Env "AGENT_NAME" | printf "%q" }}
+            - name: MODEL_ROUTER_DEPLOYMENT_NAME
+              value: {{ index .Env "MODEL_ROUTER_DEPLOYMENT_NAME" | printf "%q" }}
+            - name: COST_EXPORT_STORAGE_URL
+              value: {{ index .Env "COST_EXPORT_STORAGE_URL" | printf "%q" }}
+            - name: COST_EXPORT_STORAGE_RESOURCE_ID
+              value: {{ index .Env "COST_EXPORT_STORAGE_RESOURCE_ID" | printf "%q" }}
+            - name: COST_EXPORT_CONTAINER
+              value: "cost-exports"
+            - name: REPORT_SNAPSHOT_CONTAINER
+              value: "report-snapshots"
+            - name: CONTROL_STATE_CONTAINER
+              value: "control-state"
+            - name: COST_EXPORT_NAME
+              value: {{ index .Env "COST_EXPORT_NAME" | printf "%q" }}
+            - name: COST_EXPORT_DAILY_NAME
+              value: {{ index .Env "COST_EXPORT_DAILY_NAME" | printf "%q" }}
+            - name: FOCUS_EXPORT_PARALLEL_MONTHS
+              value: {{ index .Env "FOCUS_EXPORT_PARALLEL_MONTHS" | printf "%q" }}
+            - name: COST_EXPORT_LOCATION
+              value: {{ index .Env "AZURE_LOCATION" | printf "%q" }}
+            - name: REPORT_PUBLIC_APP_URL
+              value: {{ index .Env "APP_WEB_ORIGIN" | printf "%q" }}
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: cloudlens
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: cloudlens
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: cloudlens
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

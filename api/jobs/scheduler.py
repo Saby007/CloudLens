@@ -1,4 +1,4 @@
-"""One bounded scheduler tick; invoked by the configured Container Apps Job.
+"""One bounded scheduler tick; invoked by the processor CronJob (api/manifests/processor.tmpl.yaml).
 
 Continues refresh cycles started from the Schedule tab's Export action, starts a schedule's
 monthly close when it is due (pulling only closed months without a finalized copy), and runs

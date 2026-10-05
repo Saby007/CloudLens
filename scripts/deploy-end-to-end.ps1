@@ -1,32 +1,37 @@
 <#
 .SYNOPSIS
-    Runs the entire CloudLens deployment - clone, azd provisioning, sign-in registrations, and
-    the per-subscription role assignments - as a single self-contained script.
+    Runs the entire CloudLens deployment on Azure Kubernetes Service - clone, azd provisioning with
+    Terraform, sign-in registrations, and the per-subscription role assignments - as one script.
 
 .DESCRIPTION
     This is the whole "Deploying to Azure" README flow in one file:
 
-      1. Checks prerequisites and clones the repository (skipped when already run from a checkout).
-      2. Signs in with `azd` and `az`.
-      3. Creates the azd environment and applies the recommended `ai` profile settings.
-      4. Previews the infrastructure, then runs `azd up` until the deployment settles, retrying
-         the known transient Foundry/image-handoff/ACR conditions with a wait in between.
-      5. Enables the scheduled export processor using the image azd built for the API.
-      6. Runs scripts/bootstrap-identity.ps1, feeds the two client IDs back into the environment,
-         and redeploys so the app gets a real Microsoft sign-in screen.
-      7. Grants Reader / Cost Management Contributor on every subscription you want to assess.
+      1. Checks prerequisites (git, azd, az, terraform, kubectl, kubelogin) and clones the repository
+         (skipped when already run from a checkout). Missing kubectl/kubelogin are installed with
+         `az aks install-cli` once you agree.
+      2. Signs in with `azd` and `az` (Terraform authenticates through the Azure CLI).
+      3. Creates the azd environment and applies the recommended `ai` profile settings, including the
+         scheduled export processor.
+      4. Previews the Terraform plan, then runs `azd up`: Terraform provisions the network, AKS cluster,
+         registry, storage, Foundry account and identities; the postprovision hook installs cert-manager
+         and the ingress controller; azd builds both images in ACR and applies the Kubernetes manifests.
+         Failures are retried after a wait.
+      5. Runs scripts/bootstrap-identity.ps1, feeds the two client IDs back into the environment, and
+         runs `azd deploy` so the API pods pick them up.
+      6. Grants Reader / Cost Management Contributor on every subscription you want to assess.
+      7. Waits for the Let's Encrypt certificate and checks /api/health over HTTPS.
 
     Every phase is idempotent and re-entrant: rerunning the script against an existing environment
-    only repeats the `azd up` calls that still have work to do, so a failed run can simply be rerun.
+    reapplies the current code once and skips whatever is already in place.
 
-    The run never waits on a question you cannot see. azd's output is captured so known transient
-    errors can be recognised and retried, so every azd command runs with --no-prompt. Anything that
-    genuinely needs an answer - a question azd asks, or the Service Tree ID some tenants require on
-    app registrations - is asked in this terminal instead.
+    The run never waits on a question you cannot see. azd's output is captured so failures can be
+    recognised and retried, so every azd command runs with --no-prompt. Anything that genuinely needs an
+    answer - a question azd asks, installing kubectl/kubelogin, or the Service Tree ID some tenants
+    require on app registrations - is asked in this terminal instead.
 
 .PARAMETER EnvironmentName
     azd environment name. Lowercase letters, digits and hyphens only - it is also used to name the
-    Entra ID app registrations created by scripts/bootstrap-identity.ps1.
+    resource group and the Entra ID app registrations created by scripts/bootstrap-identity.ps1.
 
 .PARAMETER SubscriptionId
     The subscription to deploy into. Defaults to the Azure CLI's current subscription. It is pinned
@@ -41,11 +46,21 @@
     without one. When it is omitted and the tenant asks for one, the script asks in the terminal and
     offers the ID your existing registrations use. The answer is kept in the azd environment for reruns.
 
+.PARAMETER AcmeEmail
+    Optional contact address registered with Let's Encrypt for the app's TLS certificate.
+
+.PARAMETER InstallKubernetesTools
+    Install kubectl and kubelogin with `az aks install-cli` without asking when they are missing.
+
+.PARAMETER KubernetesToolsDirectory
+    Where `az aks install-cli` puts kubectl and kubelogin (in .azure-kubectl and .azure-kubelogin).
+    Defaults to your home directory.
+
 .EXAMPLE
     pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-environment -TargetSubscriptionId 'sub-a,sub-b'
 
 .EXAMPLE
-    # Standalone: downloads nothing else - clones the repository next to the current directory first.
+    # Standalone: clones the cloudlensdev branch of the repository next to the current directory first.
     pwsh ./deploy-end-to-end.ps1 -EnvironmentName my-environment -RepoDirectory ./CloudLens
 #>
 [CmdletBinding()]
@@ -58,12 +73,17 @@ param(
     [string[]] $TargetSubscriptionId = @(),
     [ValidatePattern('^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?$')]
     [string] $ServiceManagementReference = '',
+    [ValidatePattern('^([^@\s]+@[^@\s]+\.[^@\s]+)?$')]
+    [string] $AcmeEmail = '',
     [string] $RepoUrl = 'https://github.com/Saby007/CloudLens.git',
+    [string] $RepoBranch = 'cloudlensdev',
     [string] $RepoDirectory = '',
     [ValidateRange(1, 10)]
     [int] $MaxAttempts = 3,
     [ValidateRange(0, 900)]
     [int] $SettleSeconds = 120,
+    [ValidateRange(0, 3600)]
+    [int] $HealthTimeoutSeconds = 600,
     [switch] $SkipLogin,
     [switch] $SkipPreview,
     [switch] $SkipProcessor,
@@ -71,6 +91,8 @@ param(
     [switch] $SkipRoleAssignments,
     [switch] $IncludeLocalhostRedirects,
     [switch] $GrantAdminConsent,
+    [switch] $InstallKubernetesTools,
+    [string] $KubernetesToolsDirectory = $HOME,
     [switch] $PlanOnly
 )
 
@@ -91,6 +113,9 @@ $settings = [ordered]@{
     APP_AI_VALIDATED = 'true'
     APP_ENABLE_AI_RUNTIME = 'false'
 }
+# Skipping leaves an existing environment's processor setting untouched instead of switching it off.
+if (-not $SkipProcessor) { $settings.APP_ENABLE_PROCESSOR = 'true' }
+if ($AcmeEmail) { $settings.APP_ACME_EMAIL = $AcmeEmail }
 # azd's output is captured to classify failures, which would also hide any question azd asked, so azd
 # always runs with --no-prompt. These are the errors it reports when it needed an answer instead; the
 # command is then rerun attached to the terminal so the question can be answered there.
@@ -118,12 +143,14 @@ if ($SubscriptionId) {
 if ($PlanOnly) {
     [pscustomobject]@{
         environment = $EnvironmentName
-        repository = @{ url = $RepoUrl; directory = $RepoDirectory }
+        hosting = 'aks'
+        repository = @{ url = $RepoUrl; branch = $RepoBranch; directory = $RepoDirectory }
         settings = $settings
         deploymentSubscription = $SubscriptionId
         preview = -not $SkipPreview
         enableProcessor = -not $SkipProcessor
         bootstrapIdentity = -not $SkipIdentityBootstrap
+        roleAssignments = -not $SkipRoleAssignments
         serviceManagementReference = $ServiceManagementReference
         assessedSubscriptions = $subscriptionIds
         maxAttempts = $MaxAttempts
@@ -182,37 +209,52 @@ function Get-SubscriptionArgument {
     return @()
 }
 
-function Test-FoundryAccountExists {
-    $resourceGroup = Get-ResourceGroupName
-    $subscriptionArgs = Get-SubscriptionArgument
-    $accounts = Get-CliText (& az cognitiveservices account list --resource-group $resourceGroup @subscriptionArgs --query '[].name' --output tsv --only-show-errors 2>$null)
-    return ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($accounts))
-}
-
-function Test-ContainerAppsExist {
-    $resourceGroup = Get-ResourceGroupName
-    $subscriptionArgs = Get-SubscriptionArgument
-    $names = Get-CliText (& az containerapp list --resource-group $resourceGroup @subscriptionArgs --query "[?starts_with(name,'ca-api-') || starts_with(name,'ca-web-')].name" --output tsv --only-show-errors 2>$null)
-    if ($LASTEXITCODE -ne 0) { return $false }
-    $found = @($names -split "`n" | Where-Object { $_ })
-    return (@($found | Where-Object { $_.StartsWith('ca-api-') }).Count -gt 0 -and
-            @($found | Where-Object { $_.StartsWith('ca-web-') }).Count -gt 0)
-}
-
-function Wait-ActiveDeployment {
-    # ARM keeps executing the previous deployment graph after azd reports an error; retrying into
-    # a still-running deployment fails with DeploymentActive.
-    $resourceGroup = Get-ResourceGroupName
-    $subscriptionArgs = Get-SubscriptionArgument
-    for ($attempt = 1; $attempt -le 40; $attempt++) {
-        $active = Get-CliText (& az deployment group list --resource-group $resourceGroup @subscriptionArgs --query "[?properties.provisioningState=='Running' || properties.provisioningState=='Accepted'].name" --output tsv --only-show-errors 2>$null)
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($active)) { return }
-        if ($attempt % 4 -eq 1) {
-            Write-Host "  Waiting for the earlier Azure deployment to finish ($(($attempt - 1) / 4) min so far, up to 10)..." -ForegroundColor DarkGray
-        }
-        Start-Sleep -Seconds 15
+function Read-YesNo {
+    param([Parameter(Mandatory)][string] $Question, [Parameter(Mandatory)][string] $Refusal)
+    try {
+        $answer = "$(Read-Host "$Question [Y/n]")".Trim()
+    } catch {
+        throw $Refusal
     }
-    Write-Warning 'A previous deployment is still running on Azure; continuing anyway.'
+    return (-not $answer -or $answer -match '^(y|yes)$')
+}
+
+function Resolve-KubernetesTools {
+    # azd applies the manifests with kubectl and signs in to the Entra-only cluster through kubelogin.
+    $suffix = if ($IsWindows) { '.exe' } else { '' }
+    $kubectlPath = Join-Path (Join-Path $KubernetesToolsDirectory '.azure-kubectl') "kubectl$suffix"
+    $kubeloginPath = Join-Path (Join-Path $KubernetesToolsDirectory '.azure-kubelogin') "kubelogin$suffix"
+    $separator = [System.IO.Path]::PathSeparator
+    function Test-Missing { @('kubectl', 'kubelogin' | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }) }
+    function Add-ToolPath {
+        # Only for this run and the azd/hook processes it starts; az aks install-cli prints how to add them permanently.
+        foreach ($directory in @((Split-Path -Parent $kubectlPath), (Split-Path -Parent $kubeloginPath))) {
+            if ((Test-Path -LiteralPath $directory) -and ($env:PATH -split [regex]::Escape($separator)) -notcontains $directory) {
+                $env:PATH = "$directory$separator$env:PATH"
+            }
+        }
+    }
+
+    $missing = @(Test-Missing)
+    if (-not $missing.Count) { return }
+    Add-ToolPath
+    $missing = @(Test-Missing)
+    if (-not $missing.Count) {
+        Write-Host 'Using kubectl and kubelogin from an earlier az aks install-cli.'
+        return
+    }
+    if (-not $InstallKubernetesTools) {
+        $install = Read-YesNo -Question "$($missing -join ' and ') not found. Install kubectl and kubelogin now with 'az aks install-cli'?" `
+            -Refusal "$($missing -join ' and ') not found. Install them with 'az aks install-cli', or rerun with -InstallKubernetesTools."
+        if (-not $install) { throw "$($missing -join ' and ') are required. Install them with 'az aks install-cli', then rerun." }
+    }
+    Write-Host 'Installing kubectl and kubelogin (az aks install-cli)...'
+    # Not piped: the download progress and PATH guidance reach the terminal as az prints them.
+    & az aks install-cli --install-location $kubectlPath --kubelogin-install-location $kubeloginPath --only-show-errors
+    if ($LASTEXITCODE -ne 0) { throw 'az aks install-cli failed. Install kubectl and kubelogin manually, then rerun.' }
+    Add-ToolPath
+    $missing = @(Test-Missing)
+    if ($missing.Count) { throw "$($missing -join ' and ') still cannot be found after installation." }
 }
 
 function Invoke-AzdCaptured {
@@ -238,45 +280,64 @@ function Invoke-AzdInTerminal {
     & azd @Arguments --environment $EnvironmentName
 }
 
-function Invoke-AzdUp {
-    param([Parameter(Mandatory)][string] $Reason)
+function Invoke-Azd {
+    param([Parameter(Mandatory)][string[]] $Arguments, [Parameter(Mandatory)][string] $Reason)
+    $command = "azd $($Arguments -join ' ')"
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        Write-Step "azd up - $Reason (attempt $attempt of $MaxAttempts)"
-        Write-Host 'This can take several minutes; azd reports each resource as it finishes.' -ForegroundColor DarkGray
-        $text = Invoke-AzdCaptured @('up')
+        Write-Step "$command - $Reason (attempt $attempt of $MaxAttempts)"
+        Write-Host 'This can take a while - creating a new AKS cluster alone takes 10-15 minutes; azd reports each step as it finishes.' -ForegroundColor DarkGray
+        $text = Invoke-AzdCaptured $Arguments
         if ($LASTEXITCODE -eq 0) { return }
         if ($text -match $azdNeedsInput) {
-            Invoke-AzdInTerminal @('up')
+            Invoke-AzdInTerminal $Arguments
             if ($LASTEXITCODE -eq 0) { return }
         }
+        if ($text -match 'Error acquiring the state lock') {
+            throw "Terraform's local state is still locked by an earlier run that was interrupted. Make sure no other azd run is active, delete .azure/$EnvironmentName/infra/.terraform.tfstate.lock.info, then rerun this script."
+        }
         if ($attempt -eq $MaxAttempts) {
-            throw "azd up failed after $attempt attempt(s) while trying to $Reason. Review the output above; rerunning this script resumes from here."
+            throw "$command failed after $attempt attempt(s) while trying to $Reason. Review the output above; rerunning this script resumes from here."
         }
-        if ($text -match 'AccountProvisioningStateInvalid|Another operation is in progress') {
-            Write-Warning 'The AI Foundry account is still settling. Reusing the existing account on the retry.'
-            Set-AzdValue 'APP_REUSE_AI_ACCOUNT' 'true'
-        } elseif ($text -match "resource not found: unable to find a resource with name 'ca-(api|web)-") {
-            Write-Warning 'The container images were published after infrastructure planning. Retrying so Bicep can create the Container Apps.'
-        } elseif ($text -match 'unable to pull image using Managed identity') {
-            Write-Warning 'The registry data plane has not picked up the new AcrPull assignment yet. Retrying after a wait.'
-        } elseif ($text -match 'DeploymentActive') {
-            Write-Warning 'A previous deployment operation was still finishing on Azure.'
+        if ($text -match 'Forbidden|AuthorizationFailed|does not have (authorization|access)|cannot (create|get|list|patch)') {
+            Write-Warning 'A new role assignment had not reached Azure or the cluster yet. Retrying after a wait.'
+        } elseif ($text -match 'AnotherOperationInProgress|OperationNotAllowed|AccountProvisioningStateInvalid|Another operation is in progress|RequestConflict|Conflict') {
+            Write-Warning 'Azure was still finishing an earlier operation on the same resource. Retrying after a wait.'
+        } elseif ($text -match 'context deadline exceeded|timed out|TLS handshake timeout|connection reset|i/o timeout') {
+            Write-Warning 'A call timed out. Retrying after a wait.'
         } else {
-            Write-Warning 'azd up failed. Waiting before the next attempt.'
+            Write-Warning "$command failed. Waiting before the next attempt."
         }
-        Wait-Settle "azd up failed, retrying ($($attempt + 1) of $MaxAttempts)"
-        Wait-ActiveDeployment
+        Wait-Settle "$command failed, retrying ($($attempt + 1) of $MaxAttempts)"
     }
 }
 
 function Get-WebEndpointUrl {
-    $url = Get-AzdValue 'SERVICE_WEB_ENDPOINT_URL'
+    $url = Get-AzdValue 'APP_WEB_ORIGIN'
     if ($url) { return $url.TrimEnd('/') }
-    $resourceGroup = Get-ResourceGroupName
-    $subscriptionArgs = Get-SubscriptionArgument
-    $fqdn = Get-CliText (& az containerapp list --resource-group $resourceGroup @subscriptionArgs --query "[?starts_with(name,'ca-web-')].properties.configuration.ingress.fqdn | [0]" --output tsv --only-show-errors 2>$null)
-    if ([string]::IsNullOrWhiteSpace($fqdn)) { return '' }
-    return "https://$fqdn"
+    return ''
+}
+
+function Wait-AppHealthy {
+    # Let's Encrypt usually issues the certificate a minute or two after the first deployment; until then
+    # the ingress serves a self-signed certificate and the HTTPS check fails.
+    param([Parameter(Mandatory)][string] $Url)
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastError = ''
+    while ($true) {
+        try {
+            $health = Invoke-WebRequest -Uri "$Url/api/health" -UseBasicParsing -TimeoutSec 30
+            if ($health.StatusCode -eq 200) { return $true }
+            $lastError = "HTTP $($health.StatusCode)"
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+        if ($clock.Elapsed.TotalSeconds -ge $HealthTimeoutSeconds) {
+            Write-Warning "$Url/api/health is not healthy yet ($lastError). The TLS certificate may still be issuing: check 'kubectl get certificate --namespace cloudlens'."
+            return $false
+        }
+        Write-Host "  Waiting for $Url to answer over HTTPS ($([int]$clock.Elapsed.TotalSeconds)s so far, up to $HealthTimeoutSeconds)..." -ForegroundColor DarkGray
+        Start-Sleep -Seconds 20
+    }
 }
 
 function Get-RoleAssignmentSnapshot {
@@ -343,7 +404,10 @@ Write-Step 'Checking prerequisites'
 foreach ($tool in @('git', 'azd', 'az')) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "'$tool' is required and was not found on PATH." }
 }
-Write-Host 'git, azd and az are available.'
+if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
+    throw "'terraform' (1.9 or later) is required: azd provisions this app with Terraform. Install it (for example 'winget install Hashicorp.Terraform'), then rerun."
+}
+Write-Host 'git, azd, az and terraform are available.'
 
 $repoRoot = $RepoDirectory
 if (-not $repoRoot) {
@@ -360,9 +424,9 @@ if (Test-Path -LiteralPath (Join-Path $repoRoot 'azure.yaml')) {
     if ((Test-Path -LiteralPath $repoRoot) -and @(Get-ChildItem -LiteralPath $repoRoot -Force).Count -gt 0) {
         throw "'$repoRoot' already exists, is not empty, and is not a checkout of $RepoUrl."
     }
-    Write-Step "Cloning $RepoUrl into $repoRoot"
-    & git clone $RepoUrl $repoRoot
-    if ($LASTEXITCODE -ne 0) { throw "git clone of $RepoUrl failed." }
+    Write-Step "Cloning the $RepoBranch branch of $RepoUrl into $repoRoot"
+    & git clone --branch $RepoBranch $RepoUrl $repoRoot
+    if ($LASTEXITCODE -ne 0) { throw "git clone of $RepoUrl ($RepoBranch) failed." }
     if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'azure.yaml'))) {
         throw "$RepoUrl was cloned but contains no azure.yaml, so azd cannot deploy it."
     }
@@ -374,8 +438,12 @@ $deployed = $null
 # calls below never show, so it installs without asking for the duration of the run.
 $previousDynamicInstall = $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL
 $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'yes_without_prompt'
+$previousPath = $env:PATH
 Push-Location -LiteralPath $repoRoot
 try {
+    Resolve-KubernetesTools
+    Write-Host 'kubectl and kubelogin are available.'
+
     # -----------------------------------------------------------------------
     # 2. Sign in
     # -----------------------------------------------------------------------
@@ -389,6 +457,7 @@ try {
             & azd auth login
             if ($LASTEXITCODE -ne 0) { throw 'azd auth login failed.' }
         }
+        # Terraform authenticates through the Azure CLI, not azd's token cache.
         & az account show --output none --only-show-errors 2>$null
         if ($LASTEXITCODE -ne 0) {
             & az login --output none --only-show-errors
@@ -438,70 +507,37 @@ try {
         Write-Host "  $($entry.Key) set."
     }
 
-    # An environment that already has a Foundry account must reference it instead of re-declaring
-    # it, otherwise every azd up resets the account into Accepted and fails the dependent resources.
-    if (Test-FoundryAccountExists) {
-        Set-AzdValue 'APP_REUSE_AI_ACCOUNT' 'true'
-        Write-Host '  APP_REUSE_AI_ACCOUNT set (an AI Foundry account already exists in the resource group).'
-    }
-
     # -----------------------------------------------------------------------
     # 4. Provision and deploy
     # -----------------------------------------------------------------------
     if ($SkipPreview) {
         Write-Step 'Skipping the infrastructure preview (-SkipPreview)'
     } else {
-        Write-Step 'Previewing the infrastructure (azd provision --preview)'
+        Write-Step 'Previewing the infrastructure (azd provision --preview runs terraform plan)'
         $previewText = Invoke-AzdCaptured @('provision', '--preview')
         if ($LASTEXITCODE -ne 0 -and $previewText -match $azdNeedsInput) { Invoke-AzdInTerminal @('provision', '--preview') }
         if ($LASTEXITCODE -ne 0) { throw 'Infrastructure preview failed. Nothing was deployed.' }
     }
 
-    Invoke-AzdUp 'provision infrastructure and publish the container images'
-    Wait-Settle 'letting the first deployment settle'
+    Invoke-Azd @('up') 'provision the cluster and deploy both services'
 
-    Set-AzdValue 'APP_REUSE_AI_ACCOUNT' 'true'
-    Write-Host 'APP_REUSE_AI_ACCOUNT is now true, so later deployments reference the Foundry account instead of re-declaring it.'
-
-    Write-Step 'Verifying the container image handoff'
+    Write-Step 'Verifying the deployment'
     $apiImage = Get-AzdValue 'SERVICE_API_IMAGE_NAME'
     $webImage = Get-AzdValue 'SERVICE_WEB_IMAGE_NAME'
+    Write-Host "AKS cluster            = $(Get-AzdValue 'AZURE_AKS_CLUSTER_NAME')"
     Write-Host "SERVICE_API_IMAGE_NAME = $(if ($apiImage) { $apiImage } else { '<not set>' })"
     Write-Host "SERVICE_WEB_IMAGE_NAME = $(if ($webImage) { $webImage } else { '<not set>' })"
-    if (-not $apiImage -or -not $webImage -or -not (Test-ContainerAppsExist)) {
-        # The first pass builds the images in parallel with provisioning, so Bicep usually cannot
-        # create ca-api-*/ca-web-* until a second pass sees the published image names.
-        Invoke-AzdUp 'create the Container Apps from the published images'
-        Wait-Settle 'letting the Container Apps settle'
-        $apiImage = Get-AzdValue 'SERVICE_API_IMAGE_NAME'
-        $webImage = Get-AzdValue 'SERVICE_WEB_IMAGE_NAME'
-    }
     if (-not $apiImage -or -not $webImage) {
-        throw 'azd did not publish both container images. Rerun this script once the remote build completes.'
+        throw 'azd did not publish both container images. Review the azd output above, then rerun this script.'
     }
-
-    # -----------------------------------------------------------------------
-    # 5. Scheduled processor
-    # -----------------------------------------------------------------------
     if ($SkipProcessor) {
-        Write-Step 'Skipping the scheduled processor (-SkipProcessor)'
+        Write-Host 'Scheduled processor: left as configured (-SkipProcessor).'
     } else {
-        Write-Step 'Enabling the scheduled export processor'
-        $processorEnabled = Get-AzdValue 'APP_ENABLE_PROCESSOR'
-        $processorImage = Get-AzdValue 'SERVICE_PROCESSOR_IMAGE_NAME'
-        Set-AzdValue 'APP_ENABLE_PROCESSOR' 'true'
-        Set-AzdValue 'SERVICE_PROCESSOR_IMAGE_NAME' $apiImage
-        Write-Host "The processor runs the API image: $apiImage"
-        if ($processorEnabled -ne 'true' -or $processorImage -ne $apiImage) {
-            Invoke-AzdUp 'deploy the scheduled processor'
-            Wait-Settle 'letting the processor job settle'
-        } else {
-            Write-Host 'The processor is already deployed with this image; no redeploy needed.'
-        }
+        Write-Host "Scheduled processor: $(if ((Get-AzdValue 'APP_PROCESSOR_DEPLOYED') -eq 'true') { 'active (CronJob processor, every 5 minutes)' } else { 'suspended' })"
     }
 
     # -----------------------------------------------------------------------
-    # 6. Sign-in registrations
+    # 5. Sign-in registrations
     # -----------------------------------------------------------------------
     if ($SkipIdentityBootstrap) {
         Write-Step 'Skipping the Entra ID sign-in bootstrap (-SkipIdentityBootstrap)'
@@ -570,15 +606,15 @@ try {
         Set-AzdValue 'MEGHKOSHA_API_CLIENT_ID' $apiClientId
         Set-AzdValue 'MEGHKOSHA_WEB_CLIENT_ID' $webClientId
         if ($currentApiClientId -ne $apiClientId -or $currentWebClientId -ne $webClientId) {
-            Invoke-AzdUp 'publish the sign-in configuration'
-            Wait-Settle 'letting the sign-in configuration roll out'
+            # The client IDs only feed the pods' environment, so redeploying the services is enough.
+            Invoke-Azd @('deploy') 'roll out the sign-in configuration'
         } else {
             Write-Host 'The deployment already carries these client IDs; no redeploy needed.'
         }
     }
 
     # -----------------------------------------------------------------------
-    # 7. Subscription role assignments
+    # 6. Subscription role assignments
     # -----------------------------------------------------------------------
     $grantedSubscriptions = @()
     if ($SkipRoleAssignments) {
@@ -592,7 +628,7 @@ try {
         $processorPrincipalId = Get-CliText (& az identity list -g $resourceGroup @subscriptionArgs --query "[?starts_with(name,'id-processor-')].principalId | [0]" --output tsv --only-show-errors 2>$null)
         if (-not $apiPrincipalId) { throw "No id-api-* managed identity was found in $resourceGroup, so its subscription access cannot be granted." }
         if (-not $processorPrincipalId -and -not $SkipProcessor) {
-            throw "No id-processor-* managed identity was found in $resourceGroup. Rerun after the processor deploys, or pass -SkipProcessor."
+            throw "No id-processor-* managed identity was found in $resourceGroup. Rerun after the data/ai profile is provisioned, or pass -SkipProcessor."
         }
 
         $targets = $subscriptionIds
@@ -629,25 +665,21 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # 8. Summary
+    # 7. Summary
     # -----------------------------------------------------------------------
     Write-Step 'Deployment summary'
     $url = Get-WebEndpointUrl
-    if ($url) {
-        try {
-            $health = Invoke-WebRequest -Uri "$url/api/health" -UseBasicParsing -TimeoutSec 30
-            if ($health.StatusCode -ne 200) { Write-Warning "The API health endpoint returned HTTP $($health.StatusCode)." }
-        } catch {
-            Write-Warning "The API health endpoint could not be reached yet: $($_.Exception.Message)"
-        }
-    }
+    $healthy = $false
+    if ($url) { $healthy = Wait-AppHealthy $url }
     $deployed = [ordered]@{
         environment = $EnvironmentName
         subscription = $deploymentSubscription
         resourceGroup = Get-ResourceGroupName
+        cluster = Get-AzdValue 'AZURE_AKS_CLUSTER_NAME'
         webUrl = $url
+        healthy = $healthy
         apiImage = Get-AzdValue 'SERVICE_API_IMAGE_NAME'
-        processorEnabled = (Get-AzdValue 'APP_ENABLE_PROCESSOR') -eq 'true'
+        processorEnabled = (Get-AzdValue 'APP_PROCESSOR_DEPLOYED') -eq 'true'
         apiClientId = Get-AzdValue 'MEGHKOSHA_API_CLIENT_ID'
         webClientId = Get-AzdValue 'MEGHKOSHA_WEB_CLIENT_ID'
         assessedSubscriptions = @($grantedSubscriptions)
@@ -655,6 +687,7 @@ try {
 } finally {
     Pop-Location
     $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = $previousDynamicInstall
+    $env:PATH = $previousPath
 }
 
 $deployed | ConvertTo-Json -Depth 5

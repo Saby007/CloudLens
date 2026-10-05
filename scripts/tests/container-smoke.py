@@ -79,8 +79,10 @@ def verify(api, web):
         assert asset, f"Empty asset: {path}"
     response(urljoin(web, "/auth-callback.html"))
     response(urljoin(web, "/.env"), 403)
-    response(urljoin(web, "/api/health"), 502)
-    print(json.dumps({"result": "passed", "apiUser": 65532, "pythonVersion": sys.version.split()[0], "nativeDependencies": "passed", "compiledAssets": len(page.paths), "unsignedIdentity": "rejected", "unavailableHttpsUpstream": "rejected", "liveIdentityValidated": False}))
+    payload, _ = response(urljoin(web, "/api/health"))
+    assert json.loads(payload)["status"] == "ok"
+    response(urljoin(web, "/api/auth/me"), 401, {"X-MS-CLIENT-PRINCIPAL": "forged", "X-Meghkosha-User-Token": "forged"})
+    print(json.dumps({"result": "passed", "apiUser": 65532, "pythonVersion": sys.version.split()[0], "nativeDependencies": "passed", "compiledAssets": len(page.paths), "unsignedIdentity": "rejected", "proxiedApi": "passed", "proxiedForgedIdentity": "rejected", "liveIdentityValidated": False}))
 
 
 if __name__ == "__main__":

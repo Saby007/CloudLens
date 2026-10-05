@@ -25,4 +25,14 @@ web/vite.demo.config.ts
 **/coverage/
 *.tsbuildinfo
 *.log
-infra/*.compiled.json
+# Terraform: azd keeps state and plans under .azure/<env>/infra; direct runs of the operator templates keep them here.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

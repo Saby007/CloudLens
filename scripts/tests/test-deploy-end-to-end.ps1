@@ -14,17 +14,17 @@ $webClientId = '55555555-5555-5555-5555-555555555555'
 
 $global:deployTestState = @{
     environments = @{}
-    upCalls = [System.Collections.Generic.List[string]]::new()
+    # Every azd provisioning/deployment call, as '<command>:<outcome>'.
+    azdCalls = [System.Collections.Generic.List[string]]::new()
     previewCalls = 0
     authChecks = 0
     interactiveLogins = 0
     cloneCalls = 0
-    containerApps = $false
-    imagesPublished = $false
-    failNextUp = 'AccountProvisioningStateInvalid: the account is still in Accepted'
+    failNextUp = 'Error: creating Kubernetes Cluster: AnotherOperationInProgress: Another operation (Update) is in progress'
     roleAssignments = [System.Collections.Generic.List[object]]::new()
     roleCreates = [System.Collections.Generic.List[object]]::new()
     bootstrapCalls = 0
+    installCliCalls = [System.Collections.Generic.List[string]]::new()
     # azd calls made without --no-prompt (sign-in excepted); only the deliberate rerun in the terminal may appear.
     interactiveAzd = [System.Collections.Generic.List[string]]::new()
     needsAnswer = $false
@@ -74,6 +74,14 @@ function git {
     $global:deployTestState.cloneCalls++
     throw 'The test checkout already exists; cloning must be skipped.'
 }
+
+# Present on PATH as far as the helper can tell; the helper itself never runs them (azd and the hook do).
+function terraform { throw 'The helper must leave Terraform to azd.' }
+function Install-KubernetesToolStubs {
+    Set-Item -Path function:global:kubectl -Value { throw 'The helper must leave kubectl to azd and the hook.' }
+    Set-Item -Path function:global:kubelogin -Value { throw 'The helper must leave kubelogin to azd and the hook.' }
+}
+Install-KubernetesToolStubs
 
 function azd {
     $raw = @($args)
@@ -138,35 +146,37 @@ function azd {
         if ($state.needsAnswer) {
             # With --no-prompt azd reports the question it could not ask; the terminal rerun answers it.
             if ($noPrompt) {
-                $state.upCalls.Add('needs-answer')
+                $state.azdCalls.Add('up:needs-answer')
                 Write-Output "ERROR: prompting for location: no default response for prompt 'Select an Azure location to use'"
                 $global:LASTEXITCODE = 1
                 return
             }
             $state.needsAnswer = $false
-            $state.upCalls.Add('answered')
+            $state.azdCalls.Add('up:answered')
         }
         if ($state.failNextUp) {
             $message = $state.failNextUp
             $state.failNextUp = ''
-            $state.upCalls.Add('failed')
+            $state.azdCalls.Add('up:failed')
             Write-Output $message
             $global:LASTEXITCODE = 1
             return
         }
-        if (-not $state.imagesPublished) {
-            # azd publishes the images on the pass that creates them, before Bicep can use the names.
-            $state.imagesPublished = $true
-            $values['SERVICE_API_IMAGE_NAME'] = 'cost-app/api:v1'
-            $values['SERVICE_WEB_IMAGE_NAME'] = 'cost-app/web:v1'
-            $values['AZURE_RESOURCE_GROUP'] = $state.resourceGroup
-            $values['APP_WEB_ORIGIN'] = 'https://web.example.test'
-            $values['MEGHKOSHA_OBO_MANAGED_IDENTITY_RESOURCE_ID'] = "/subscriptions/$($state.subscriptionId)/resourceGroups/$($state.resourceGroup)/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-obo"
-        } else {
-            $state.containerApps = $true
-            $values['SERVICE_WEB_ENDPOINT_URL'] = 'https://web.example.test'
-        }
-        $state.upCalls.Add('succeeded')
+        # One azd up provisions with Terraform, runs the hook, builds both images and applies the manifests.
+        $values['SERVICE_API_IMAGE_NAME'] = 'acrtest.azurecr.io/cost-assessment-app/api-app-test:azd-deploy-1'
+        $values['SERVICE_WEB_IMAGE_NAME'] = 'acrtest.azurecr.io/cost-assessment-app/web-app-test:azd-deploy-1'
+        $values['AZURE_RESOURCE_GROUP'] = $state.resourceGroup
+        $values['AZURE_AKS_CLUSTER_NAME'] = 'aks-0123456789abc'
+        $values['APP_WEB_ORIGIN'] = 'https://web.example.test'
+        $values['APP_PROCESSOR_DEPLOYED'] = if ($values.Contains('APP_ENABLE_PROCESSOR') -and $values['APP_ENABLE_PROCESSOR'] -eq 'true') { 'true' } else { 'false' }
+        $values['MEGHKOSHA_OBO_MANAGED_IDENTITY_RESOURCE_ID'] = "/subscriptions/$($state.subscriptionId)/resourceGroups/$($state.resourceGroup)/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-obo"
+        $state.azdCalls.Add('up:succeeded')
+        return
+    }
+    if ($a[0] -eq 'deploy') {
+        $values = $state.environments[$environment]
+        if (-not $values.Contains('SERVICE_API_IMAGE_NAME')) { throw 'azd deploy ran before azd up provisioned the environment.' }
+        $state.azdCalls.Add("deploy:succeeded:$($values['MEGHKOSHA_API_CLIENT_ID'])")
         return
     }
     throw "Unexpected azd call: $($a -join ' ')"
@@ -186,17 +196,13 @@ function az {
         return
     }
     if ($a[0] -eq 'login') { $state.interactiveLogins++; return }
-    if ($a[0] -in @('cognitiveservices', 'deployment', 'containerapp', 'identity') -and
-        (Get-StubArgument $a '--subscription') -ne $state.subscriptionId) {
-        throw "az $($a[0]) must be pinned to the deployment subscription, otherwise it reads the wrong one."
+    if ($a[0] -eq 'aks' -and $a[1] -eq 'install-cli') {
+        $state.installCliCalls.Add("$(Get-StubArgument $a '--install-location')|$(Get-StubArgument $a '--kubelogin-install-location')")
+        Install-KubernetesToolStubs
+        return
     }
-    if ($a[0] -eq 'cognitiveservices') { return '' }
-    if ($a[0] -eq 'deployment') { return '' }
-    if ($a[0] -eq 'containerapp' -and $a[1] -eq 'list') {
-        if (-not $state.containerApps) { return '' }
-        $query = Get-StubArgument $a '--query'
-        if ($query -match 'fqdn') { return 'web.example.test' }
-        return "ca-api-$($state.environmentName)`nca-web-$($state.environmentName)"
+    if ($a[0] -eq 'identity' -and (Get-StubArgument $a '--subscription') -ne $state.subscriptionId) {
+        throw 'az identity must be pinned to the deployment subscription, otherwise it reads the wrong one.'
     }
     if ($a[0] -eq 'identity' -and $a[1] -eq 'list') {
         if ((Get-StubArgument $a '-g') -ne $state.resourceGroup) { throw 'Managed identities must be listed from the deployment resource group.' }
@@ -236,7 +242,9 @@ function az {
 }
 
 $repoRoot = Join-Path ([System.IO.Path]::GetTempPath()) "cloudlens-deploy-test-$([guid]::NewGuid().ToString('n'))"
+$toolsHome = Join-Path $repoRoot 'tools-home'
 New-Item -ItemType Directory -Path (Join-Path $repoRoot 'scripts') -Force | Out-Null
+New-Item -ItemType Directory -Path $toolsHome -Force | Out-Null
 try {
     Set-Content -LiteralPath (Join-Path $repoRoot 'azure.yaml') -Value 'name: cloudlens-test'
     Set-Content -LiteralPath (Join-Path $repoRoot 'scripts/bootstrap-identity.ps1') -Value @"
@@ -254,6 +262,7 @@ param(
 )
 if (-not `$Apply) { throw 'The helper must apply the identity configuration.' }
 if (`$env:APP_ALLOW_AZURE_CHANGES -ne 'true') { throw 'The helper must set the explicit approval flag.' }
+if ("`$WebOrigin" -ne 'https://web.example.test/') { throw "The sign-in redirect must use the ingress origin, not `$WebOrigin." }
 `$global:deployTestState.bootstrapCalls++
 if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementReference) {
     throw 'Microsoft Graph POST /v1.0/applications was refused because this tenant requires a Service Tree ID (serviceManagementReference) on new app registrations. Rerun with -ServiceManagementReference <id>.'
@@ -275,11 +284,13 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         TargetSubscriptionId = "$targetOne, $targetTwo"
         SettleSeconds = 0
         MaxAttempts = 3
+        KubernetesToolsDirectory = $toolsHome
     }
 
     $plan = & $script @parameters -PlanOnly | ConvertFrom-Json -AsHashtable
-    if (@($plan.assessedSubscriptions) -join ',' -ne "$targetOne,$targetTwo") { throw 'Comma-separated subscriptions were not expanded into separate targets.' }
-    if ($global:deployTestState.upCalls.Count -ne 0) { throw '-PlanOnly must not deploy anything.' }
+    if (@($plan.assessedSubscriptions) -join ',' -ne "$targetOne,$targetTwo") { throw 'Comma-separated target subscriptions were not split into separate subscriptions.' }
+    if ($plan.hosting -ne 'aks' -or $plan.repository.branch -ne 'cloudlensdev') { throw 'The plan must describe the AKS deployment from the cloudlensdev branch.' }
+    if ($global:deployTestState.azdCalls.Count -ne 0) { throw '-PlanOnly must not deploy anything.' }
 
     $summary = & $script @parameters
     if (@($summary).Count -ne 1) { throw 'The helper must return only its deployment summary; progress output belongs on the host.' }
@@ -296,9 +307,7 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         APP_ENABLE_CHAT_RUNTIME = 'true'
         APP_AI_VALIDATED = 'true'
         APP_ENABLE_AI_RUNTIME = 'false'
-        APP_REUSE_AI_ACCOUNT = 'true'
         APP_ENABLE_PROCESSOR = 'true'
-        SERVICE_PROCESSOR_IMAGE_NAME = 'cost-app/api:v1'
         MEGHKOSHA_API_CLIENT_ID = $apiClientId
         MEGHKOSHA_WEB_CLIENT_ID = $webClientId
     }
@@ -307,13 +316,17 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
             throw "Environment value $key is '$(if ($values.Contains($key)) { $values[$key] } else { '<unset>' })' instead of '$($expected[$key])'."
         }
     }
+    foreach ($retired in @('APP_REUSE_AI_ACCOUNT', 'APP_RESTORE_AI_ACCOUNT', 'SERVICE_PROCESSOR_IMAGE_NAME')) {
+        if ($values.Contains($retired)) { throw "$retired belongs to the Container Apps flow and must not be set on AKS." }
+    }
     if ($values['APP_MODEL_DEPLOYMENTS'] -notmatch '"modelName":"model-router"' -or $values['APP_MODEL_DEPLOYMENTS'] -notmatch '"capacity":20\}') { throw 'The approved Model Router deployment definition was not applied.' }
     if ($state.previewCalls -ne 1) { throw "azd provision --preview ran $($state.previewCalls) times instead of once." }
     if ($state.authChecks -ne 1 -or $state.interactiveLogins -ne 0) { throw 'Sign-in must be checked once and must not prompt when already authenticated.' }
     if ($state.cloneCalls -ne 0) { throw 'An existing checkout must not be cloned again.' }
+    if ($state.installCliCalls.Count -ne 0 -or $state.questions.Count -ne 0) { throw 'kubectl and kubelogin were available, so nothing may be installed or asked.' }
     if ($state.bootstrapCalls -ne 1) { throw "bootstrap-identity.ps1 ran $($state.bootstrapCalls) times instead of once." }
-    if (($state.upCalls -join ',') -ne 'failed,succeeded,succeeded,succeeded,succeeded') {
-        throw "Unexpected azd up sequence: $($state.upCalls -join ',')"
+    if (($state.azdCalls -join ',') -ne "up:failed,up:succeeded,deploy:succeeded:$apiClientId") {
+        throw "Unexpected azd sequence: $($state.azdCalls -join ',')"
     }
     if ($state.roleCreates.Count -ne 6) { throw "Expected six role assignments, got $($state.roleCreates.Count)." }
     foreach ($scope in @("/subscriptions/$targetOne", "/subscriptions/$targetTwo")) {
@@ -324,19 +337,19 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
             throw "The three documented role assignments were not all made on $scope."
         }
     }
-    if ($summary.webUrl -ne 'https://web.example.test' -or -not $summary.processorEnabled -or
-        $summary.apiClientId -ne $apiClientId -or $summary.subscription -ne $subscriptionId -or
+    if ($summary.webUrl -ne 'https://web.example.test' -or -not $summary.healthy -or -not $summary.processorEnabled -or
+        $summary.cluster -ne 'aks-0123456789abc' -or $summary.apiClientId -ne $apiClientId -or $summary.subscription -ne $subscriptionId -or
         @($summary.assessedSubscriptions).Count -ne 2) {
         throw 'The deployment summary misreports the delivered environment.'
     }
 
     # A rerun against a settled environment must deploy the current code once and nothing more:
-    # no repeated image-handoff, processor or sign-in deployments, and no duplicated role assignments.
-    $state.upCalls.Clear()
+    # no repeated sign-in rollout and no duplicated role assignments.
+    $state.azdCalls.Clear()
     $state.roleCreates.Clear()
     $state.previewCalls = 0
     & $script @parameters -SkipPreview | Out-Null
-    if (($state.upCalls -join ',') -ne 'succeeded') { throw "A rerun deployed $($state.upCalls.Count) time(s) instead of only redeploying the current code once." }
+    if (($state.azdCalls -join ',') -ne 'up:succeeded') { throw "A rerun made these azd calls instead of one azd up: $($state.azdCalls -join ',')" }
     if ($state.roleCreates.Count -ne 0) { throw 'A rerun duplicated role assignments instead of detecting the existing ones.' }
     if ($state.previewCalls -ne 0) { throw '-SkipPreview still ran the infrastructure preview.' }
     if ($state.bootstrapCalls -ne 2) { throw 'The sign-in bootstrap must be re-verified on every run.' }
@@ -344,11 +357,11 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     # azd must never wait on a question nobody can see: every call except sign-in runs with --no-prompt,
     # and when azd reports that it needed an answer, that same command reruns attached to the terminal.
     if ($state.interactiveAzd.Count) { throw "azd ran without --no-prompt, so a question it asked would be invisible: $($state.interactiveAzd -join '; ')" }
-    $state.upCalls.Clear()
+    $state.azdCalls.Clear()
     $state.needsAnswer = $true
     & $script @parameters -SkipPreview | Out-Null
-    if (($state.upCalls -join ',') -ne 'needs-answer,answered,succeeded') {
-        throw "A question azd needed answered was not handed to the terminal: $($state.upCalls -join ',')"
+    if (($state.azdCalls -join ',') -ne 'up:needs-answer,up:answered,up:succeeded') {
+        throw "A question azd needed answered was not handed to the terminal: $($state.azdCalls -join ',')"
     }
     if (($state.interactiveAzd -join '; ') -ne "up --environment $environmentName") {
         throw "Only the azd command that needed an answer may run interactively; got: $($state.interactiveAzd -join '; ')"
@@ -375,9 +388,46 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     $state.requireServiceTree = $false
     if ($state.interactiveAzd.Count) { throw "azd ran without --no-prompt: $($state.interactiveAzd -join '; ')" }
 
-    [ordered]@{ result = 'passed'; deployments = 5; roleAssignments = 6; rerunRedeploysOnce = $true
-                noHiddenPrompts = $true; azdQuestionsAskedInTerminal = $true; serviceTreeIdAskedAndRemembered = $true } | ConvertTo-Json -Compress
+    # Missing kubectl/kubelogin: the helper asks before installing them with az aks install-cli into the
+    # tools directory, -InstallKubernetesTools installs without asking, and an unattended run that cannot
+    # ask explains what to do instead of guessing.
+    $savedPath = $env:PATH
+    $emptyPath = Join-Path $repoRoot 'empty-path'
+    New-Item -ItemType Directory -Path $emptyPath -Force | Out-Null
+    try {
+        $env:PATH = $emptyPath
+        Remove-Item -Path Function:\kubectl, Function:\kubelogin
+        $state.answers.Add('')
+        & $script @parameters -SkipPreview -SkipIdentityBootstrap -SkipRoleAssignments | Out-Null
+        if ($state.questions.Count -ne 1 -or $state.questions[0] -notmatch 'az aks install-cli') {
+            throw "Missing Kubernetes tools must be offered for installation in the terminal. Asked: $($state.questions -join ' | ')"
+        }
+        $expectedInstall = "$(Join-Path (Join-Path $toolsHome '.azure-kubectl') "kubectl$(if ($IsWindows) { '.exe' })")|$(Join-Path (Join-Path $toolsHome '.azure-kubelogin') "kubelogin$(if ($IsWindows) { '.exe' })")"
+        if (($state.installCliCalls -join ';') -ne $expectedInstall) { throw "az aks install-cli was not run once into the tools directory: $($state.installCliCalls -join ';')" }
+        if ($env:PATH -ne $emptyPath) { throw 'The helper must restore PATH when it finishes.' }
+
+        $state.questions.Clear()
+        $state.installCliCalls.Clear()
+        Remove-Item -Path Function:\kubectl, Function:\kubelogin
+        & $script @parameters -SkipPreview -SkipIdentityBootstrap -SkipRoleAssignments -InstallKubernetesTools | Out-Null
+        if ($state.questions.Count -ne 0 -or $state.installCliCalls.Count -ne 1) { throw '-InstallKubernetesTools must install without asking.' }
+
+        Remove-Item -Path Function:\kubectl, Function:\kubelogin
+        $refused = $null
+        try { & $script @parameters -SkipPreview -SkipIdentityBootstrap -SkipRoleAssignments | Out-Null } catch { $refused = $_.Exception.Message }
+        if ($refused -notmatch 'az aks install-cli' -or $refused -notmatch '-InstallKubernetesTools') {
+            throw "A session that cannot answer must explain how to install the tools; got: $refused"
+        }
+    } finally {
+        $env:PATH = $savedPath
+        Install-KubernetesToolStubs
+    }
+
+    [ordered]@{ result = 'passed'; azdCalls = 'up,deploy'; roleAssignments = 6; rerunRedeploysOnce = $true
+                noHiddenPrompts = $true; azdQuestionsAskedInTerminal = $true; serviceTreeIdAskedAndRemembered = $true
+                kubernetesToolsOfferedAndInstalled = $true } | ConvertTo-Json -Compress
 } finally {
     Remove-Variable -Name deployTestState -Scope Global -ErrorAction SilentlyContinue
+    Remove-Item -Path Function:\kubectl, Function:\kubelogin -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $repoRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

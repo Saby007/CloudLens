@@ -1,0 +1,101 @@
+# Scheduled FOCUS export processor, applied by `azd deploy api` because it runs the API image.
+# It stays suspended until Terraform reports APP_PROCESSOR_DEPLOYED=true (data or ai profile with
+# APP_ENABLE_PROCESSOR=true). Ticks never overlap; each one is checkpointed, so a skipped tick only delays work.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: processor
+  labels:
+    app.kubernetes.io/name: processor
+    app.kubernetes.io/part-of: cloudlens
+  annotations:
+    azure.workload.identity/client-id: {{ index .Env "AZURE_PROCESSOR_IDENTITY_CLIENT_ID" | printf "%q" }}
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: processor
+  labels:
+    app.kubernetes.io/name: processor
+    app.kubernetes.io/part-of: cloudlens
+spec:
+  schedule: {{ or (index .Env "APP_PROCESSOR_CRON") "*/5 * * * *" | printf "%q" }}
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 240
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  suspend: {{ if eq (index .Env "APP_PROCESSOR_DEPLOYED") "true" }}false{{ else }}true{{ end }}
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: processor
+            app.kubernetes.io/part-of: cloudlens
+            azure.workload.identity/use: "true"
+        spec:
+          serviceAccountName: processor
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: processor
+              image: {{ index .Env "SERVICE_API_IMAGE_NAME" | printf "%q" }}
+              imagePullPolicy: IfNotPresent
+              command:
+                - /usr/bin/python
+                - -m
+                - jobs.scheduler
+              env:
+                - name: AZURE_CLIENT_ID
+                  value: {{ index .Env "AZURE_PROCESSOR_IDENTITY_CLIENT_ID" | printf "%q" }}
+                - name: AZURE_TENANT_ID
+                  value: {{ index .Env "AZURE_TENANT_ID" | printf "%q" }}
+                - name: APP_SCHEDULER_ENABLED
+                  value: "true"
+                - name: COST_EXPORT_STORAGE_URL
+                  value: {{ index .Env "COST_EXPORT_STORAGE_URL" | printf "%q" }}
+                - name: COST_EXPORT_STORAGE_RESOURCE_ID
+                  value: {{ index .Env "COST_EXPORT_STORAGE_RESOURCE_ID" | printf "%q" }}
+                - name: COST_EXPORT_NAME
+                  value: {{ index .Env "COST_EXPORT_NAME" | printf "%q" }}
+                - name: COST_EXPORT_DAILY_NAME
+                  value: {{ index .Env "COST_EXPORT_DAILY_NAME" | printf "%q" }}
+                - name: FOCUS_EXPORT_PARALLEL_MONTHS
+                  value: {{ index .Env "FOCUS_EXPORT_PARALLEL_MONTHS" | printf "%q" }}
+                - name: COST_EXPORT_CONTAINER
+                  value: "cost-exports"
+                - name: CONTROL_STATE_CONTAINER
+                  value: "control-state"
+                - name: MEGHKOSHA_AI_ENABLED
+                  value: "false"
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: 2Gi
+                limits:
+                  memory: 2Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 256Mi
