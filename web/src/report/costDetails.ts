@@ -31,8 +31,18 @@ export function presetCostWindow(dates: string[], days: number): CostWindow {
   return { startDate: shiftCostDate(endDate, 1 - days), endDate };
 }
 
+/* The report's headline figure is a calendar month. Defaulting the cost
+   window to a rolling 30 days put $487.02 (Aug 2-31) beside $494
+   (Aug 1-31) on the same page, so the default is the assessed month. */
+export function monthCostWindow(periodStart: string, periodEnd: string): CostWindow | null {
+  return validCostDate(periodStart) && validCostDate(periodEnd) && periodStart <= periodEnd
+    ? { startDate: periodStart, endDate: periodEnd }
+    : null;
+}
+
 /* The daily pull adds the open month through yesterday. When a report has it,
-   the page opens on that month to date so the newest days are what you see first. */
+   the page opens on that month to date so the newest days are what you see
+   first; the assessed (closed) month stays one click away. */
 export function monthToDateWindow(details: CostDetailSummary | undefined): CostWindow | null {
   const period = details?.partialPeriod;
   const latest = (details?.dates ?? []).filter(validCostDate).sort().at(-1);
@@ -40,41 +50,70 @@ export function monthToDateWindow(details: CostDetailSummary | undefined): CostW
   return { startDate: `${period}-01`, endDate: latest, monthToDate: true };
 }
 
-/* The initial window for a report: the open month to date, else the last 30 days. */
-export function defaultCostWindow(details: CostDetailSummary | undefined, dates: string[]): CostWindow {
-  return monthToDateWindow(details) ?? presetCostWindow(dates, 30);
+/* The initial window for a report: the open month to date, else the assessed month, else the last 30 days. */
+export function defaultCostWindow(details: CostDetailSummary | undefined, periodStart: string, periodEnd: string, dates: string[]): CostWindow {
+  return monthToDateWindow(details) ?? monthCostWindow(periodStart, periodEnd) ?? presetCostWindow(dates, 30);
+}
+
+function lastDayOfMonth(year: number, monthIndex: number): number {
+  return new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+}
+
+/* A window that starts on the 1st and ends on the month's last day. */
+export function isCalendarMonth(window: CostWindow): boolean {
+  if (!validCostDate(window.startDate) || !validCostDate(window.endDate)) return false;
+  const [year, month, day] = window.startDate.split('-').map(Number);
+  return day === 1
+    && window.endDate === `${window.startDate.slice(0, 8)}${String(lastDayOfMonth(year, month - 1)).padStart(2, '0')}`;
 }
 
 /* The open month to date (1-4 Oct). Other windows that happen to start on the
    1st, such as a 7-day range ending on the 7th, keep rolling comparisons. */
 export function isMonthToDate(window: CostWindow): boolean {
   return window.monthToDate === true && validCostDate(window.startDate) && validCostDate(window.endDate) && window.startDate.endsWith('-01')
-    && window.startDate.slice(0, 7) === window.endDate.slice(0, 7) && window.startDate <= window.endDate;
+    && window.startDate.slice(0, 7) === window.endDate.slice(0, 7) && window.startDate <= window.endDate && !isCalendarMonth(window);
 }
 
 export function previousCostWindow(window: CostWindow): CostWindow {
-  // A month to date compares with the same days of the previous month (1-4 Oct with 1-4 Sep).
-  if (isMonthToDate(window)) {
+  /* A calendar month compares with the previous calendar month, so days pair
+     by day of month (Aug 2 with Jul 2). Shifting by day count instead paired
+     Aug 2 with Jul 3, and for a 30-day month would have borrowed a day from
+     the month before that. */
+  if (isCalendarMonth(window) || isMonthToDate(window)) {
     const [year, month] = window.startDate.split('-').map(Number);
     const previousYear = month === 1 ? year - 1 : year;
     const previousMonth = month === 1 ? 12 : month - 1;
-    const lastDay = new Date(Date.UTC(previousYear, previousMonth, 0)).getUTCDate();
     const prefix = `${previousYear}-${String(previousMonth).padStart(2, '0')}`;
-    return { startDate: `${prefix}-01`, endDate: `${prefix}-${String(Math.min(Number(window.endDate.slice(8)), lastDay)).padStart(2, '0')}` };
+    const lastDay = lastDayOfMonth(previousYear, previousMonth - 1);
+    // A month to date compares with the same days of the previous month (1-4 Oct with 1-4 Sep).
+    const endDay = isCalendarMonth(window) ? lastDay : Math.min(Number(window.endDate.slice(8)), lastDay);
+    return { startDate: `${prefix}-01`, endDate: `${prefix}-${String(endDay).padStart(2, '0')}` };
   }
   const days = costWindowDates(window).length;
   return days ? { startDate: shiftCostDate(window.startDate, -days), endDate: shiftCostDate(window.startDate, -1) } : { startDate: '', endDate: '' };
 }
 
-/* The date a given day is compared with. In a month to date that is the same day of the
-   previous month, and a day the previous month lacks (30 Mar against February) has none. */
+/* The date in the previous window that a given day is compared with. For a
+   calendar month that is the same day of the previous month; a day with no
+   counterpart (the 31st against a 30-day month) has none, rather than being
+   paired with the 30th a second time and counted twice in period totals. */
 export function comparisonDate(window: CostWindow, index: number): string {
   const previous = previousCostWindow(window);
-  return isMonthToDate(window) ? costWindowDates(previous)[index] ?? '' : shiftCostDate(previous.startDate, index);
+  if (isCalendarMonth(window) || isMonthToDate(window)) return costWindowDates(previous)[index] ?? '';
+  return shiftCostDate(previous.startDate, index);
+}
+
+/* Tag keys as the report shows them are normalised by the API: `azd-env-name`
+   becomes "Azd Env Name". Comparing that display form with the raw key on a cost
+   row matched nothing, so every key containing a hyphen or underscore produced an
+   empty chart and no budgets. Both sides are folded the same way here. */
+export function sameTagKey(left: string, right: string): boolean {
+  const fold = (key: string) => key.toLowerCase().replace(/[\s_-]+/g, ' ').trim();
+  return fold(left) === fold(right);
 }
 
 export function costTagValue(row: CostDetailRow, key: string): string | undefined {
-  return Object.entries(row.tags).find(([name]) => name.toLowerCase() === key.toLowerCase())?.[1];
+  return Object.entries(row.tags).find(([name]) => sameTagKey(name, key))?.[1];
 }
 
 export function matchesCostFilter(row: CostDetailRow, filter: CostFilter): boolean {
@@ -120,7 +159,11 @@ export function compareCostGroups(details: CostDetailSummary | undefined, window
         : dimension === 'region' ? row.region : dimension === 'resourceGroup' ? row.resourceGroup : costTagValue(row, filter.tagKey ?? '') ?? null;
     const name = dimension === 'resource' ? row.resourceName || 'Unattributed charge'
       : dimension === 'subscription' ? row.subscriptionName : value ?? 'Untagged';
-    const key = JSON.stringify([row.subscriptionId, value]);
+    /* Azure resource ids and resource group names are case-insensitive, and FOCUS
+       exports carry both spellings (`SRE` and `sre`), so grouping on the raw text
+       split one resource group into two rows with half the cost each. */
+    const folded = dimension === 'resource' || dimension === 'resourceGroup' ? value?.toLowerCase() ?? null : value;
+    const key = JSON.stringify([row.subscriptionId.toLowerCase(), folded]);
     const group = groups.get(key) ?? { id: key, name, subscriptionId: row.subscriptionId, subscriptionName: row.subscriptionName, current: 0, previous: 0, sources: [] };
     group.sources.push(row);
     for (const [day, amount] of Object.entries(row.dailyCosts)) {
@@ -140,6 +183,7 @@ export function compareCostGroups(details: CostDetailSummary | undefined, window
 }
 
 export function dailySubscriptionCosts(details: CostDetailSummary | undefined, window: CostWindow, filter: CostFilter = {}) {
+  const previous = previousCostWindow(window);
   const rows = details?.status === 'complete' ? details.rows.filter((row) => matchesCostFilter(row, filter)) : [];
   const subscriptions = [...new Map(rows.map((row) => [row.subscriptionId, row.subscriptionName])).entries()];
   const dates = costWindowDates(window);
@@ -151,7 +195,7 @@ export function dailySubscriptionCosts(details: CostDetailSummary | undefined, w
     }
     return { subscriptionId, subscriptionName, days: dates.map((date, index) => {
       const previousDate = comparisonDate(window, index);
-      return { date, previousDate, current: available.has(date) ? totals.get(date) ?? 0 : null, previous: available.has(previousDate) ? totals.get(previousDate) ?? 0 : null };
+      return { date, previousDate, current: available.has(date) ? totals.get(date) ?? 0 : null, previous: previousDate && available.has(previousDate) ? totals.get(previousDate) ?? 0 : null };
     }) };
   });
 }
