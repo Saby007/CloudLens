@@ -16,13 +16,11 @@ from uuid import uuid4
 
 import httpx
 from azure.core.exceptions import AzureError, HttpResponseError, ResourceExistsError, ResourceNotFoundError
-from azure.identity import ManagedIdentityCredential
-from azure.identity.aio import ManagedIdentityCredential as AsyncManagedIdentityCredential
-from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.blob import ContentSettings
 from fastapi import HTTPException
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-from services import focus_export_control, user_arm_client
+from services import azure_connections, focus_export_control, user_arm_client
 from services.entra_tokens import configured_uuid
 
 logger = logging.getLogger(__name__)
@@ -168,9 +166,9 @@ def _configuration() -> tuple[str, str, str]:
 @contextmanager
 def _container():
     _, identity, url = _configuration()
-    with ManagedIdentityCredential(client_id=identity) as credential:
-        with BlobServiceClient(url, credential=credential, retry_total=0, connection_timeout=5, read_timeout=10) as service:
-            yield service.get_container_client(os.environ.get("CONTROL_STATE_CONTAINER", "control-state"))
+    # Shared for the process: a new client per lock opened a new storage connection and fetched a new token.
+    service = azure_connections.blob_service(url, identity, retry_total=0, connection_timeout=5, read_timeout=10)
+    yield service.get_container_client(os.environ.get("CONTROL_STATE_CONTAINER", "control-state"))
 
 
 def _blob_name(subscription_id: str) -> str:
@@ -239,10 +237,10 @@ async def _locked(subscription_id: str):
 
 async def _arm_request(method: str, path: str, body: dict | None = None, *, headers: dict | None = None):
     _, identity, _ = _configuration()
-    async with AsyncManagedIdentityCredential(client_id=identity) as credential:
-        token = await credential.get_token("https://management.azure.com/.default")
-        async with httpx.AsyncClient(base_url="https://management.azure.com", timeout=45 if method == "PUT" else 10, follow_redirects=False) as client:
-            response = await client.request(method, path, headers={**(headers or {}), "Authorization": f"Bearer {token.token}"}, json=body)
+    token = await azure_connections.arm_token(identity)
+    response = await azure_connections.http_client().request(
+        method, f"{azure_connections.ARM_BASE}{path}", headers={**(headers or {}), "Authorization": f"Bearer {token}"},
+        json=body, timeout=45 if method == "PUT" else 10)
     response.raise_for_status()
     if len(response.content) > 2 * 1024 * 1024:
         raise ValueError("Export control response is too large")

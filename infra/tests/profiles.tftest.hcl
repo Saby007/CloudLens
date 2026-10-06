@@ -30,6 +30,18 @@ mock_provider "azurerm" {
     }
   }
 
+  mock_resource "azurerm_network_security_group" {
+    defaults = {
+      id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Network/networkSecurityGroups/nsg-test"
+    }
+  }
+
+  mock_resource "azurerm_monitor_data_collection_rule" {
+    defaults = {
+      id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Insights/dataCollectionRules/dcr-test"
+    }
+  }
+
   mock_resource "azurerm_public_ip" {
     defaults = {
       id         = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Network/publicIPAddresses/pip-ingress-test"
@@ -195,6 +207,53 @@ run "core_profile_provisions_only_the_hardened_foundation" {
       azurerm_kubernetes_cluster.main.network_profile[0].dns_service_ip == "10.0.0.10"
     )
     error_message = "The cluster must use Azure CNI Overlay with the Cilium data plane and network policy."
+  }
+
+  assert {
+    condition = (
+      azurerm_kubernetes_cluster.main.network_profile[0].load_balancer_profile[0].managed_outbound_ip_count == 1 &&
+      azurerm_kubernetes_cluster.main.network_profile[0].load_balancer_profile[0].outbound_ports_allocated == 6400 &&
+      azurerm_kubernetes_cluster.main.network_profile[0].load_balancer_profile[0].idle_timeout_in_minutes == 4
+    )
+    error_message = "Each node needs 6,400 outbound SNAT ports released after 4 idle minutes; AKS's defaults ran out."
+  }
+
+  assert {
+    condition = (
+      startswith(azurerm_network_security_group.aks_nodes.name, "nsg-aks-nodes-") &&
+      length(azurerm_network_security_group.aks_nodes.security_rule) == 1 &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).name == "AllowWebToIngress" &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).direction == "Inbound" &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).access == "Allow" &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).protocol == "Tcp" &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).source_address_prefix == "Internet" &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).destination_address_prefix == azurerm_public_ip.ingress.ip_address &&
+      toset(one(azurerm_network_security_group.aks_nodes.security_rule).destination_port_ranges) == toset(["80", "443"])
+    )
+    error_message = "The node subnet's NSG must let the internet reach only the ingress IP, on HTTP and HTTPS."
+  }
+
+  assert {
+    condition = (
+      startswith(azurerm_network_security_group.private_endpoints.name, "nsg-private-endpoints-") &&
+      length(azurerm_network_security_group.private_endpoints.security_rule) == 0 &&
+      azurerm_subnet.aks.network_security_group_id_wo_version == 1 &&
+      azurerm_subnet.private_endpoints.network_security_group_id_wo_version == 1
+    )
+    error_message = "Both subnets must get their NSGs from Terraform, and the private endpoint subnet must allow nothing extra."
+  }
+
+  assert {
+    condition = (
+      azurerm_monitor_data_collection_rule_association.container_insights.target_resource_id == azurerm_kubernetes_cluster.main.id &&
+      azurerm_monitor_data_collection_rule_association.container_insights.data_collection_rule_id == azurerm_monitor_data_collection_rule.container_insights.id &&
+      azurerm_monitor_data_collection_rule.container_insights.destinations[0].log_analytics[0].workspace_resource_id == azurerm_log_analytics_workspace.main.id &&
+      toset(azurerm_monitor_data_collection_rule.container_insights.data_flow[0].streams) == toset(["Microsoft-ContainerLogV2", "Microsoft-KubeEvents", "Microsoft-KubePodInventory"]) &&
+      azurerm_monitor_data_collection_rule.container_insights.data_sources[0].extension[0].extension_name == "ContainerInsights" &&
+      jsondecode(azurerm_monitor_data_collection_rule.container_insights.data_sources[0].extension[0].extension_json).dataCollectionSettings.enableContainerLogV2 == true &&
+      jsondecode(azurerm_monitor_data_collection_rule.container_insights.data_sources[0].extension[0].extension_json).dataCollectionSettings.namespaceFilteringMode == "Exclude"
+    )
+    error_message = "Container Insights must send the cluster's container logs, events and pod inventory to the workspace; the agent collects nothing without this rule."
   }
 
   assert {
@@ -508,10 +567,12 @@ run "invalid_settings_are_rejected_before_any_change" {
   command = plan
 
   variables {
-    profile            = "unknown"
-    aks_zones          = "1,4"
-    aks_system_vm_size = "Standard_D2s_v5"
-    ingress_dns_label  = "1-starts-with-a-digit"
+    profile                           = "unknown"
+    aks_zones                         = "1,4"
+    aks_system_vm_size                = "Standard_D2s_v5"
+    ingress_dns_label                 = "1-starts-with-a-digit"
+    aks_outbound_ports_per_node       = 2004
+    aks_outbound_idle_timeout_minutes = 3
   }
 
   expect_failures = [
@@ -519,7 +580,34 @@ run "invalid_settings_are_rejected_before_any_change" {
     var.aks_zones,
     var.aks_system_vm_size,
     var.ingress_dns_label,
+    var.aks_outbound_ports_per_node,
+    var.aks_outbound_idle_timeout_minutes,
   ]
+}
+
+run "outbound_ports_must_cover_every_node_including_upgrade_surge" {
+  command = plan
+
+  # 3 + 1 system and 6 + 1 application nodes at 6,400 ports each need 70,400 ports; one IP has 64,000.
+  variables {
+    aks_user_max_nodes = 6
+  }
+
+  expect_failures = [azurerm_kubernetes_cluster.main]
+}
+
+run "another_outbound_ip_makes_room_for_larger_pools" {
+  command = plan
+
+  variables {
+    aks_user_max_nodes    = 6
+    aks_outbound_ip_count = 2
+  }
+
+  assert {
+    condition     = azurerm_kubernetes_cluster.main.network_profile[0].load_balancer_profile[0].managed_outbound_ip_count == 2
+    error_message = "A second outbound IP must double the SNAT ports available to the nodes."
+  }
 }
 
 run "lowering_the_provisioned_profile_is_refused" {

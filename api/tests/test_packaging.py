@@ -178,6 +178,12 @@ def test_azure_operations_are_blocked_without_explicit_approval(operation):
     ({"APP_INGRESS_DNS_LABEL": "9lives"}, "APP_INGRESS_DNS_LABEL must be"),
     ({"APP_CUSTOM_DOMAIN": "not a domain"}, "APP_CUSTOM_DOMAIN must be"),
     ({"APP_ACME_EMAIL": "ops"}, "APP_ACME_EMAIL must be"),
+    ({"APP_AKS_OUTBOUND_PORTS": "6404"}, "APP_AKS_OUTBOUND_PORTS must be a multiple of 8"),
+    ({"APP_AKS_OUTBOUND_PORTS": "512"}, "APP_AKS_OUTBOUND_PORTS must be a whole number between 1024 and 64000"),
+    ({"APP_AKS_OUTBOUND_IPS": "0"}, "APP_AKS_OUTBOUND_IPS must be a whole number"),
+    ({"APP_AKS_OUTBOUND_IDLE_TIMEOUT": "2"}, "APP_AKS_OUTBOUND_IDLE_TIMEOUT must be a whole number between 4 and 120"),
+    ({"APP_AKS_USER_MAX_NODES": "6"}, "need 70400 SNAT ports"),
+    ({"APP_AKS_USER_MAX_NODES": "five"}, "APP_AKS_USER_MAX_NODES must be a whole number"),
     ({"APP_ENABLE_PROCESSOR": "True"}, "must be true or false (lowercase)"),
     ({"MEGHKOSHA_API_CLIENT_ID": "33333333-3333-3333-3333-333333333333"}, "must contain a nonzero UUID"),
     ({"APP_EXPORT_TRUSTED_SERVICES": "true"}, "not part of the core stage"),
@@ -191,6 +197,11 @@ def test_invalid_or_unimplemented_configuration_fails_before_cloud_calls(overrid
     result = run_input_validation(overrides)
     assert result.returncode != 0
     assert message in result.stderr
+
+
+def test_a_second_outbound_ip_makes_room_for_a_larger_application_pool():
+    result = run_input_validation({"APP_AKS_USER_MAX_NODES": "6", "APP_AKS_OUTBOUND_IPS": "2"})
+    assert result.returncode == 0, result.stderr
 
 
 def test_approved_model_router_enables_chat_without_hosted_agent_narration():
@@ -398,7 +409,7 @@ def terraform_roots(tmp_path_factory):
     """Initializes a scratch copy of each Terraform root, so tests never touch infra/ or its lock files."""
     terraform = shutil.which("terraform")
     if not terraform:
-        pytest.skip("Terraform 1.9 or later is required for the infrastructure contract tests")
+        pytest.skip("Terraform 1.11 or later is required for the infrastructure contract tests")
     roots = {}
     for root in TERRAFORM_ROOTS:
         workspace = tmp_path_factory.mktemp(root.replace("/", "-"))
@@ -470,8 +481,10 @@ def test_azd_parameter_file_maps_every_terraform_variable_from_the_environment()
     assert defaults["tls_cluster_issuer"] == "letsencrypt"
     assert '"principal_id": "${AZURE_PRINCIPAL_ID}"' in template
     for name in ("daily_export_retention_days", "closed_month_retention_days", "export_parallel_months", "log_retention_days",
-                 "aks_system_min_nodes", "aks_system_max_nodes", "aks_user_min_nodes", "aks_user_max_nodes"):
+                 "aks_system_min_nodes", "aks_system_max_nodes", "aks_user_min_nodes", "aks_user_max_nodes",
+                 "aks_outbound_ip_count", "aks_outbound_ports_per_node", "aks_outbound_idle_timeout_minutes"):
         assert defaults[name].isdigit(), name
+    assert (defaults["aks_outbound_ip_count"], defaults["aks_outbound_ports_per_node"], defaults["aks_outbound_idle_timeout_minutes"]) == ("1", "6400", "4")
     router = '[{"name":"model-router","modelFormat":"OpenAI","modelName":"model-router","modelVersion":"2025-11-18","sku":"GlobalStandard","capacity":20}]'
     configured = json.loads(_azd_substitute(template, {"AZURE_ENV_NAME": "dev", "APP_PROFILE": "ai", "APP_MODEL_DEPLOYMENTS": router,
                                                        "APP_AKS_ZONES": "none", "AZURE_RESOURCE_GROUP": "rg-dev"}))
@@ -634,6 +647,33 @@ def test_workloads_run_hardened_with_workload_identity_instead_of_secrets():
     assert 'value: "api:8000"' in web
     for mount in ("mountPath: /tmp", "mountPath: /etc/nginx/conf.d", "mountPath: /var/cache/nginx"):
         assert mount in web
+
+
+def _spread_constraints(text):
+    """Each topology spread constraint of the manifest's Deployment, keyed by its topology key."""
+    block = text.split("topologySpreadConstraints:", 1)[1].split("containers:", 1)[0]
+    constraints = {}
+    for entry in block.split("- maxSkew: 1")[1:]:
+        key = re.search(r"topologyKey: (\S+)", entry).group(1)
+        constraints[key] = entry
+    return constraints
+
+
+def test_api_and_web_replicas_are_spread_across_nodes_without_blocking_rollouts():
+    for name in ("api", "web"):
+        constraints = _spread_constraints(MANIFESTS[name].read_text())
+        assert set(constraints) == {"topology.kubernetes.io/zone", "kubernetes.io/hostname"}, name
+        hostname, zone = constraints["kubernetes.io/hostname"], constraints["topology.kubernetes.io/zone"]
+        # Hard across nodes, so one node failure never takes every replica down; soft across zones,
+        # because a zoneless region or a single surviving zone must not leave pods pending.
+        assert "whenUnsatisfiable: DoNotSchedule" in hostname, name
+        assert "whenUnsatisfiable: ScheduleAnyway" in zone, name
+        for entry in (hostname, zone):
+            # Without Honor the tainted system nodes count as empty nodes, so a third replica could never be placed.
+            assert "nodeTaintsPolicy: Honor" in entry, name
+            # Without it a rollout's new pods could all land on one node while the old ones drain.
+            assert "matchLabelKeys:\n            - pod-template-hash" in entry, name
+            assert f"app.kubernetes.io/name: {name}" in entry, name
 
 
 def test_processor_cronjob_mirrors_the_container_apps_job_and_never_overlaps():

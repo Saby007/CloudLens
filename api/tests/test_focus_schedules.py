@@ -96,30 +96,85 @@ def test_export_control_timeout_remains_bounded_by_operation(store, monkeypatch,
     actual_client = httpx.AsyncClient
     requests = []
 
-    async def token(scope):
-        assert scope == "https://management.azure.com/.default"
-        return SimpleNamespace(token="synthetic-managed-identity-token")
+    class Credential:
+        def __init__(self, *, client_id):
+            assert client_id == ACTOR
 
-    @asynccontextmanager
-    async def credential(*, client_id):
-        assert client_id == ACTOR
-        yield SimpleNamespace(get_token=token)
+        async def get_token(self, scope):
+            assert scope == "https://management.azure.com/.default"
+            return SimpleNamespace(token="synthetic-managed-identity-token")
 
     def respond(request):
         requests.append(request)
         assert request.extensions["timeout"]["read"] == timeout
         assert request.headers["Authorization"] == "Bearer synthetic-managed-identity-token"
         assert request.headers["If-None-Match"] == "*"
+        assert str(request.url) == "https://management.azure.com/test"
         return httpx.Response(200, json={"accepted": True})
 
     def client(**options):
         assert options["follow_redirects"] is False
         return actual_client(transport=httpx.MockTransport(respond), **options)
 
-    monkeypatch.setattr(focus_schedules, "AsyncManagedIdentityCredential", credential)
+    monkeypatch.setattr(focus_schedules.azure_connections, "AsyncManagedIdentityCredential", Credential)
     monkeypatch.setattr(focus_schedules.httpx, "AsyncClient", client)
     result = asyncio.run(focus_schedules._arm_request(method, "/test", headers={"If-None-Match": "*"}))
     assert result == {"accepted": True} and len(requests) == 1
+
+
+def test_a_processor_run_reuses_one_arm_token_and_connection_pool(store, monkeypatch):
+    actual_client = httpx.AsyncClient
+    credentials, clients, closed = [], [], []
+
+    class Credential:
+        def __init__(self, *, client_id):
+            credentials.append(client_id)
+
+        async def get_token(self, scope):
+            return SimpleNamespace(token="synthetic-managed-identity-token")
+
+        async def close(self):
+            closed.append("credential")
+
+    def client(**options):
+        clients.append(options)
+        return actual_client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})), **options)
+
+    async def run():
+        try:
+            for _ in range(5):
+                await focus_schedules._arm_request("GET", "/test")
+        finally:
+            await focus_schedules.azure_connections.aclose()
+
+    monkeypatch.setattr(focus_schedules.azure_connections, "AsyncManagedIdentityCredential", Credential)
+    monkeypatch.setattr(focus_schedules.httpx, "AsyncClient", client)
+    asyncio.run(run())
+    assert credentials == [ACTOR] and len(clients) == 1
+    assert closed == ["credential"]
+
+
+def test_schedule_locks_share_one_control_state_client(monkeypatch):
+    created = []
+
+    class Service:
+        def __init__(self, url, *, credential, **options):
+            created.append((url, credential, options))
+
+        def get_container_client(self, name):
+            return SimpleNamespace(name=name)
+
+    monkeypatch.setenv("APP_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("AZURE_CLIENT_ID", ACTOR)
+    monkeypatch.setenv("COST_EXPORT_STORAGE_URL", "https://teststore.blob.core.windows.net")
+    monkeypatch.setenv("COST_EXPORT_STORAGE_RESOURCE_ID", STORAGE)
+    monkeypatch.setattr(focus_schedules.azure_connections, "ManagedIdentityCredential", lambda *, client_id: ("credential", client_id))
+    monkeypatch.setattr(focus_schedules.azure_connections, "BlobServiceClient", Service)
+    for _ in range(3):
+        with focus_schedules._container() as container:
+            assert container.name == "control-state"
+    assert created == [("https://teststore.blob.core.windows.net", ("credential", ACTOR),
+                        {"retry_total": 0, "connection_timeout": 5, "read_timeout": 10})]
 
 
 def test_monthly_schedule_keeps_original_day_after_february():
@@ -631,6 +686,47 @@ def test_scheduler_report_refresh_failure_does_not_affect_scheduler_failure_coun
 
     failures = asyncio.run(scheduler.run_once())
     assert failures == 0
+
+
+def test_scheduler_logs_why_a_schedule_could_not_advance(store, monkeypatch, caplog):
+    from jobs import scheduler
+
+    async def unavailable(subscription_id, **kwargs):
+        raise HTTPException(status_code=503, detail="ADLS schedule access is unavailable. Contact the deployment administrator.")
+
+    async def unexpected(subscription_id, **kwargs):
+        raise httpx.ConnectTimeout("connection attempt timed out")
+
+    monkeypatch.setattr(focus_schedules, "scheduled_subscription_ids", lambda: [SUBSCRIPTION])
+    monkeypatch.setattr(focus_schedules, "advance", unavailable)
+    monkeypatch.setattr(focus_schedules, "advance_daily", unexpected)
+    with caplog.at_level("WARNING", logger="jobs.scheduler"):
+        assert asyncio.run(scheduler.run_once()) == 2
+    records = [record for record in caplog.records if record.name == "jobs.scheduler"]
+    messages = [record.getMessage() for record in records]
+    assert any("could not advance" in message and "503 ADLS schedule access is unavailable" in message for message in messages)
+    assert any("ConnectTimeout: connection attempt timed out" in message for message in messages)
+    # Only the unexpected error carries a traceback; the HTTPException's detail already explains itself.
+    assert [record.exc_info is not None for record in records] == [False, True]
+
+
+def test_scheduler_closes_its_azure_connections_even_when_the_run_fails(monkeypatch):
+    from jobs import scheduler
+
+    events = []
+
+    async def failing_run():
+        events.append("run")
+        raise RuntimeError("storage unavailable")
+
+    async def close():
+        events.append("closed")
+
+    monkeypatch.setattr(scheduler, "run_once", failing_run)
+    monkeypatch.setattr(scheduler.azure_connections, "aclose", close)
+    with pytest.raises(RuntimeError):
+        asyncio.run(scheduler.main())
+    assert events == ["run", "closed"]
 
 
 def test_unavailable_month_never_completes_the_six_month_window(store):

@@ -104,6 +104,28 @@ if ($domain -and $domain.ToLowerInvariant() -cnotmatch '^([a-z0-9]([a-z0-9-]{0,6
 $email = Get-Setting 'APP_ACME_EMAIL'
 if ($email -and $email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'APP_ACME_EMAIL must be an email address.' }
 
+# Every node, plus the surge node each pool adds while it upgrades, takes its SNAT ports from the
+# outbound IPs' 64,000 each. Terraform enforces the same rule, but only at plan time.
+function Get-WholeNumber([string] $Name, [string] $Default, [int] $Minimum, [int] $Maximum) {
+    $value = Get-Setting $Name $Default
+    if ($value -cnotmatch '^[0-9]{1,6}$' -or [int]$value -lt $Minimum -or [int]$value -gt $Maximum) {
+        throw "$Name must be a whole number between $Minimum and $Maximum."
+    }
+    return [int]$value
+}
+$outboundIps = Get-WholeNumber 'APP_AKS_OUTBOUND_IPS' '1' 1 100
+$outboundPorts = Get-WholeNumber 'APP_AKS_OUTBOUND_PORTS' '6400' 1024 64000
+if ($outboundPorts % 8) { throw 'APP_AKS_OUTBOUND_PORTS must be a multiple of 8.' }
+[void] (Get-WholeNumber 'APP_AKS_OUTBOUND_IDLE_TIMEOUT' '4' 4 120)
+$nodes = 0
+foreach ($pool in @(@('APP_AKS_SYSTEM_MAX_NODES', '3', 20), @('APP_AKS_USER_MAX_NODES', '5', 50))) {
+    $count = Get-WholeNumber $pool[0] $pool[1] 1 $pool[2]
+    $nodes += $count + [Math]::Ceiling($count * 0.1)
+}
+if ($nodes * $outboundPorts -gt 64000 * $outboundIps) {
+    throw "The node pools at their maximum size, plus one upgrade surge node per pool, need $($nodes * $outboundPorts) SNAT ports, but the outbound IPs provide $(64000 * $outboundIps). Lower APP_AKS_OUTBOUND_PORTS, raise APP_AKS_OUTBOUND_IPS, or lower the pools' maximum node counts."
+}
+
 if ($Operation -eq 'Publish' -and (Get-Setting 'AZURE_CONTAINER_REGISTRY_ENDPOINT') -cnotmatch '^[a-z0-9]+\.azurecr\.io$') {
     throw 'Publish requires the provisioned environment registry (run azd provision first).'
 }

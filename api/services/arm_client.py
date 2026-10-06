@@ -10,12 +10,11 @@ from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
-from services import runtime_identity
+from services import azure_connections, runtime_identity
 
 logger = logging.getLogger(__name__)
 
 ARM_BASE = "https://management.azure.com"
-_credential = None
 
 # Cost Management's query API is far more aggressively rate-limited than plain ARM/
 # Resource Graph calls, and re-running the assessment repeatedly (e.g. while testing)
@@ -93,22 +92,18 @@ def _cost_retry_delay(error: httpx.HTTPStatusError, attempt: int) -> float:
 
 
 async def _token() -> str:
-    global _credential
-    if _credential is None:
-        _credential = runtime_identity.async_credential()
-    result = await _credential.get_token(f"{ARM_BASE}/.default")
-    return result.token
+    return await azure_connections.arm_token(runtime_identity.client_id())
 
 
 async def _arm_request(method: str, path: str, json: dict | None = None, timeout: float = 30.0) -> dict:
     token = await _token()
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        res = await client.request(
-            method,
-            f"{ARM_BASE}{path}",
-            json=json,
-            headers={"Authorization": f"Bearer {token}"},
-        )
+    res = await azure_connections.http_client().request(
+        method,
+        f"{ARM_BASE}{path}",
+        json=json,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=timeout,
+    )
     res.raise_for_status()
     return res.json() if res.content else {}
 
@@ -473,21 +468,21 @@ def _price_unit_size(unit_of_measure: str) -> int | None:
 async def _retail_price_items(filter_expr: str) -> list[dict]:
     items: list[dict] = []
     url = f"{_RETAIL_PRICES_BASE}?{urlencode({'api-version': '2023-01-01-preview', '$filter': filter_expr})}"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for _ in range(20):
-            response = await client.get(url)
-            response.raise_for_status()
-            payload = response.json()
-            page = payload.get("Items")
-            if isinstance(page, list):
-                items.extend(page)
-            next_page = payload.get("NextPageLink")
-            if not next_page or not isinstance(next_page, str):
-                break
-            parsed = urlsplit(next_page)
-            if parsed.scheme != "https" or parsed.netloc != "prices.azure.com" or parsed.path != "/api/retail/prices":
-                raise ValueError("Retail Prices pagination left the expected service")
-            url = next_page
+    client = azure_connections.http_client()
+    for _ in range(20):
+        response = await client.get(url, timeout=15.0)
+        response.raise_for_status()
+        payload = response.json()
+        page = payload.get("Items")
+        if isinstance(page, list):
+            items.extend(page)
+        next_page = payload.get("NextPageLink")
+        if not next_page or not isinstance(next_page, str):
+            break
+        parsed = urlsplit(next_page)
+        if parsed.scheme != "https" or parsed.netloc != "prices.azure.com" or parsed.path != "/api/retail/prices":
+            raise ValueError("Retail Prices pagination left the expected service")
+        url = next_page
     return items
 
 

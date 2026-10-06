@@ -134,7 +134,7 @@ Two other top-level views round out the app:
 - [git](https://git-scm.com/) and **PowerShell 7+** (`pwsh`); the deployment hook and helper scripts are PowerShell.
 - The [Azure CLI](https://learn.microsoft.com/cli/azure/), signed in with `az login`. Terraform authenticates through it, not through azd.
 - The [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/) 1.32 or later.
-- [Terraform](https://developer.hashicorp.com/terraform/install) 1.9 or later (for example `winget install Hashicorp.Terraform`).
+- [Terraform](https://developer.hashicorp.com/terraform/install) 1.11 or later (for example `winget install Hashicorp.Terraform`).
 - **kubectl** and **kubelogin** on your `PATH`; azd deploys with them. `az aks install-cli` installs both, and the one-command script offers to run it for you.
 
 **kubectl and kubelogin on `PATH`.** `azd` looks both up on your `PATH` and otherwise stops with *required external tools are missing: kubectl is not installed*, even when they are installed. `az aks install-cli` doesn't add them to `PATH`, and the one-command script puts them there only for its own run, printing these commands when they aren't on yours. Before you run `azd` yourself — for example `azd deploy` after a code change — add both folders once, then open a new terminal (restart VS Code if you use its terminal). On Windows:
@@ -169,7 +169,7 @@ az provider show --namespace Microsoft.CostManagementExports --subscription <sub
 
 There are two ways to deploy: one command that does the whole thing, or the step-by-step Azure Developer CLI workflow. Both use [azure.yaml](azure.yaml), and one `azd up` does all of this:
 
-1. **`azd provision` runs Terraform** ([infra/](infra)): resource group, network, AKS cluster, container registry, Log Analytics, managed identities with their workload-identity federation, and — per profile — the export storage and the Foundry account. Terraform state is kept in `.azure/<environment>/infra/`.
+1. **`azd provision` runs Terraform** ([infra/](infra)): resource group, network with an NSG on each subnet, AKS cluster, container registry, Log Analytics with Container Insights, managed identities with their workload-identity federation, and — per profile — the export storage and the Foundry account. Terraform state is kept in `.azure/<environment>/infra/`.
 2. **The postprovision hook** ([scripts/aks-bootstrap.ps1](scripts/aks-bootstrap.ps1)) prepares the cluster: it installs a pinned, checksum-verified cert-manager release, creates an app-routing NGINX ingress controller on the Terraform-owned static IP, and adds the Let's Encrypt issuers. It is safe to rerun.
 3. **`azd deploy`** builds both container images remotely in Azure Container Registry, then applies [api/manifests](api/manifests) and [web/manifests](web/manifests) to the `cloudlens` namespace and waits for the rollout.
 4. **cert-manager** obtains the Let's Encrypt certificate for the app's host name, usually within a minute or two, and renews it automatically.
@@ -378,6 +378,8 @@ Set these with `azd env set <name> <value>` before `azd provision`. Values marke
 | `APP_AKS_KUBERNETES_VERSION` | region default | The `stable` auto-upgrade channel keeps the cluster current inside the maintenance window. |
 | `APP_AKS_MAINTENANCE_DAY`, `APP_AKS_MAINTENANCE_START` | `Sunday`, `02:00` | Weekly four-hour UTC window for cluster and node-image upgrades. |
 | `APP_AKS_API_AUTHORIZED_IP_RANGES` | *(any)* | Comma-separated CIDR ranges allowed to reach the Kubernetes API server. Include the machine that runs `azd`. |
+| `APP_AKS_OUTBOUND_PORTS`, `APP_AKS_OUTBOUND_IPS` | `6400`, `1` | SNAT ports each node gets for outbound connections, and the managed outbound IPs that provide them (64,000 each). The pools at their maximum size, plus one upgrade surge node per pool, must fit: the defaults allow 10 nodes. See [Networking, outbound connections and logs](#networking-outbound-connections-and-logs). |
+| `APP_AKS_OUTBOUND_IDLE_TIMEOUT` | `4` | Minutes an idle outbound connection keeps its SNAT port (4-120; Azure's default is 30). |
 | `APP_VNET_PREFIX`, `APP_AKS_SUBNET_PREFIX`, `APP_PRIVATE_ENDPOINT_SUBNET_PREFIX` | `10.42.0.0/23`, `10.42.0.0/24`, `10.42.1.0/27` | **Day-0.** Nodes take addresses from the AKS subnet; pods use the overlay range. |
 | `APP_AKS_POD_CIDR`, `APP_AKS_SERVICE_CIDR` | `10.244.0.0/16`, `10.0.0.0/16` | **Day-0.** Cluster-internal ranges; must not overlap the VNet or networks it is peered with. |
 | `APP_INGRESS_DNS_LABEL` | `cloudlens-<token>` | **Day-0.** The `<label>` in `<label>.<region>.cloudapp.azure.com`; must be unique in the region. |
@@ -386,7 +388,21 @@ Set these with `azd env set <name> <value>` before `azd provision`. Values marke
 | `APP_ACME_EMAIL` | *(none)* | Optional contact address registered with Let's Encrypt. |
 | `APP_PROCESSOR_CRON` | `*/5 * * * *` | Processor CronJob schedule (UTC). Ticks never overlap. |
 
-`scripts/validate-deployment-inputs.ps1` checks these settings offline (network overlaps, sizes, zones, profiles) before you provision. To save cost on a dev/test cluster, stop it when idle with `az aks stop` and start it again with `az aks start`.
+`scripts/validate-deployment-inputs.ps1` checks these settings offline (network overlaps, sizes, zones, outbound ports, profiles) before you provision. To save cost on a dev/test cluster, stop it when idle with `az aks stop` and start it again with `az aks start`.
+
+### Networking, outbound connections and logs
+
+- **Subnet NSGs.** Terraform attaches an NSG to both subnets. The node subnet's NSG allows only HTTP and HTTPS from the internet, and only to the ingress IP (HTTP is for Let's Encrypt's challenge); Azure's default rules cover traffic inside the VNet, load balancer probes and outbound traffic. Some tenants' Azure Policy attaches its own NSG to any subnet without one, and that NSG blocks the app. Terraform therefore sets the NSG in the request that creates the subnet and, on an environment where a policy already attached one, replaces it on the next `azd provision`. Once the subnets have these NSGs, such a policy has no reason to touch them again.
+- **Outbound connections.** Every connection from the cluster to Azure or the internet holds one of its node's SNAT ports on the load balancer. Each node gets `APP_AKS_OUTBOUND_PORTS` ports, and an idle connection gives its port back after `APP_AKS_OUTBOUND_IDLE_TIMEOUT` minutes. The API and the processor share one connection pool and one managed identity credential per process instead of opening a connection and fetching a token for every call, and they close idle connections after 30 seconds.
+- **Replicas on separate nodes.** The two api replicas, and the two web replicas, are never placed on the same node while another application node can take one, so a single node failure doesn't take the app down. Each rollout's new pods are spread the same way.
+- **Logs.** Container Insights sends container logs (`ContainerLogV2`), Kubernetes events (`KubeEvents`) and pod inventory (`KubePodInventory`) to the environment's Log Analytics workspace. These are the streams of Microsoft's default *Logs and Events* preset, without the `kube-system`, `gatekeeper-system` and `azure-arc` namespaces. Data starts arriving about 10 minutes after the first `azd provision` that creates the rule. The API and the processor log at INFO, but the Azure SDKs' request-by-request tracing is left out. For example, the processor's warnings from the last day:
+
+  ```kusto
+  ContainerLogV2
+  | where TimeGenerated > ago(1d) and PodNamespace == "cloudlens" and PodName startswith "processor-"
+  | where LogMessage has "WARNING"
+  | project TimeGenerated, PodName, LogMessage
+  ```
 
 ### HTTPS and custom domains
 
@@ -417,7 +433,10 @@ azd keeps the Terraform state in `.azure/<environment>/infra/terraform.tfstate` 
 | `azd deploy` or `azd up` stops with *required external tools are missing: kubectl is not installed* | kubectl and kubelogin are usually installed but not on this terminal's `PATH`: the one-command script puts them there only while it runs. Add `$HOME\.azure-kubectl` and `$HOME\.azure-kubelogin` to `PATH` as shown under [Prerequisites](#prerequisites), then rerun. |
 | The postprovision hook says the account *still cannot administer* the cluster | The cluster-admin role assignment hadn't reached the API server yet. Rerun `azd provision`. |
 | The browser warns about the certificate, or `kubectl get certificate --namespace cloudlens` shows `READY False` | Inspect `kubectl describe certificate web-tls --namespace cloudlens` and `kubectl get challenges --all-namespaces`. Port 80 must be reachable from the internet; a `rateLimited` error means switch to `letsencrypt-staging` for a while. |
-| Pods stay `Pending` | `kubectl describe pod <name> --namespace cloudlens`: usually vCPU quota or node size — raise the quota, or adjust `APP_AKS_USER_*`. |
+| Pods stay `Pending` | `kubectl describe pod <name> --namespace cloudlens`: usually vCPU quota or node size — raise the quota, or adjust `APP_AKS_USER_*`. *didn't match pod topology spread constraints* means every application node already runs its share of api or web replicas; the cluster autoscaler adds a node unless the pool is at `APP_AKS_USER_MAX_NODES`. |
+| Schedules, Budgets or reports intermittently fail with 503, and the api or processor logs show `ConnectTimeout` | The node ran out of outbound SNAT ports. In the portal, check the `kubernetes` load balancer in the node resource group: *SNAT Connection Count* filtered to failed connections, and *Used SNAT Ports* per backend IP. Raise `APP_AKS_OUTBOUND_PORTS` (or `APP_AKS_OUTBOUND_IPS` for more nodes) and run `azd provision`. |
+| The app times out from the internet although its pods are running | Check the node subnet's NSG: `az network vnet subnet show --resource-group <rg> --vnet-name vnet-<token> --name aks-nodes --query networkSecurityGroup.id`. If it isn't `nsg-aks-nodes-<token>`, something replaced it; increment `subnet_nsg_version` in [infra/network.tf](infra/network.tf) and run `azd provision`, which attaches Terraform's NSG again. |
+| `ContainerLogV2` stays empty in Log Analytics | Allow 10 minutes after the provision that created the rule. Then check that the cluster has the `ContainerInsightsExtension` data collection rule association: `az monitor data-collection rule association list --resource <cluster resource ID>`. |
 | `Error acquiring the state lock` | An earlier `azd` run was interrupted. Make sure none is still running, delete `.azure/<environment>/infra/.terraform.tfstate.lock.info`, and rerun. |
 | `FlagMustBeSetForRestore` on the Foundry account | An account with this name was deleted outside Terraform and is soft-deleted. Purge it with `az cognitiveservices account purge --name <ai-account> --resource-group <rg> --location <foundry-location>`, then rerun. |
 | API calls fail with *managed identity is not configured* or 401s from Azure | Check workload identity: `kubectl get serviceaccount api --namespace cloudlens --output yaml` must carry the `azure.workload.identity/client-id` annotation, and `az identity federated-credential list --identity-name <id-api-...> --resource-group <rg>` must list the cluster's issuer. |

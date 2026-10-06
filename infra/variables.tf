@@ -215,6 +215,39 @@ variable "aks_api_authorized_ip_ranges" {
   default     = ""
 }
 
+variable "aks_outbound_ip_count" {
+  description = "Managed outbound public IPs. Each adds 64,000 SNAT ports for the nodes to share, so more IPs allow more nodes."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.aks_outbound_ip_count >= 1 && var.aks_outbound_ip_count <= 100
+    error_message = "aks_outbound_ip_count must be between 1 and 100."
+  }
+}
+
+variable "aks_outbound_ports_per_node" {
+  description = "SNAT ports each node gets for outbound connections. Every node, including the extra node an upgrade adds to each pool, takes this many from the outbound IPs' 64,000 each."
+  type        = number
+  default     = 6400
+
+  validation {
+    condition     = var.aks_outbound_ports_per_node >= 1024 && var.aks_outbound_ports_per_node <= 64000 && var.aks_outbound_ports_per_node % 8 == 0
+    error_message = "aks_outbound_ports_per_node must be a multiple of 8 between 1024 and 64000."
+  }
+}
+
+variable "aks_outbound_idle_timeout_minutes" {
+  description = "Minutes an idle outbound connection keeps its SNAT port. Azure's default is 30; the app closes idle connections after 30 seconds."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.aks_outbound_idle_timeout_minutes >= 4 && var.aks_outbound_idle_timeout_minutes <= 120
+    error_message = "aks_outbound_idle_timeout_minutes must be between 4 and 120."
+  }
+}
+
 variable "aks_maintenance_day" {
   description = "Weekly UTC day for cluster and node image auto-upgrades."
   type        = string

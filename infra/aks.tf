@@ -64,6 +64,14 @@ resource "azurerm_kubernetes_cluster" "main" {
     dns_service_ip      = cidrhost(var.aks_service_cidr, 10)
     load_balancer_sku   = "standard"
     outbound_type       = "loadBalancer"
+
+    # Every outbound connection holds a SNAT port. AKS's default of 1,024 ports per node, each held for
+    # 30 minutes after its connection goes idle, ran out on the node hosting the app's pods.
+    load_balancer_profile {
+      managed_outbound_ip_count = var.aks_outbound_ip_count
+      outbound_ports_allocated  = var.aks_outbound_ports_per_node
+      idle_timeout_in_minutes   = var.aks_outbound_idle_timeout_minutes
+    }
   }
 
   azure_active_directory_role_based_access_control {
@@ -109,7 +117,15 @@ resource "azurerm_kubernetes_cluster" "main" {
   }
 
   lifecycle {
-    ignore_changes = [default_node_pool[0].node_count]
+    # Defender for Containers enables its own profile on the cluster (through Azure Policy in many tenants);
+    # Terraform doesn't configure it, so it must not switch it off.
+    ignore_changes = [default_node_pool[0].node_count, microsoft_defender]
+
+    # Each pool upgrades with a 10% surge, so its largest size plus that surge must also get its ports.
+    precondition {
+      condition     = (var.aks_system_max_nodes + ceil(var.aks_system_max_nodes * 0.1) + var.aks_user_max_nodes + ceil(var.aks_user_max_nodes * 0.1)) * var.aks_outbound_ports_per_node <= 64000 * var.aks_outbound_ip_count
+      error_message = "The node pools at their maximum size, plus one upgrade surge node per pool, need more SNAT ports than the outbound IPs provide (64,000 each). Lower APP_AKS_OUTBOUND_PORTS, raise APP_AKS_OUTBOUND_IPS, or lower the pools' maximum node counts."
+    }
   }
 
   depends_on = [time_sleep.aks_identity_propagation]
@@ -186,4 +202,55 @@ resource "azurerm_monitor_diagnostic_setting" "aks" {
   enabled_metric {
     category = "AllMetrics"
   }
+}
+
+# Container Insights. With managed identity authentication the monitoring agent sends nothing until a data
+# collection rule is associated with the cluster, and AKS only creates one when monitoring is enabled from the
+# CLI or the portal. These are the streams of Microsoft's default "Logs and Events" preset; the system
+# namespaces are left out, as in its cost-optimized preset.
+locals {
+  container_insights_streams = ["Microsoft-ContainerLogV2", "Microsoft-KubeEvents", "Microsoft-KubePodInventory"]
+}
+
+resource "azurerm_monitor_data_collection_rule" "container_insights" {
+  name                = "MSCI-${azurerm_log_analytics_workspace.main.location}-${azurerm_kubernetes_cluster.main.name}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_log_analytics_workspace.main.location
+  description         = "Container Insights logs and events for the CloudLens cluster."
+  tags                = local.tags
+
+  destinations {
+    log_analytics {
+      name                  = "ciworkspace"
+      workspace_resource_id = azurerm_log_analytics_workspace.main.id
+    }
+  }
+
+  data_flow {
+    streams      = local.container_insights_streams
+    destinations = ["ciworkspace"]
+  }
+
+  data_sources {
+    extension {
+      name           = "ContainerInsightsExtension"
+      extension_name = "ContainerInsights"
+      streams        = local.container_insights_streams
+      extension_json = jsonencode({
+        dataCollectionSettings = {
+          interval               = "1m"
+          namespaceFilteringMode = "Exclude"
+          namespaces             = ["kube-system", "gatekeeper-system", "azure-arc"]
+          enableContainerLogV2   = true
+        }
+      })
+    }
+  }
+}
+
+resource "azurerm_monitor_data_collection_rule_association" "container_insights" {
+  name                    = "ContainerInsightsExtension"
+  target_resource_id      = azurerm_kubernetes_cluster.main.id
+  data_collection_rule_id = azurerm_monitor_data_collection_rule.container_insights.id
+  description             = "Container Insights collection for this cluster. Deleting it stops the cluster's log collection."
 }

@@ -427,7 +427,7 @@ foreach ($tool in @('git', 'azd', 'az')) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "'$tool' is required and was not found on PATH." }
 }
 if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
-    throw "'terraform' (1.9 or later) is required: azd provisions this app with Terraform. Install it (for example 'winget install Hashicorp.Terraform'), then rerun."
+    throw "'terraform' (1.11 or later) is required: azd provisions this app with Terraform. Install it (for example 'winget install Hashicorp.Terraform'), then rerun."
 }
 Write-Host 'git, azd, az and terraform are available.'
 

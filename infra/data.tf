@@ -28,6 +28,11 @@ resource "azurerm_storage_account" "exports" {
     versioning_enabled  = false
     change_feed_enabled = false
   }
+
+  lifecycle {
+    # Defender for Storage adds its malware scanner as a resource access rule; removing it would stop scanning.
+    ignore_changes = [network_rules[0].private_link_access]
+  }
 }
 
 resource "azurerm_storage_container" "data" {

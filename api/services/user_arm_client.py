@@ -12,10 +12,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from azure.core.exceptions import ClientAuthenticationError
-from azure.identity.aio import ManagedIdentityCredential
 from fastapi import HTTPException
 
-from services import access_control
+from services import access_control, azure_connections
 from services.auth import ClientPrincipal
 from services.entra_tokens import configured_uuid
 
@@ -24,6 +23,7 @@ ARM_SCOPE = f"{ARM_BASE}/.default"
 MAX_PAGES = 100
 MAX_SUBSCRIPTIONS = 5000
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+REQUEST_TIMEOUT_SECONDS = 10
 DISCOVERY_TIMEOUT_SECONDS = 30
 ACCESS_CHECK_TIMEOUT_SECONDS = 60
 
@@ -100,7 +100,8 @@ async def _list_subscriptions(client: httpx.AsyncClient, token: str, tenant_id: 
         if path in visited or len(visited) >= MAX_PAGES:
             raise ValueError("Subscription pagination limit exceeded")
         visited.add(path)
-        async with client.stream("GET", path, headers={"Authorization": f"Bearer {token}"}) as response:
+        async with client.stream("GET", f"{ARM_BASE}{path}", headers={"Authorization": f"Bearer {token}"},
+                                 timeout=REQUEST_TIMEOUT_SECONDS) as response:
             _check_response(response, tenant_id)
             content = bytearray()
             async for chunk in response.aiter_bytes():
@@ -146,10 +147,8 @@ async def _managed_identity_client(principal: ClientPrincipal, timeout_seconds: 
         raise HTTPException(status_code=403, detail="This account is not authorized for this deployment.")
     try:
         async with asyncio.timeout(timeout_seconds):
-            async with ManagedIdentityCredential(client_id=managed_identity_client_id) as credential:
-                token = await credential.get_token(ARM_SCOPE)
-                async with httpx.AsyncClient(base_url=ARM_BASE, timeout=10, follow_redirects=False) as client:
-                    yield client, token.token
+            token = await azure_connections.arm_token(managed_identity_client_id)
+            yield azure_connections.http_client(), token
     except HTTPException:
         raise
     except ClientAuthenticationError:
@@ -178,8 +177,9 @@ async def discover_subscriptions(principal: ClientPrincipal) -> list[dict]:
 
 
 async def _probe_json(client, token: str, tenant_id: str, path: str, *, body: dict | None = None):
-    async with client.stream("POST" if body is not None else "GET", path,
-                             headers={"Authorization": f"Bearer {token}"}, json=body) as response:
+    async with client.stream("POST" if body is not None else "GET", f"{ARM_BASE}{path}",
+                             headers={"Authorization": f"Bearer {token}"}, json=body,
+                             timeout=REQUEST_TIMEOUT_SECONDS) as response:
         if response.status_code == 403:
             return None
         _check_response(response, tenant_id, operation="Cost Management access check" if body is not None else "Azure subscription access check")

@@ -8,6 +8,7 @@ and disabled by default; this core does not depend on a Static Web Apps session.
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -36,6 +37,7 @@ from reports.models import (
     ReportSnapshotSummary,
 )
 from services import arm_client
+from services import azure_connections
 from services import user_arm_client
 from services import access_control
 from services import chat_responder
@@ -60,9 +62,17 @@ from services.focus_cost_reader import (
 )
 
 logging.basicConfig(level=logging.INFO)
+azure_connections.quiet_sdk_http_logging()
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    yield
+    await azure_connections.aclose()
+
+
+app = FastAPI(lifespan=_lifespan)
 
 
 @app.middleware("http")

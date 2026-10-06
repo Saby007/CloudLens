@@ -44,16 +44,25 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      # The hostname rule is hard so a single node failure can't take every replica down. Honor skips the
+      # tainted system nodes, which would otherwise count as empty nodes and block a third replica, and
+      # pod-template-hash spreads each rollout's new pods instead of letting them land on one node.
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone
           whenUnsatisfiable: ScheduleAnyway
+          nodeTaintsPolicy: Honor
+          matchLabelKeys:
+            - pod-template-hash
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: api
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          matchLabelKeys:
+            - pod-template-hash
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: api

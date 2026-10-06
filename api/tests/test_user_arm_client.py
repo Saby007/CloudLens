@@ -11,7 +11,7 @@ from azure.core.pipeline.transport import AsyncHttpResponse, AsyncHttpTransport
 from azure.identity.aio import ManagedIdentityCredential
 from fastapi import HTTPException
 
-from services import user_arm_client
+from services import azure_connections, user_arm_client
 from services.auth import ClientPrincipal
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
@@ -22,6 +22,17 @@ IDENTITY_CLIENT_ID = "55555555-5555-5555-5555-555555555555"
 SUBSCRIPTION_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 OTHER_SUBSCRIPTION = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 _HTTP_CLIENT = httpx.AsyncClient
+
+
+def run(awaitable):
+    """Serves one call the way the API process does, then shuts its shared Azure connections down."""
+    async def call_then_shut_down():
+        try:
+            return await awaitable
+        finally:
+            await azure_connections.aclose()
+
+    return asyncio.run(call_then_shut_down())
 
 
 @pytest.fixture(autouse=True)
@@ -66,10 +77,7 @@ def test_managed_identity_discovery_filters_app_inventory_without_user_token_exc
         def __init__(self, **kwargs):
             assert kwargs == {"client_id": IDENTITY_CLIENT_ID}
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
+        async def close(self):
             calls.append("closed")
 
         async def get_token(self, scope):
@@ -91,14 +99,14 @@ def test_managed_identity_discovery_filters_app_inventory_without_user_token_exc
     def reject_exchange(**kwargs):
         pytest.fail("Backend Azure calls must not exchange a user assertion")
 
-    monkeypatch.setattr(user_arm_client, "ManagedIdentityCredential", ManagedIdentity)
+    monkeypatch.setattr(azure_connections, "AsyncManagedIdentityCredential", ManagedIdentity)
     monkeypatch.setattr(user_arm_client, "OnBehalfOfCredential", reject_exchange, raising=False)
     monkeypatch.setattr(access_control, "authorized_subscription_ids", authorized)
     monkeypatch.setattr(user_arm_client.httpx, "AsyncClient", lambda **kwargs: _HTTP_CLIENT(
         transport=httpx.MockTransport(respond), **kwargs,
     ))
 
-    assert asyncio.run(user_arm_client.discover_subscriptions(principal(""))) == [subscription()]
+    assert run(user_arm_client.discover_subscriptions(principal(""))) == [subscription()]
     assert calls == ["arm_token", "user_authorized", "closed"]
 
 
@@ -111,10 +119,7 @@ def transport(monkeypatch):
         def __init__(self, **kwargs):
             assert kwargs == {"client_id": IDENTITY_CLIENT_ID}
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
+        async def close(self):
             lifecycle.append("mi_closed")
 
         async def get_token(self, scope):
@@ -122,7 +127,7 @@ def transport(monkeypatch):
             calls.append(scope)
             return AccessToken("app-managed-identity-token", 9999999999)
 
-    monkeypatch.setattr(user_arm_client, "ManagedIdentityCredential", ManagedIdentity)
+    monkeypatch.setattr(azure_connections, "AsyncManagedIdentityCredential", ManagedIdentity)
 
     def install(handler):
         monkeypatch.setattr(user_arm_client.httpx, "AsyncClient", lambda **kwargs: _HTTP_CLIENT(
@@ -146,7 +151,7 @@ def test_secretless_discovery_paginates_deduplicates_and_closes_credentials(tran
         return httpx.Response(200, json={"value": [subscription(), subscription(OTHER_SUBSCRIPTION)]})
 
     calls, lifecycle = transport(respond)
-    result = asyncio.run(user_arm_client.discover_subscriptions(principal()))
+    result = run(user_arm_client.discover_subscriptions(principal()))
     assert [item["subscriptionId"] for item in result] == [SUBSCRIPTION_ID, OTHER_SUBSCRIPTION]
     assert len(requests) == 2
     assert calls == [user_arm_client.ARM_SCOPE]
@@ -161,8 +166,8 @@ def test_shared_app_identity_does_not_share_authorization_between_users(monkeypa
 
     monkeypatch.setattr(user_arm_client.access_control.arm_client, "list_role_assignments_for_principal", assignments)
     calls, _ = transport(lambda request: httpx.Response(200, json={"value": [subscription()]}))
-    assert asyncio.run(user_arm_client.discover_subscriptions(principal())) == [subscription()]
-    assert asyncio.run(user_arm_client.discover_subscriptions(principal(object_id=WEB_CLIENT_ID))) == []
+    assert run(user_arm_client.discover_subscriptions(principal())) == [subscription()]
+    assert run(user_arm_client.discover_subscriptions(principal(object_id=WEB_CLIENT_ID))) == []
     assert calls == [user_arm_client.ARM_SCOPE, user_arm_client.ARM_SCOPE]
 
 
@@ -182,8 +187,8 @@ def test_schedule_listing_only_checks_rows_authorized_for_each_user(monkeypatch,
     monkeypatch.setattr(user_arm_client.access_control.arm_client, "list_role_assignments_for_principal", assignments)
     monkeypatch.setattr(user_arm_client, "_has_read_and_cost_access", ready)
     transport(lambda request: httpx.Response(200, json={"value": [subscription(), subscription(OTHER_SUBSCRIPTION)]}))
-    first = asyncio.run(user_arm_client.discover_schedule_subscriptions(principal()))
-    second = asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(object_id=WEB_CLIENT_ID)))
+    first = run(user_arm_client.discover_schedule_subscriptions(principal()))
+    second = run(user_arm_client.discover_schedule_subscriptions(principal(object_id=WEB_CLIENT_ID)))
     assert [item["subscriptionId"] for item in first] == [SUBSCRIPTION_ID]
     assert [item["subscriptionId"] for item in second] == [OTHER_SUBSCRIPTION]
     assert checked == [SUBSCRIPTION_ID, OTHER_SUBSCRIPTION]
@@ -200,7 +205,7 @@ def test_schedule_listing_authorization_lookup_failure_does_not_return_metadata(
     monkeypatch.setattr(user_arm_client, "_has_read_and_cost_access", unexpected)
     transport(lambda request: httpx.Response(200, json={"value": [subscription()]}))
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(user_arm_client.discover_schedule_subscriptions(principal()))
+        run(user_arm_client.discover_schedule_subscriptions(principal()))
     assert failure.value.status_code == 503
     assert "private" not in failure.value.detail and "Pilot" not in failure.value.detail
 
@@ -219,7 +224,7 @@ def test_schedule_listing_does_not_request_live_cost_data(transport):
         return httpx.Response(200, json={"value": []})
 
     transport(respond)
-    rows = asyncio.run(user_arm_client.discover_schedule_subscriptions(principal()))
+    rows = run(user_arm_client.discover_schedule_subscriptions(principal()))
     assert [item["subscriptionId"] for item in rows] == [SUBSCRIPTION_ID]
     assert rows[0]["readAccess"] is True and rows[0]["costAccess"] is True
     assert len(requests) == 3
@@ -244,12 +249,12 @@ def test_schedule_actions_require_live_managed_identity_read_and_cost_access(tra
         return httpx.Response(200, json={"properties": {"columns": [], "rows": []}})
 
     _, lifecycle = transport(respond)
-    assert asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID])) == [
+    assert run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID])) == [
         {**subscription(), "readAccess": True, "costAccess": True, "accessCheckMode": "live"},
     ]
     assert lifecycle == ["mi_closed"]
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(), [OTHER_SUBSCRIPTION]))
+        run(user_arm_client.discover_schedule_subscriptions(principal(), [OTHER_SUBSCRIPTION]))
     assert failure.value.status_code == 403
     assert all(request.method == "GET" or request.url.path.endswith("/query") for request in requests)
 
@@ -269,7 +274,7 @@ def test_schedule_export_actions_can_opt_out_of_the_live_cost_query(transport):
         return httpx.Response(200, json={"value": []})
 
     transport(respond)
-    rows = asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID], probe_cost=False))
+    rows = run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID], probe_cost=False))
     assert rows == [{**subscription(), "readAccess": True, "costAccess": True, "accessCheckMode": "permissions"}]
     assert all(request.method == "GET" for request in requests)
 
@@ -283,7 +288,7 @@ def test_schedule_candidates_do_not_treat_excluded_read_actions_as_access(transp
         return httpx.Response(200, json={"value": [{"actions": ["*"], "notActions": excluded}]})
 
     transport(respond)
-    rows = asyncio.run(user_arm_client.discover_schedule_subscriptions(principal()))
+    rows = run(user_arm_client.discover_schedule_subscriptions(principal()))
     assert len(rows) == 1 and rows[0]["subscriptionId"] == SUBSCRIPTION_ID
     assert rows[0]["readAccess"] is False and rows[0]["costAccess"] is False
     assert rows[0]["accessIssue"]
@@ -297,7 +302,7 @@ def test_schedule_listing_does_not_infer_access_from_unrecognized_conditional_pe
         return httpx.Response(200, json={"value": [{"actions": ["*"], "notActions": [], "condition": "unrecognized", "conditionVersion": "2.0"}]})
 
     transport(respond)
-    rows = asyncio.run(user_arm_client.discover_schedule_subscriptions(principal()))
+    rows = run(user_arm_client.discover_schedule_subscriptions(principal()))
     assert len(rows) == 1
     assert rows[0]["readAccess"] is False and rows[0]["costAccess"] is False
 
@@ -306,7 +311,7 @@ def test_schedule_selection_rejects_injected_id_before_permissions_or_cost_calls
     requests = []
     transport(lambda request: requests.append(request) or httpx.Response(200, json={"value": [subscription()]}))
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(), [OTHER_SUBSCRIPTION]))
+        run(user_arm_client.discover_schedule_subscriptions(principal(), [OTHER_SUBSCRIPTION]))
     assert failure.value.status_code == 403
     assert len(requests) == 1
 
@@ -324,7 +329,7 @@ def test_schedule_readiness_failure_preserves_other_authorized_rows(transport, s
         return httpx.Response(200, json={"value": []})
 
     _, lifecycle = transport(respond)
-    rows = asyncio.run(user_arm_client.discover_schedule_subscriptions(principal()))
+    rows = run(user_arm_client.discover_schedule_subscriptions(principal()))
     assert [item["subscriptionId"] for item in rows] == [SUBSCRIPTION_ID, OTHER_SUBSCRIPTION]
     assert rows[0]["readAccess"] is False and rows[0]["costAccess"] is False
     assert rows[0]["accessIssue"] and "private" not in rows[0]["accessIssue"]
@@ -334,7 +339,7 @@ def test_schedule_readiness_failure_preserves_other_authorized_rows(transport, s
         assert "Retry after 120 seconds" in rows[0]["accessIssue"]
     assert lifecycle == ["mi_closed"]
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
+        run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
     assert failure.value.status_code == (403 if status == 403 else 503)
 
 
@@ -350,7 +355,7 @@ def test_schedule_list_timeout_is_local_to_the_affected_subscription(monkeypatch
 
     monkeypatch.setattr(user_arm_client, "ACCESS_CHECK_TIMEOUT_SECONDS", 0.02)
     transport(respond)
-    rows = asyncio.run(user_arm_client.discover_schedule_subscriptions(principal()))
+    rows = run(user_arm_client.discover_schedule_subscriptions(principal()))
     assert len(rows) == 2
     assert rows[0]["readAccess"] is False and rows[0]["accessIssue"]
     assert rows[1]["readAccess"] is True
@@ -369,7 +374,7 @@ def test_cost_probe_throttling_names_cost_management_and_keeps_longest_retry(tra
 
     transport(respond)
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
+        run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
     assert failure.value.status_code == 503
     assert failure.value.detail == "Cost Management access check was throttled. Retry after 120 seconds."
     assert failure.value.headers == {"Retry-After": "120"}
@@ -392,7 +397,7 @@ def test_cost_probe_retries_once_after_a_short_throttle_then_succeeds(transport)
         return httpx.Response(200, json={"properties": {"columns": [], "rows": []}})
 
     transport(respond)
-    rows = asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
+    rows = run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
     assert len(attempts) == 2
     assert rows[0]["costAccess"] is True
 
@@ -413,7 +418,7 @@ def test_cost_probe_does_not_retry_a_long_throttle_twice(transport):
 
     transport(respond)
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
+        run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
     assert len(attempts) == 1
     assert failure.value.status_code == 503
 
@@ -432,7 +437,7 @@ def test_pagination_cannot_relay_tokens_outside_requested_collection(transport, 
 
     transport(respond)
     with pytest.raises(HTTPException) as error:
-        asyncio.run(user_arm_client.discover_subscriptions(principal()))
+        run(user_arm_client.discover_subscriptions(principal()))
     assert error.value.status_code == 502
     assert len(calls) == 1
     assert "attacker" not in error.value.detail
@@ -446,7 +451,7 @@ def test_pagination_cannot_relay_tokens_outside_requested_collection(transport, 
 def test_invalid_collections_do_not_return_partial_success(transport, payload):
     transport(lambda request: httpx.Response(200, json=payload))
     with pytest.raises(HTTPException) as error:
-        asyncio.run(user_arm_client.discover_subscriptions(principal()))
+        run(user_arm_client.discover_subscriptions(principal()))
     assert error.value.status_code == 502
 
 
@@ -455,7 +460,7 @@ def test_foreign_tenant_is_not_discovered_and_disabled_subscription_is_not_selec
         subscription(), subscription(OTHER_SUBSCRIPTION, state="Disabled"),
         subscription("cccccccc-cccc-cccc-cccc-cccccccccccc", tenantId=OBJECT_ID),
     ]}))
-    discovered = asyncio.run(user_arm_client.discover_subscriptions(principal()))
+    discovered = run(user_arm_client.discover_subscriptions(principal()))
     assert len(discovered) == 2
     assert user_arm_client.validate_selection(discovered, [SUBSCRIPTION_ID.upper()]) == [subscription()]
     for selected in [[OTHER_SUBSCRIPTION], [SUBSCRIPTION_ID, "cccccccc-cccc-cccc-cccc-cccccccccccc"]]:
@@ -477,7 +482,7 @@ def test_upstream_errors_are_distinct_from_empty_discovery(transport, status, ex
     _, lifecycle = transport(lambda request: httpx.Response(status, headers={"Retry-After": "120"},
                                                            text="private upstream details"))
     with pytest.raises(HTTPException) as error:
-        asyncio.run(user_arm_client.discover_subscriptions(principal()))
+        run(user_arm_client.discover_subscriptions(principal()))
     assert error.value.status_code == expected
     assert "private" not in json.dumps(error.value.detail)
     assert lifecycle == ["mi_closed"]
@@ -492,7 +497,7 @@ def test_arm_identity_failure_does_not_challenge_the_signed_in_user(transport):
         f'Bearer authorization_uri="https://attacker.example", error="insufficient_claims", claims="{encoded}"'
     )}))
     with pytest.raises(HTTPException) as error:
-        asyncio.run(user_arm_client.discover_subscriptions(principal()))
+        run(user_arm_client.discover_subscriptions(principal()))
     assert error.value.status_code == 503
     assert error.value.detail["code"] == "azure_managed_identity_unavailable"
     assert "WWW-Authenticate" not in (error.value.headers or {})
@@ -510,7 +515,7 @@ def test_missing_runtime_identity_fails_without_falling_back_to_other_credential
         monkeypatch.setenv("AZURE_CLIENT_ID", value)
     for caller in [principal(), principal("")]:
         with pytest.raises(HTTPException) as error:
-            asyncio.run(user_arm_client.discover_subscriptions(caller))
+            run(user_arm_client.discover_subscriptions(caller))
         assert error.value.status_code == 503
         assert "verified-user-assertion" not in error.value.detail
     assert calls == []
@@ -520,15 +525,15 @@ def test_missing_runtime_identity_fails_without_falling_back_to_other_credential
 def test_identity_failure_stops_before_arm_access_and_closes_credentials(monkeypatch, transport):
     requests = []
     _, lifecycle = transport(lambda request: requests.append(request))
-    credential_type = user_arm_client.ManagedIdentityCredential
+    credential_type = azure_connections.AsyncManagedIdentityCredential
 
     class UnavailableCredential(credential_type):
         async def get_token(self, *args, **kwargs):
             raise ClientAuthenticationError("private token and diagnostic", response=None)
 
-    monkeypatch.setattr(user_arm_client, "ManagedIdentityCredential", UnavailableCredential)
+    monkeypatch.setattr(azure_connections, "AsyncManagedIdentityCredential", UnavailableCredential)
     with pytest.raises(HTTPException) as error:
-        asyncio.run(user_arm_client.discover_subscriptions(principal()))
+        run(user_arm_client.discover_subscriptions(principal()))
     assert error.value.status_code == 503
     assert error.value.detail["code"] == "azure_managed_identity_unavailable"
     assert "private" not in json.dumps(error.value.detail)
@@ -537,11 +542,7 @@ def test_identity_failure_stops_before_arm_access_and_closes_credentials(monkeyp
     assert lifecycle == ["mi_closed"]
 
 
-@pytest.mark.parametrize("factory_name, credential_type", [
-    ("credential", "ManagedIdentityCredential"),
-    ("async_credential", "AsyncManagedIdentityCredential"),
-])
-def test_backend_credential_factories_select_only_the_runtime_identity(monkeypatch, factory_name, credential_type):
+def test_backend_credential_factory_selects_only_the_runtime_identity(monkeypatch):
     from services import runtime_identity
 
     calls = []
@@ -551,43 +552,81 @@ def test_backend_credential_factories_select_only_the_runtime_identity(monkeypat
         calls.append(kwargs)
         return credential
 
-    monkeypatch.setattr(runtime_identity, credential_type, create)
+    monkeypatch.setattr(runtime_identity, "ManagedIdentityCredential", create)
     monkeypatch.setenv("COST_CONTROL_CLIENT_ID", OTHER_SUBSCRIPTION)
-    assert getattr(runtime_identity, factory_name)() is credential
+    assert runtime_identity.credential() is credential
     assert calls == [{"client_id": IDENTITY_CLIENT_ID}]
     monkeypatch.delenv("AZURE_CLIENT_ID")
     with pytest.raises(RuntimeError, match="runtime managed identity"):
-        getattr(runtime_identity, factory_name)()
+        runtime_identity.credential()
     assert len(calls) == 1
 
 
 def test_inherited_arm_calls_use_the_explicit_runtime_identity(monkeypatch):
-    from services import arm_client, runtime_identity
+    from services import arm_client
 
     calls = []
 
     class Credential:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
         async def get_token(self, scope):
             calls.append(scope)
             return AccessToken("runtime-arm-token", 9999999999)
 
-    monkeypatch.setattr(arm_client, "_credential", None)
-    monkeypatch.setattr(runtime_identity, "async_credential", Credential)
+    monkeypatch.setattr(azure_connections, "AsyncManagedIdentityCredential", Credential)
+    monkeypatch.setenv("COST_CONTROL_CLIENT_ID", OTHER_SUBSCRIPTION)
     assert asyncio.run(arm_client._token()) == "runtime-arm-token"
-    assert calls == [user_arm_client.ARM_SCOPE]
+    assert calls == [{"client_id": IDENTITY_CLIENT_ID}, user_arm_client.ARM_SCOPE]
+    monkeypatch.delenv("AZURE_CLIENT_ID")
+    with pytest.raises(RuntimeError, match="runtime managed identity"):
+        asyncio.run(arm_client._token())
+
+
+def test_requests_in_one_process_share_one_credential_and_connection_pool(monkeypatch):
+    created, connections, closed = [], [], []
+
+    class ManagedIdentity:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        async def get_token(self, scope):
+            return AccessToken("app-managed-identity-token", 9999999999)
+
+        async def close(self):
+            closed.append("credential")
+
+    def client(**options):
+        connections.append(options)
+        return _HTTP_CLIENT(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"value": [subscription()]})), **options)
+
+    async def three_requests_then_shut_down():
+        try:
+            return [await user_arm_client.discover_subscriptions(principal()) for _ in range(3)]
+        finally:
+            await azure_connections.aclose()
+
+    monkeypatch.setattr(azure_connections, "AsyncManagedIdentityCredential", ManagedIdentity)
+    monkeypatch.setattr(user_arm_client.httpx, "AsyncClient", client)
+    assert asyncio.run(three_requests_then_shut_down()) == [[subscription()]] * 3
+    assert created == [{"client_id": IDENTITY_CLIENT_ID}]
+    assert len(connections) == 1 and connections[0]["follow_redirects"] is False
+    assert closed == ["credential"]
 
 
 def test_discovery_rechecks_a_previously_cached_user_grant(monkeypatch, transport):
     transport(lambda request: httpx.Response(200, json={"value": [subscription()]}))
-    assert asyncio.run(user_arm_client.discover_subscriptions(principal())) == [subscription()]
+    assert run(user_arm_client.discover_subscriptions(principal())) == [subscription()]
 
     async def revoked(subscription_id, principal_object_id):
         return []
 
     monkeypatch.setattr(user_arm_client.access_control.arm_client, "list_role_assignments_for_principal", revoked)
-    assert asyncio.run(user_arm_client.discover_subscriptions(principal())) == []
+    assert run(user_arm_client.discover_subscriptions(principal())) == []
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
+        run(user_arm_client.discover_schedule_subscriptions(principal(), [SUBSCRIPTION_ID]))
     assert failure.value.status_code == 403
 
 
@@ -595,7 +634,7 @@ def test_foreign_tenant_cannot_use_the_runtime_identity(transport):
     calls, _ = transport(lambda request: pytest.fail("A foreign tenant must not reach ARM"))
     caller = ClientPrincipal("subject", "foreign@example.test", WEB_CLIENT_ID, OBJECT_ID)
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(user_arm_client.discover_subscriptions(caller))
+        run(user_arm_client.discover_subscriptions(caller))
     assert failure.value.status_code == 403
     assert calls == []
 
@@ -609,18 +648,18 @@ def test_discovery_limits_never_return_a_partial_collection(monkeypatch, transpo
     monkeypatch.setattr(user_arm_client, limit, value)
     transport(lambda request: httpx.Response(200, json=payload))
     with pytest.raises(HTTPException) as error:
-        asyncio.run(user_arm_client.discover_subscriptions(principal()))
+        run(user_arm_client.discover_subscriptions(principal()))
     assert error.value.status_code == 502
 
 
-def test_total_timeout_closes_request_scoped_credentials(monkeypatch, transport):
+def test_total_timeout_fails_closed_and_shutdown_still_closes_the_credential(monkeypatch, transport):
     async def never_completes(request):
         await asyncio.Event().wait()
 
     _, lifecycle = transport(never_completes)
     monkeypatch.setattr(user_arm_client, "DISCOVERY_TIMEOUT_SECONDS", 0.02)
     with pytest.raises(HTTPException) as error:
-        asyncio.run(user_arm_client.discover_subscriptions(principal()))
+        run(user_arm_client.discover_subscriptions(principal()))
     assert error.value.status_code == 503
     assert lifecycle == ["mi_closed"]
 
@@ -634,7 +673,7 @@ def test_total_timeout_closes_request_scoped_credentials(monkeypatch, transport)
 def test_malformed_claims_challenge_is_not_forwarded(transport, header):
     transport(lambda request: httpx.Response(401, headers={"WWW-Authenticate": header}))
     with pytest.raises(HTTPException) as error:
-        asyncio.run(user_arm_client.discover_subscriptions(principal()))
+        run(user_arm_client.discover_subscriptions(principal()))
     assert error.value.status_code == 503
     assert "WWW-Authenticate" not in (error.value.headers or {})
 
@@ -691,19 +730,19 @@ def test_installed_sdk_uses_container_identity_endpoint_without_obo(monkeypatch,
         return httpx.Response(200, json={"value": [subscription()]})
 
     transport(respond)
-    monkeypatch.setattr(user_arm_client, "ManagedIdentityCredential", lambda **kwargs: ManagedIdentityCredential(
+    monkeypatch.setattr(azure_connections, "AsyncManagedIdentityCredential", lambda **kwargs: ManagedIdentityCredential(
         transport=TokenTransport(), retry_total=0, **kwargs,
     ))
     if token_error:
         with pytest.raises(HTTPException) as error:
-            asyncio.run(user_arm_client.discover_subscriptions(principal()))
+            run(user_arm_client.discover_subscriptions(principal()))
         assert error.value.status_code == 503
         assert error.value.detail["code"] == "azure_managed_identity_unavailable"
         assert not error.value.headers
         assert "private" not in json.dumps(error.value.detail)
         assert arm_requests == []
     else:
-        assert asyncio.run(user_arm_client.discover_subscriptions(principal())) == [subscription()]
+        assert run(user_arm_client.discover_subscriptions(principal())) == [subscription()]
         assert len(arm_requests) == 1
     assert len(token_requests) == 1
     assert closed

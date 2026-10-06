@@ -11,6 +11,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _fresh_azure_connections():
+    # The shared pool and credentials outlive a request by design; tests must not inherit another test's fakes.
+    from services import azure_connections
+
+    azure_connections.reset()
+    yield
+    azure_connections.reset()
+
+
+@pytest.fixture(autouse=True)
 def _bind_test_identity(monkeypatch, request):
     tenant_id = "11111111-1111-1111-1111-111111111111"
     monkeypatch.setenv("AZURE_TENANT_ID", tenant_id)

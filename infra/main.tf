@@ -1,5 +1,6 @@
 terraform {
-  required_version = ">= 1.9.0, < 2.0.0"
+  # 1.11 introduced write-only arguments, which the subnets use for their NSGs (network.tf).
+  required_version = ">= 1.11.0, < 2.0.0"
 
   required_providers {
     azurerm = {
@@ -22,7 +23,7 @@ provider "azurerm" {
       permanently_delete_on_destroy = true
     }
     resource_group {
-      # AKS writes its monitoring data collection rules into this group outside Terraform; azd down must still remove it.
+      # Azure Policy can add resources to this group outside Terraform (for example a default NSG for a new subnet); azd down must still remove it.
       prevent_deletion_if_contains_resources = false
     }
     storage {

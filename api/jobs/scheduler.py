@@ -10,11 +10,17 @@ import logging
 
 from fastapi import HTTPException
 
-from services import focus_schedules
+from services import azure_connections, focus_schedules
 
 logger = logging.getLogger(__name__)
 
 _REPORT_REFRESH_STALE_DAYS = 90
+
+
+def _failure_reason(error: BaseException) -> str:
+    if isinstance(error, HTTPException):
+        return f"{error.status_code} {error.detail}"[:500]
+    return f"{type(error).__name__}: {error}"[:500]
 
 
 async def run_once() -> int:
@@ -31,7 +37,10 @@ async def run_once() -> int:
                     continue
                 if isinstance(result, BaseException):
                     failures += 1
-                    logger.warning("FOCUS schedule %s could not advance; prerequisites or service availability need verification", subscription_id)
+                    # The traceback only helps for unexpected errors; an HTTPException's detail already says what failed.
+                    logger.warning("FOCUS schedule %s could not advance; prerequisites or service availability need verification (%s)",
+                                   subscription_id, _failure_reason(result),
+                                   exc_info=None if isinstance(result, HTTPException) else result)
                     continue
                 if isinstance(result, dict) and result.get("status") == "succeeded":
                     new_data = True
@@ -55,6 +64,14 @@ async def _refresh_report_for_active_schedules() -> None:
         logger.warning("Automatic report refresh after a completed refresh cycle failed", exc_info=True)
 
 
+async def main() -> int:
+    try:
+        return await run_once()
+    finally:
+        await azure_connections.aclose()
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    raise SystemExit(1 if asyncio.run(run_once()) else 0)
+    azure_connections.quiet_sdk_http_logging()
+    raise SystemExit(1 if asyncio.run(main()) else 0)
