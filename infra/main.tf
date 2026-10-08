@@ -81,6 +81,7 @@ locals {
 
   aks_zones                    = lower(trimspace(var.aks_zones)) == "none" ? [] : compact([for zone in split(",", var.aks_zones) : trimspace(zone)])
   aks_api_authorized_ip_ranges = compact([for range in split(",", var.aks_api_authorized_ip_ranges) : trimspace(range)])
+  web_allowed_ip_ranges        = compact([for range in split(",", var.web_allowed_ip_ranges) : trimspace(range)])
   ingress_dns_label            = var.ingress_dns_label != "" ? var.ingress_dns_label : "cloudlens-${local.resource_token}"
   ingress_class                = "cloudlens-nginx"
 

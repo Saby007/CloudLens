@@ -97,6 +97,16 @@ output "APP_INGRESS_PUBLIC_IP_NAME" {
   value = azurerm_public_ip.ingress.name
 }
 
+output "APP_INGRESS_NSG_NAME" {
+  value = azurerm_network_security_group.aks_nodes.name
+}
+
+# "true" once HTTPS is limited to APP_WEB_ALLOWED_IP_RANGES. Operator mode opens the public URL only then: the value
+# reaches the manifests after Terraform has applied the rule, so a plain azd deploy cannot open it early.
+output "APP_WEB_INGRESS_RESTRICTED" {
+  value = tostring(length(local.web_allowed_ip_ranges) > 0)
+}
+
 output "APP_TLS_CLUSTER_ISSUER" {
   value = var.tls_cluster_issuer
 }

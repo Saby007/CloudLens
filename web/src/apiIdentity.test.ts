@@ -203,3 +203,48 @@ it('does not transfer a pending challenge to another account', async () => {
   await redirectApiIdentity('other@example.test');
   expect(mocks.loginRedirect).toHaveBeenCalledWith({ scopes: [configuration.scope], loginHint: 'other@example.test', prompt: 'select_account' });
 });
+
+const operatorConfiguration = { mode: 'operator', tenantId: configuration.tenantId };
+const operatorProfile = { userId: 'operator:66666666-6666-4666-8666-666666666666', userDetails: 'operator@example.test', tenantId: configuration.tenantId };
+const operatorApi = () => vi.mocked(fetch).mockImplementation(async (path) =>
+  new Response(JSON.stringify(path === '/api/auth/config' ? operatorConfiguration : operatorProfile)));
+
+it('uses the API operator in operator mode without any Microsoft sign-in or token', async () => {
+  operatorApi();
+  const { apiFetch, initializeApiIdentity, connectApiIdentity } = await import('./apiIdentity');
+  await expect(initializeApiIdentity('')).resolves.toEqual({ ...operatorProfile, operatorMode: true });
+  await expect(connectApiIdentity('user@example.test')).resolves.toEqual({ ...operatorProfile, operatorMode: true });
+  await apiFetch('/api/report/latest', { headers: { Authorization: 'forged', 'x-ms-client-principal': 'forged', 'x-meghkosha-user-token': 'forged' } });
+  const request = vi.mocked(fetch).mock.calls.at(-1)!;
+  const headers = new Headers(request[1]?.headers);
+  expect(['authorization', 'x-ms-client-principal', 'x-meghkosha-user-token'].some((name) => headers.has(name))).toBe(false);
+  expect(request[1]).toMatchObject({ credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
+  await expect(apiFetch('https://other.example/api/report')).rejects.toThrow('only be sent');
+  expect(mocks.constructor).not.toHaveBeenCalled();
+  expect(mocks.acquireTokenSilent).not.toHaveBeenCalled();
+  expect(mocks.ssoSilent).not.toHaveBeenCalled();
+  expect(mocks.loginPopup).not.toHaveBeenCalled();
+});
+
+it('has no Microsoft session to end in operator mode', async () => {
+  operatorApi();
+  const { signOutApiIdentity } = await import('./apiIdentity');
+  await signOutApiIdentity();
+  expect(mocks.constructor).not.toHaveBeenCalled();
+  expect(mocks.clearCache).not.toHaveBeenCalled();
+  expect(mocks.logoutRedirect).not.toHaveBeenCalled();
+});
+
+it('rejects an operator configuration without a valid tenant', async () => {
+  vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ mode: 'operator', tenantId: '00000000-0000-0000-0000-000000000000' })));
+  const { initializeApiIdentity } = await import('./apiIdentity');
+  await expect(initializeApiIdentity('')).rejects.toThrow('configuration is invalid');
+  expect(mocks.constructor).not.toHaveBeenCalled();
+});
+
+it('rejects an operator profile from another tenant', async () => {
+  vi.mocked(fetch).mockImplementation(async (path) => new Response(JSON.stringify(path === '/api/auth/config'
+    ? operatorConfiguration : { ...operatorProfile, tenantId: configuration.apiClientId })));
+  const { initializeApiIdentity } = await import('./apiIdentity');
+  await expect(initializeApiIdentity('')).rejects.toThrow('invalid identity profile');
+});

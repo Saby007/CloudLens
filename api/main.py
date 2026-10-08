@@ -52,6 +52,7 @@ from services import report_email
 from services import report_snapshots
 from services.entra_tokens import configured_uuid, identity_configuration, REQUIRED_SCOPE
 from services.auth import ClientPrincipal, require_tenant_principal
+from services.operator_identity import operator_identity, operator_mode_enabled
 from services import sql_metrics
 from services import resource_uptime
 from services import service_retirements
@@ -68,6 +69,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    if os.environ.get("MEGHKOSHA_AUTH_MODE") == "operator":
+        logger.warning("Operator mode: Entra sign-in is off and every request acts as MEGHKOSHA_OPERATOR_OBJECT_ID; the app "
+                       "must be reached only through kubectl port-forward or from the IP allow-list (APP_WEB_ALLOWED_IP_RANGES).")
     yield
     await azure_connections.aclose()
 
@@ -96,7 +100,10 @@ async def verify_api_identity(request: Request, call_next):
 
 
 @app.get("/api/auth/config")
-def get_identity_configuration():
+def get_identity_configuration(request: Request):
+    if operator_mode_enabled():
+        operator = operator_identity(request, _expected_tenant_id())
+        return JSONResponse({"mode": "operator", "tenantId": operator.tenant_id}, headers={"Cache-Control": "no-store"})
     configuration = identity_configuration(_expected_tenant_id())
     return JSONResponse({
         "tenantId": configuration.tenant_id,

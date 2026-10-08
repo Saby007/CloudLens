@@ -166,6 +166,11 @@ spec:
           type: Utilization
           averageUtilization: 70
 ---
+# The only rule admitting traffic to the web pods (10-network-policies.yaml denies everything else).
+# Operator mode (MEGHKOSHA_AUTH_MODE=operator, Dev only) has no sign-in, so unless Terraform has limited HTTPS to an
+# IP allow-list (APP_WEB_INGRESS_RESTRICTED=true) the public ingress must not reach them: the selector then names a
+# namespace that cannot exist - namespace names are lowercase DNS labels - and the rule admits nothing. The app is then
+# reached with `kubectl port-forward`, which network policies do not filter.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -182,7 +187,7 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: app-routing-system
+              kubernetes.io/metadata.name: {{ if and (eq (index .Env "MEGHKOSHA_AUTH_MODE") "operator") (ne (index .Env "APP_WEB_INGRESS_RESTRICTED") "true") }}"Operator-Mode.No-Public-Ingress"{{ else }}"app-routing-system"{{ end }}
       ports:
         - protocol: TCP
           port: 8080

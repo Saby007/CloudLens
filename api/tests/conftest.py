@@ -24,6 +24,8 @@ def _fresh_azure_connections():
 def _bind_test_identity(monkeypatch, request):
     tenant_id = "11111111-1111-1111-1111-111111111111"
     monkeypatch.setenv("AZURE_TENANT_ID", tenant_id)
+    # A shell configured for the Dev operator mode must not turn Entra sign-in off for the suite.
+    monkeypatch.delenv("MEGHKOSHA_AUTH_MODE", raising=False)
     if request.module.__name__.rsplit(".", 1)[-1] in {"test_auth", "test_entra_tokens"}:
         return
     from services import auth

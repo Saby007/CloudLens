@@ -205,6 +205,8 @@ pwsh ./scripts/deploy-end-to-end.ps1 `
 | `-InstallKubernetesTools` | Install kubectl and kubelogin with `az aks install-cli` without asking. |
 | `-AcmeEmail` | Register a contact address with Let's Encrypt for the TLS certificate. |
 | `-SkipIdentityBootstrap` | A separate Entra administrator creates the app registrations. |
+| `-OperatorMode` | Dev only: you cannot create Entra app registrations. Deploys without sign-in; the public URL stays closed unless you add `-AllowedIpRanges` — see [operator mode](#operator-mode-dev-without-entra-app-registrations). |
+| `-AllowedIpRanges` | Only these IPv4 addresses or CIDR ranges may reach the public URL over HTTPS. With `-OperatorMode`, this is what opens it; `scripts/allow-my-ip.ps1` keeps it current when your address changes. |
 | `-ServiceManagementReference` | Your tenant requires a Service Tree ID on app registrations. If you leave it out, the script asks when the tenant refuses, suggests the ID your existing registrations use, and remembers your answer. |
 | `-SkipRoleAssignments` | A subscription Owner grants the three roles separately. |
 | `-SkipProcessor` | Scheduled exports are intentionally out of scope (the processor setting is left as it is). |
@@ -261,6 +263,8 @@ For both `data` and `ai`, keep `APP_EXPORT_TRUSTED_SERVICES=true` — otherwise 
 This step creates two Microsoft Entra ID app registrations: a **public-client SPA** (what users sign into in the browser) and a **confidential-client API** (what validates their token). `scripts/bootstrap-identity.ps1` creates both for you — redirect URI, API scope, and the federated credential the API's managed identity needs — instead of you clicking through the Entra portal by hand.
 
 > [`scripts/deploy-end-to-end.ps1`](#option-1--one-command-end-to-end-recommended) runs this entire step for you, including feeding the two client IDs back into `azd` and redeploying. Follow the manual steps below when you want to review the plan first, or when a separate Entra administrator runs the bootstrap.
+
+> Can't create app registrations (`Microsoft Graph POST /v1.0/applications was denied (HTTP 403)`)? An Entra administrator can run this step for you. For a Dev environment you can instead use [operator mode](#operator-mode-dev-without-entra-app-registrations), which needs no app registrations.
 
 > Run this with **PowerShell 7+** (`pwsh`), not Windows PowerShell 5.1 — the `-Apply` path uses `ConvertFrom-Json -AsHashtable`, which doesn't exist in 5.1. If you're on Windows and typed `./scripts/bootstrap-identity.ps1` directly, check `$PSVersionTable.PSVersion` first; if it's below 7, launch `pwsh` and run the command again from there.
 
@@ -321,6 +325,57 @@ Sign in, open **Schedules**, and use **Refresh schedules**. Once the roles above
 
 If **Schedules** keeps reporting **Export status unavailable** or *"FOCUS export configuration could not be confirmed"* even though all three role assignments are in place, re-check the [`Microsoft.CostManagementExports` registration](#prerequisites) on the subscription you deployed into — that is the most common cause, and it is not something role assignments or a redeploy can fix.
 
+### Operator mode: Dev without Entra app registrations
+
+For a **Dev environment** whose operator cannot create Entra app registrations, deploy without sign-in. With no sign-in, the network decides who reaches the app, so choose one of two ways in.
+
+**Public URL, limited to your IP addresses.** The app keeps its usual `https://<label>.<region>.cloudapp.azure.com` address, but the node subnet's network security group lets only the addresses you list reach it over HTTPS:
+
+```powershell
+pwsh ./scripts/deploy-end-to-end.ps1 `
+  -EnvironmentName my-dev `
+  -TargetSubscriptionId '<subscription-id>' `
+  -OperatorMode `
+  -AllowedIpRanges '<your-public-ip>'
+```
+
+`-AllowedIpRanges` takes comma-separated IPv4 addresses or CIDR ranges (/8 or narrower), for example `'203.0.113.7,198.51.100.0/24'` for home plus an office range; `(Invoke-RestMethod https://api.ipify.org)` prints your current public address. The list is kept in the azd environment, so later runs keep it; `-AllowedIpRanges ''` removes it. When your address changes, point the list at the new one — this updates the network rule in seconds, without a redeploy:
+
+```powershell
+pwsh ./scripts/allow-my-ip.ps1 -EnvironmentName my-dev                                  # looks your address up at api.ipify.org
+pwsh ./scripts/allow-my-ip.ps1 -EnvironmentName my-dev -IpAddress 198.51.100.0/24 -Add   # allow a range and keep the others
+```
+
+> **On a VPN, the app may see a different address.** A VPN that carries only some destinations — the Microsoft VPN carries Azure's address ranges — sends your traffic to the app through the VPN, while lookup sites such as api.ipify.org are reached over your normal connection. The app then sees the VPN's exit address, and HTTPS times out even though the allow-list holds your home address. Disconnect the VPN while using the app, or use port-forward (below) while connected. `allow-my-ip.ps1` checks for this and stops without changes. Allow-listing a VPN's exit address works, but everyone else on that VPN could then reach the app as you.
+
+**Port-forward only.** Leave out `-AllowedIpRanges` and the public URL stays closed: the network security group blocks HTTPS, the `web-from-ingress` network policy admits nothing, and the API refuses requests forwarded by the ingress controller. Reach the app through the cluster ([Cluster access](#cluster-access)) and open <http://localhost:8080>. This also works from any address while an allow-list is in place:
+
+```powershell
+az aks get-credentials --resource-group (azd env get-value AZURE_RESOURCE_GROUP) --name (azd env get-value AZURE_AKS_CLUSTER_NAME)
+kubelogin convert-kubeconfig --login azurecli
+kubectl port-forward --namespace cloudlens service/web 8080:8080
+```
+
+If you set `APP_AKS_API_AUTHORIZED_IP_RANGES`, your address must be in it.
+
+Either way:
+
+- **No sign-in; every request acts as the operator** — the account signed in to the Azure CLI when the script ran, read with `az ad signed-in-user show` (no Entra role needed). The app still reads Azure data with its managed identities and still shows only the subscriptions where the operator holds a supported role, exactly as for a signed-in user.
+- **Everyone who reaches the app acts as the operator** — anyone behind an allowed address, and anyone who can port-forward to the cluster — with no per-user sign-in or audit trail; changes are attributed to the operator. Keep the allow-list narrow, grant cluster access accordingly, and never use operator mode in production.
+- The sign-in bootstrap is skipped. The script checks the public URL only when an allow-list is in place, and prints the port-forward commands either way.
+
+Every run of the script sets the mode, so a run without `-OperatorMode` turns sign-in back on (which then needs the app registrations). With plain `azd`, set the values yourself and redeploy; `azd env set MEGHKOSHA_AUTH_MODE entra` and `azd deploy` turn sign-in back on:
+
+```powershell
+azd env set MEGHKOSHA_AUTH_MODE operator
+azd env set MEGHKOSHA_OPERATOR_OBJECT_ID (az ad signed-in-user show --query id --output tsv)
+azd env set MEGHKOSHA_OPERATOR_UPN (az ad signed-in-user show --query userPrincipalName --output tsv)
+azd env set APP_WEB_ALLOWED_IP_RANGES '<your-public-ip>'   # optional: open the public URL to these addresses
+azd up
+```
+
+Terraform applies the allow-list, so it needs `azd up` (or `azd provision`), not just `azd deploy`: the public URL opens only after Terraform reports the restriction (`APP_WEB_INGRESS_RESTRICTED`), so a plain `azd deploy` can never open it early. `MEGHKOSHA_AUTH_MODE` is compared exactly — `operator` or `entra`, lowercase — by Terraform, the API and the web manifest alike; any other value is rejected.
+
 ## The three manual role assignments
 
 Subscription access is deliberately kept **outside** the application — there is no in-app subscription-onboarding flow, and the app can never grant itself access. For every subscription you want it to assess, a user with **Owner** (or **User Access Administrator**) on that subscription must add three role assignments:
@@ -378,6 +433,7 @@ Set these with `azd env set <name> <value>` before `azd provision`. Values marke
 | `APP_AKS_KUBERNETES_VERSION` | region default | The `stable` auto-upgrade channel keeps the cluster current inside the maintenance window. |
 | `APP_AKS_MAINTENANCE_DAY`, `APP_AKS_MAINTENANCE_START` | `Sunday`, `02:00` | Weekly four-hour UTC window for cluster and node-image upgrades. |
 | `APP_AKS_API_AUTHORIZED_IP_RANGES` | *(any)* | Comma-separated CIDR ranges allowed to reach the Kubernetes API server. Include the machine that runs `azd`. |
+| `APP_WEB_ALLOWED_IP_RANGES` | *(any)* | Comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) allowed to reach the app over HTTPS. Required to open the public URL in [operator mode](#operator-mode-dev-without-entra-app-registrations). Applied by Terraform; `scripts/allow-my-ip.ps1` updates it in place. |
 | `APP_AKS_OUTBOUND_PORTS`, `APP_AKS_OUTBOUND_IPS` | `6400`, `1` | SNAT ports each node gets for outbound connections, and the managed outbound IPs that provide them (64,000 each). The pools at their maximum size, plus one upgrade surge node per pool, must fit: the defaults allow 10 nodes. See [Networking, outbound connections and logs](#networking-outbound-connections-and-logs). |
 | `APP_AKS_OUTBOUND_IDLE_TIMEOUT` | `4` | Minutes an idle outbound connection keeps its SNAT port (4-120; Azure's default is 30). |
 | `APP_VNET_PREFIX`, `APP_AKS_SUBNET_PREFIX`, `APP_PRIVATE_ENDPOINT_SUBNET_PREFIX` | `10.42.0.0/23`, `10.42.0.0/24`, `10.42.1.0/27` | **Day-0.** Nodes take addresses from the AKS subnet; pods use the overlay range. |
@@ -475,6 +531,7 @@ Individual suites are `Backend`, `Frontend`, `Build`, and `Browser`. The runner 
 - Its managed identities hold only the roles you explicitly grant (see above) plus what the deployment itself provisions (container-scoped storage roles for its own control-state and export data). Pods reach them through workload identity federation — there are no client secrets, storage keys or registry passwords anywhere.
 - The cluster API accepts Entra ID only (local accounts are disabled) and is authorized by Azure RBAC; restrict it further with `APP_AKS_API_AUTHORIZED_IP_RANGES`.
 - TLS ends at the ingress controller. Network policies admit only the ingress controller to the web pods and only the web pods to the API; the API has no public endpoint. Storage and Foundry are reachable only through private endpoints.
+- [Operator mode](#operator-mode-dev-without-entra-app-registrations) (Dev only) replaces Entra sign-in with network access control: every request acts as one configured operator, and only the addresses on the IP allow-list (enforced by the network security group) or users with cluster access (through port-forward) can reach the app. Without an allow-list, HTTPS is blocked at the network security group, the network policies admit nothing from the ingress controller, and the API refuses requests it forwarded. Never use it in production.
 - Pods run as non-root users with read-only root filesystems, no privilege escalation, all Linux capabilities dropped and the runtime-default seccomp profile. Container images run on a minimal, digest-pinned base with no shell or package manager in the production API image.
 - All API responses that could contain cost or identity data are marked private/no-store.
 - This is a reference implementation, not an audited commercial product — review the Terraform configuration, the Kubernetes manifests and the RBAC grants before deploying into a production tenant.

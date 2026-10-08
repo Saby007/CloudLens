@@ -37,6 +37,21 @@ function Test-Overlap([System.Net.IPNetwork] $First, [System.Net.IPNetwork] $Sec
     return $First.Contains($Second.BaseAddress) -or $Second.Contains($First.BaseAddress)
 }
 
+# The same rules Terraform's web_allowed_ip_ranges validation applies: IPv4, /8 to /32, written with the network address.
+function ConvertTo-IpAllowList([string] $Name, [string] $Value) {
+    $ranges = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in @("$Value" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $text = if ($item.Contains('/')) { $item } else { "$item/32" }
+        $network = [System.Net.IPNetwork]::new([System.Net.IPAddress]::Any, 0)
+        if ($text -notmatch '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$' -or -not [System.Net.IPNetwork]::TryParse($text, [ref] $network) -or
+            $network.PrefixLength -lt 8 -or "$($network.BaseAddress)/$($network.PrefixLength)" -cne $text) {
+            throw "$Name must list IPv4 addresses or CIDR ranges from /8 to /32 written with their network address, for example 203.0.113.7 or 198.51.100.0/24; '$item' is not one."
+        }
+        if (-not $ranges.Contains($text)) { $ranges.Add($text) }
+    }
+    return , $ranges.ToArray()
+}
+
 if ($Operation -ne 'Local' -and -not (Get-BooleanSetting 'APP_ALLOW_AZURE_CHANGES')) {
     throw 'Azure changes are not approved. Complete the required approval gates and explicitly set APP_ALLOW_AZURE_CHANGES=true.'
 }
@@ -134,6 +149,12 @@ if ($signInConfigured) {
     foreach ($name in @('AZURE_TENANT_ID', 'MEGHKOSHA_API_CLIENT_ID', 'MEGHKOSHA_WEB_CLIENT_ID')) { Assert-Identifier $name }
     if ((Get-Setting 'MEGHKOSHA_API_CLIENT_ID') -eq (Get-Setting 'MEGHKOSHA_WEB_CLIENT_ID')) { throw 'API and SPA must use separate registrations.' }
 }
+# Compared exactly, as the API and the web manifest do: a near miss must never switch only one of them.
+$authMode = [Environment]::GetEnvironmentVariable('MEGHKOSHA_AUTH_MODE', 'Process')
+if ($null -eq $authMode) { $authMode = '' }
+if ($authMode -cnotin @('', 'entra', 'operator')) { throw 'MEGHKOSHA_AUTH_MODE must be entra or operator (lowercase, no spaces).' }
+if ($authMode -ceq 'operator') { Assert-Identifier 'MEGHKOSHA_OPERATOR_OBJECT_ID' }
+$webAllowedIpRanges = ConvertTo-IpAllowList 'APP_WEB_ALLOWED_IP_RANGES' ([Environment]::GetEnvironmentVariable('APP_WEB_ALLOWED_IP_RANGES', 'Process'))
 if ($Operation -eq 'Deploy' -and (Get-Setting 'AZURE_AKS_CLUSTER_NAME') -cnotmatch '^aks-[a-f0-9]{13}$') {
     throw 'Deploy requires the provisioned AKS cluster (run azd provision first).'
 }
@@ -190,6 +211,8 @@ if ($chatRuntime -and ($profile -ne 'ai' -or -not (Get-BooleanSetting 'APP_AI_VA
     hosting = 'aks'
     profile = $profile
     signInConfigured = $signInConfigured
+    authMode = $(if ($authMode) { $authMode } else { 'entra' })
+    webAllowedIpRanges = @($webAllowedIpRanges)
     processorEnabled = $processor
     aiRuntimeEnabled = $aiRuntime
     chatRuntimeEnabled = $chatRuntime

@@ -18,9 +18,10 @@
          and the ingress controller; azd builds both images in ACR and applies the Kubernetes manifests.
          Failures are retried after a wait.
       5. Runs scripts/bootstrap-identity.ps1, feeds the two client IDs back into the environment, and
-         runs `azd deploy` so the API pods pick them up.
+         runs `azd deploy` so the API pods pick them up. Skipped with -OperatorMode.
       6. Grants Reader / Cost Management Contributor on every subscription you want to assess.
-      7. Waits for the Let's Encrypt certificate and checks /api/health over HTTPS.
+      7. Waits for the Let's Encrypt certificate and checks /api/health over HTTPS, or, with -OperatorMode and
+         no IP allow-list, prints how to reach the app through `kubectl port-forward` instead.
 
     Every phase is idempotent and re-entrant: rerunning the script against an existing environment
     reapplies the current code once and skips whatever is already in place.
@@ -50,6 +51,19 @@
 .PARAMETER AcmeEmail
     Optional contact address registered with Let's Encrypt for the app's TLS certificate.
 
+.PARAMETER OperatorMode
+    Dev only, for operators who cannot create Entra app registrations. Deploys without Entra sign-in:
+    every request acts as the signed-in Azure CLI user (their own Azure role assignments still decide
+    which subscriptions the app shows). Without -AllowedIpRanges the public URL is closed and the app is
+    reached through `kubectl port-forward`. Skips the sign-in bootstrap. A later run without this switch
+    turns sign-in back on, which then needs the app registrations.
+
+.PARAMETER AllowedIpRanges
+    Comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) that may reach the app's public URL over
+    HTTPS; everyone else is blocked by the network security group. With -OperatorMode this is what opens the
+    public URL. The list is kept in the azd environment, so later runs keep it unless you pass this again;
+    pass '' to remove it. When your address changes, scripts/allow-my-ip.ps1 updates it in seconds.
+
 .PARAMETER InstallKubernetesTools
     Install kubectl and kubelogin with `az aks install-cli` without asking when they are missing.
 
@@ -59,6 +73,14 @@
 
 .EXAMPLE
     pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-environment -TargetSubscriptionId 'sub-a,sub-b'
+
+.EXAMPLE
+    # Dev environment without Entra app registrations: reached through kubectl port-forward only.
+    pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-dev -TargetSubscriptionId 'sub-a' -OperatorMode
+
+.EXAMPLE
+    # The same, served at its public URL to your own address only (scripts/allow-my-ip.ps1 keeps it current).
+    pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-dev -TargetSubscriptionId 'sub-a' -OperatorMode -AllowedIpRanges '203.0.113.7'
 
 .EXAMPLE
     # Standalone: clones the cloudlensdev branch of the repository next to the current directory first.
@@ -92,6 +114,8 @@ param(
     [switch] $SkipRoleAssignments,
     [switch] $IncludeLocalhostRedirects,
     [switch] $GrantAdminConsent,
+    [switch] $OperatorMode,
+    [string] $AllowedIpRanges = '',
     [switch] $InstallKubernetesTools,
     [string] $KubernetesToolsDirectory = $HOME,
     [switch] $PlanOnly
@@ -117,6 +141,32 @@ $settings = [ordered]@{
 # Skipping leaves an existing environment's processor setting untouched instead of switching it off.
 if (-not $SkipProcessor) { $settings.APP_ENABLE_PROCESSOR = 'true' }
 if ($AcmeEmail) { $settings.APP_ACME_EMAIL = $AcmeEmail }
+# Every run sets the sign-in mode explicitly, so operator mode never outlives the run that asked for it.
+# The operator is the signed-in az user, resolved after sign-in.
+$settings.MEGHKOSHA_AUTH_MODE = if ($OperatorMode) { 'operator' } else { 'entra' }
+if (-not $OperatorMode) {
+    $settings.MEGHKOSHA_OPERATOR_OBJECT_ID = ''
+    $settings.MEGHKOSHA_OPERATOR_UPN = ''
+}
+
+# The same rules Terraform's web_allowed_ip_ranges validation applies: IPv4, /8 to /32, written with the network address.
+function ConvertTo-IpAllowList {
+    param([AllowEmptyString()][string] $Value)
+    if (-not ('System.Net.IPNetwork' -as [type])) { throw '-AllowedIpRanges needs PowerShell 7.4 or later.' }
+    $ranges = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in @("$Value" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $text = if ($item.Contains('/')) { $item } else { "$item/32" }
+        $network = [System.Net.IPNetwork]::new([System.Net.IPAddress]::Any, 0)
+        if ($text -notmatch '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$' -or -not [System.Net.IPNetwork]::TryParse($text, [ref] $network) -or
+            $network.PrefixLength -lt 8 -or "$($network.BaseAddress)/$($network.PrefixLength)" -cne $text) {
+            throw "-AllowedIpRanges takes IPv4 addresses or CIDR ranges from /8 to /32 written with their network address, for example 203.0.113.7 or 198.51.100.0/24; '$item' is not one."
+        }
+        if (-not $ranges.Contains($text)) { $ranges.Add($text) }
+    }
+    return ($ranges -join ',')
+}
+# Kept in the azd environment between runs (scripts/allow-my-ip.ps1 updates it), so only an explicit value changes it.
+if ($PSBoundParameters.ContainsKey('AllowedIpRanges')) { $settings.APP_WEB_ALLOWED_IP_RANGES = ConvertTo-IpAllowList $AllowedIpRanges }
 # azd's output is captured to classify failures, which would also hide any question azd asked, so azd
 # always runs with --no-prompt. These are the errors it reports when it needed an answer instead; the
 # command is then rerun attached to the terminal so the question can be answered there.
@@ -150,7 +200,8 @@ if ($PlanOnly) {
         deploymentSubscription = $SubscriptionId
         preview = -not $SkipPreview
         enableProcessor = -not $SkipProcessor
-        bootstrapIdentity = -not $SkipIdentityBootstrap
+        operatorMode = [bool] $OperatorMode
+        bootstrapIdentity = -not ($SkipIdentityBootstrap -or $OperatorMode)
         roleAssignments = -not $SkipRoleAssignments
         serviceManagementReference = $ServiceManagementReference
         assessedSubscriptions = $subscriptionIds
@@ -527,6 +578,30 @@ try {
     # unattended run; setting them explicitly keeps every later azd call non-interactive.
     Set-AzdValue 'AZURE_SUBSCRIPTION_ID' $deploymentSubscription
     Write-Host '  AZURE_SUBSCRIPTION_ID set.'
+    if ($OperatorMode) {
+        # Every request will act as this user, so the API authorizes against their own object ID.
+        $operatorJson = Get-CliText (& az ad signed-in-user show --query '{id:id,upn:userPrincipalName}' --output json --only-show-errors 2>$null)
+        $operatorId = ''
+        $operatorUpn = ''
+        if ($LASTEXITCODE -eq 0 -and $operatorJson) {
+            try {
+                $operatorAccount = $operatorJson | ConvertFrom-Json -AsHashtable
+                if ($operatorAccount -is [System.Collections.IDictionary]) {
+                    $operatorId = "$($operatorAccount['id'])"
+                    $operatorUpn = "$($operatorAccount['upn'])".Trim()
+                }
+            } catch {
+                $operatorId = ''
+            }
+        }
+        $operatorObjectId = [guid]::Empty
+        if (-not [guid]::TryParse($operatorId, [ref] $operatorObjectId) -or $operatorObjectId -eq [guid]::Empty) {
+            throw "-OperatorMode acts as the signed-in Azure CLI user, but 'az ad signed-in-user show' returned no user object ID. Sign in to az with your own user account (not a service principal), then rerun."
+        }
+        $settings.MEGHKOSHA_OPERATOR_OBJECT_ID = $operatorObjectId.ToString()
+        $settings.MEGHKOSHA_OPERATOR_UPN = $operatorUpn
+        Write-Host "Operator mode (Dev only): Entra sign-in is off and every request acts as $(if ($operatorUpn) { $operatorUpn } else { $settings.MEGHKOSHA_OPERATOR_OBJECT_ID })." -ForegroundColor Yellow
+    }
     foreach ($entry in $settings.GetEnumerator()) {
         Set-AzdValue $entry.Key $entry.Value
         Write-Host "  $($entry.Key) set."
@@ -564,7 +639,9 @@ try {
     # -----------------------------------------------------------------------
     # 5. Sign-in registrations
     # -----------------------------------------------------------------------
-    if ($SkipIdentityBootstrap) {
+    if ($OperatorMode) {
+        Write-Step 'Skipping the Entra ID sign-in bootstrap (-OperatorMode has no sign-in)'
+    } elseif ($SkipIdentityBootstrap) {
         Write-Step 'Skipping the Entra ID sign-in bootstrap (-SkipIdentityBootstrap)'
     } else {
         Write-Step 'Configuring sign-in (scripts/bootstrap-identity.ps1)'
@@ -694,14 +771,28 @@ try {
     # -----------------------------------------------------------------------
     Write-Step 'Deployment summary'
     $url = Get-WebEndpointUrl
+    # Terraform reports the restriction only once the network security group enforces the allow-list.
+    $restricted = (Get-AzdValue 'APP_WEB_INGRESS_RESTRICTED') -eq 'true'
+    $allowedIpRanges = Get-AzdValue 'APP_WEB_ALLOWED_IP_RANGES'
+    $publicUrlOpen = -not $OperatorMode -or $restricted
     $healthy = $false
-    if ($url) { $healthy = Wait-AppHealthy $url }
+    if (-not $publicUrlOpen) {
+        Write-Host 'Operator mode without an IP allow-list closes the public URL, so the HTTPS health check is skipped.' -ForegroundColor Yellow
+    } elseif ($url) {
+        $healthy = Wait-AppHealthy $url
+        if (-not $healthy -and $restricted) {
+            Write-Warning "The public URL answers only $allowedIpRanges. If this machine's address is not among them - on a VPN that carries Azure traffic the app sees the VPN's exit address - run scripts/allow-my-ip.ps1 -EnvironmentName $EnvironmentName, which checks for that."
+        }
+    }
     $deployed = [ordered]@{
         environment = $EnvironmentName
         subscription = $deploymentSubscription
         resourceGroup = Get-ResourceGroupName
         cluster = Get-AzdValue 'AZURE_AKS_CLUSTER_NAME'
-        webUrl = $url
+        authMode = $settings.MEGHKOSHA_AUTH_MODE
+        webUrl = $(if ($publicUrlOpen) { $url } else { '' })
+        allowedIpRanges = $(if ($restricted) { $allowedIpRanges } else { '' })
+        portForward = $(if ($OperatorMode) { 'kubectl port-forward --namespace cloudlens service/web 8080:8080' } else { '' })
         healthy = $healthy
         apiImage = Get-AzdValue 'SERVICE_API_IMAGE_NAME'
         processorEnabled = (Get-AzdValue 'APP_PROCESSOR_DEPLOYED') -eq 'true'
@@ -716,7 +807,19 @@ try {
 }
 
 $deployed | ConvertTo-Json -Depth 5
-if ($deployed.webUrl) { Write-Host "Open the app: $($deployed.webUrl)" -ForegroundColor Green }
+if ($deployed.portForward) {
+    if ($deployed.webUrl) {
+        Write-Host "Operator mode: open $($deployed.webUrl) from an allowed address ($($deployed.allowedIpRanges -replace ',', ', '))." -ForegroundColor Yellow
+        Write-Host "When your IP address changes: pwsh ./scripts/allow-my-ip.ps1 -EnvironmentName $($deployed.environment)"
+        Write-Host 'From any other address, connect to the cluster and forward the web service:'
+    } else {
+        Write-Host 'Operator mode: the public URL is closed. Connect to the cluster and forward the web service:' -ForegroundColor Yellow
+    }
+    Write-Host "    az aks get-credentials --resource-group $($deployed.resourceGroup) --name $($deployed.cluster) --subscription $($deployed.subscription)"
+    Write-Host '    kubelogin convert-kubeconfig --login azurecli'
+    Write-Host "    $($deployed.portForward)"
+    Write-Host 'then open http://localhost:8080. Everyone who reaches the app acts as the operator.' -ForegroundColor Yellow
+} elseif ($deployed.webUrl) { Write-Host "Open the app: $($deployed.webUrl)" -ForegroundColor Green }
 if ($kubernetesToolsPathHint) {
     Write-Host ''
     Write-Host $kubernetesToolsPathHint -ForegroundColor Yellow

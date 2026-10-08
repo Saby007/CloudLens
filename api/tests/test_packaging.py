@@ -150,6 +150,7 @@ def test_each_profile_defaults_to_no_processor_ai_runtime_or_export_exception(pr
     assert settings["hosting"] == "aks"
     assert settings["tlsIssuer"] == "letsencrypt"
     assert not settings["signInConfigured"]
+    assert settings["authMode"] == "entra"
     assert not settings["processorEnabled"]
     assert not settings["aiRuntimeEnabled"]
     assert not settings["chatRuntimeEnabled"]
@@ -186,6 +187,13 @@ def test_azure_operations_are_blocked_without_explicit_approval(operation):
     ({"APP_AKS_USER_MAX_NODES": "five"}, "APP_AKS_USER_MAX_NODES must be a whole number"),
     ({"APP_ENABLE_PROCESSOR": "True"}, "must be true or false (lowercase)"),
     ({"MEGHKOSHA_API_CLIENT_ID": "33333333-3333-3333-3333-333333333333"}, "must contain a nonzero UUID"),
+    ({"MEGHKOSHA_AUTH_MODE": "Operator"}, "MEGHKOSHA_AUTH_MODE must be entra or operator"),
+    ({"MEGHKOSHA_AUTH_MODE": "none"}, "MEGHKOSHA_AUTH_MODE must be entra or operator"),
+    ({"MEGHKOSHA_AUTH_MODE": "operator"}, "MEGHKOSHA_OPERATOR_OBJECT_ID must contain a nonzero UUID"),
+    ({"APP_WEB_ALLOWED_IP_RANGES": "0.0.0.0/0"}, "APP_WEB_ALLOWED_IP_RANGES"),
+    ({"APP_WEB_ALLOWED_IP_RANGES": "198.51.100.7/24"}, "APP_WEB_ALLOWED_IP_RANGES"),
+    ({"APP_WEB_ALLOWED_IP_RANGES": "203.0.113.7,not-an-address"}, "APP_WEB_ALLOWED_IP_RANGES"),
+    ({"APP_WEB_ALLOWED_IP_RANGES": "2001:db8::/32"}, "APP_WEB_ALLOWED_IP_RANGES"),
     ({"APP_EXPORT_TRUSTED_SERVICES": "true"}, "not part of the core stage"),
     ({"APP_ENABLE_PROCESSOR": "true"}, "requires the data"),
     ({"APP_ENABLE_AI_RUNTIME": "true"}, "AI runtime requires"),
@@ -202,6 +210,22 @@ def test_invalid_or_unimplemented_configuration_fails_before_cloud_calls(overrid
 def test_a_second_outbound_ip_makes_room_for_a_larger_application_pool():
     result = run_input_validation({"APP_AKS_USER_MAX_NODES": "6", "APP_AKS_OUTBOUND_IPS": "2"})
     assert result.returncode == 0, result.stderr
+
+
+def test_operator_mode_needs_an_operator_but_no_sign_in_registrations():
+    result = run_input_validation({"MEGHKOSHA_AUTH_MODE": "operator",
+                                   "MEGHKOSHA_OPERATOR_OBJECT_ID": "66666666-6666-6666-6666-666666666666"})
+    assert result.returncode == 0, result.stderr
+    settings = json.loads(result.stdout)
+    assert settings["authMode"] == "operator"
+    assert not settings["signInConfigured"]
+    assert settings["webAllowedIpRanges"] == []
+
+
+def test_an_ip_allow_list_accepts_addresses_and_narrow_networks():
+    result = run_input_validation({"APP_WEB_ALLOWED_IP_RANGES": " 203.0.113.7 ,198.51.100.0/24,203.0.113.7/32"})
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["webAllowedIpRanges"] == ["203.0.113.7/32", "198.51.100.0/24"]
 
 
 def test_approved_model_router_enables_chat_without_hosted_agent_narration():
@@ -268,6 +292,9 @@ def test_ai_deployment_helper_plans_the_recommended_aks_profile_without_sign_in_
         "APP_AI_VALIDATED": "true",
         "APP_ENABLE_AI_RUNTIME": "false",
         "APP_ENABLE_PROCESSOR": "true",
+        "MEGHKOSHA_AUTH_MODE": "entra",
+        "MEGHKOSHA_OPERATOR_OBJECT_ID": "",
+        "MEGHKOSHA_OPERATOR_UPN": "",
     }
     source = script.read_text(encoding="utf-8")
     assert "deploy-end-to-end.ps1" in source
@@ -335,6 +362,14 @@ def test_end_to_end_helper_deploys_once_retries_and_never_hides_a_question():
     assert summary["rerunRedeploysOnce"] and summary["noHiddenPrompts"] and summary["azdQuestionsAskedInTerminal"]
     assert summary["serviceTreeIdAskedAndRemembered"] and summary["kubernetesToolsOfferedAndInstalled"]
     assert summary["kubernetesToolsPathExplained"]
+    assert summary["operatorModeSkipsSignInAndPublicUrl"] and summary["allowListOpensPublicUrl"]
+
+
+def test_allow_my_ip_keeps_the_allow_list_current_without_a_redeploy():
+    summary = run_powershell_harness("test-allow-my-ip.ps1")
+    assert summary == {"result": "passed", "detectsAddress": True, "keepsOthersWithAdd": True,
+                       "refusesBroadRanges": True, "savesOnlyAfterRuleUpdate": True, "noRedeploy": True,
+                       "detectsVpnSplitTunnel": True}
 
 
 def test_aks_bootstrap_hook_waits_for_rbac_and_installs_only_the_pinned_cert_manager():
@@ -479,6 +514,8 @@ def test_azd_parameter_file_maps_every_terraform_variable_from_the_environment()
     assert defaults["aks_zones"] == "1,2,3" and defaults["aks_sku_tier"] == "Standard"
     assert defaults["aks_system_vm_size"] == "Standard_D2ds_v5" and defaults["aks_user_vm_size"] == "Standard_D4ds_v5"
     assert defaults["tls_cluster_issuer"] == "letsencrypt"
+    assert defaults["auth_mode"] == "" and defaults["web_allowed_ip_ranges"] == ""
+    assert '"auth_mode": "${MEGHKOSHA_AUTH_MODE}"' in template and '"web_allowed_ip_ranges": "${APP_WEB_ALLOWED_IP_RANGES}"' in template
     assert '"principal_id": "${AZURE_PRINCIPAL_ID}"' in template
     for name in ("daily_export_retention_days", "closed_month_retention_days", "export_parallel_months", "log_retention_days",
                  "aks_system_min_nodes", "aks_system_max_nodes", "aks_user_min_nodes", "aks_user_max_nodes",
@@ -563,6 +600,8 @@ SAFE_TEMPLATE_ACTIONS = (
     r'\{\{ index \.Env "[A-Z0-9_]+" \| printf "%q" \}\}',
     r'\{\{ or \(index \.Env "[A-Z0-9_]+"\) "[^"{}]+" \| printf "%q" \}\}',
     r'\{\{ if eq \(index \.Env "[A-Z0-9_]+"\) "true" \}\}false\{\{ else \}\}true\{\{ end \}\}',
+    r'\{\{ if and \(eq \(index \.Env "[A-Z0-9_]+"\) "[a-z]+"\) \(ne \(index \.Env "[A-Z0-9_]+"\) "true"\) \}\}'
+    r'"[^"{}]+"\{\{ else \}\}"[^"{}]+"\{\{ end \}\}',
 )
 
 
@@ -581,7 +620,9 @@ def test_manifest_templates_use_only_quoted_lookups_that_cannot_render_no_value(
 
 def test_every_value_read_by_the_manifests_and_hook_is_provided():
     produced_by_azd = {"SERVICE_API_IMAGE_NAME", "SERVICE_WEB_IMAGE_NAME", "AZURE_SUBSCRIPTION_ID"}
-    set_by_operator = {"MEGHKOSHA_API_CLIENT_ID", "MEGHKOSHA_WEB_CLIENT_ID", "APP_ACME_EMAIL"}
+    set_by_operator = {"MEGHKOSHA_API_CLIENT_ID", "MEGHKOSHA_WEB_CLIENT_ID", "APP_ACME_EMAIL",
+                       "MEGHKOSHA_AUTH_MODE", "MEGHKOSHA_OPERATOR_OBJECT_ID", "MEGHKOSHA_OPERATOR_UPN",
+                       "APP_WEB_ALLOWED_IP_RANGES"}
     outputs = _terraform_outputs()
     read = set()
     for path in MANIFESTS.values():
@@ -604,7 +645,9 @@ def test_api_and_processor_receive_the_same_settings_as_the_container_apps_did()
     api = _container_environment(MANIFESTS["api"].read_text())
     assert sorted(api) == sorted([
         "AZURE_CLIENT_ID", "AZURE_TENANT_ID", "MEGHKOSHA_API_CLIENT_ID", "MEGHKOSHA_WEB_CLIENT_ID",
-        "MEGHKOSHA_OBO_MANAGED_IDENTITY_CLIENT_ID", "MEGHKOSHA_ACTION_WRITES_PAUSED", "APP_PROFILE", "APP_SCHEDULER_ENABLED",
+        "MEGHKOSHA_OBO_MANAGED_IDENTITY_CLIENT_ID", "MEGHKOSHA_AUTH_MODE", "MEGHKOSHA_OPERATOR_OBJECT_ID",
+        "MEGHKOSHA_OPERATOR_UPN", "APP_WEB_INGRESS_RESTRICTED", "MEGHKOSHA_ACTION_WRITES_PAUSED", "APP_PROFILE",
+        "APP_SCHEDULER_ENABLED",
         "MEGHKOSHA_AI_ENABLED", "FOUNDRY_CHAT_ENABLED", "AI_PROJECT_ENDPOINT", "AI_SERVICES_ENDPOINT", "AGENT_NAME",
         "MODEL_ROUTER_DEPLOYMENT_NAME", "COST_EXPORT_STORAGE_URL", "COST_EXPORT_STORAGE_RESOURCE_ID", "COST_EXPORT_CONTAINER",
         "REPORT_SNAPSHOT_CONTAINER", "CONTROL_STATE_CONTAINER", "COST_EXPORT_NAME", "COST_EXPORT_DAILY_NAME",
@@ -712,6 +755,33 @@ def test_only_the_web_pods_reach_the_api_and_tls_comes_from_cert_manager():
     assert re.search(r"\$CertManagerVersion = 'v\d+\.\d+\.\d+'", hook)
     assert re.search(r"\$CertManagerSha256 = '[a-f0-9]{64}'", hook)
     assert "Get-FileHash" in hook and "--server-side" in hook
+
+
+def test_operator_mode_closes_the_public_ingress_with_the_setting_the_api_reads():
+    from services import operator_identity
+
+    web = MANIFESTS["web"].read_text()
+    policy = web.split("name: web-from-ingress", 1)[1].split("\n---", 1)[0]
+    closed, ingress_namespace = "Operator-Mode.No-Public-Ingress", "app-routing-system"
+    # Closed in operator mode unless Terraform has already limited HTTPS to an IP allow-list.
+    assert ('kubernetes.io/metadata.name: {{ if and (eq (index .Env "MEGHKOSHA_AUTH_MODE") "operator") '
+            '(ne (index .Env "APP_WEB_INGRESS_RESTRICTED") "true") }}'
+            '"Operator-Mode.No-Public-Ingress"{{ else }}"app-routing-system"{{ end }}') in policy
+    # A valid label value that can never name a namespace (lowercase DNS labels), so the rule then admits nothing.
+    dns_label = r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?"
+    assert re.fullmatch(r"[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?", closed)
+    assert not re.fullmatch(dns_label, closed) and re.fullmatch(dns_label, ingress_namespace)
+    # It is the only policy admitting traffic to the web pods, so closing it closes the public URL.
+    assert web.count("kind: NetworkPolicy") == 1
+    # The API switches on exactly the same values, so the two can never disagree.
+    api = MANIFESTS["api"].read_text()
+    for name in ("MEGHKOSHA_AUTH_MODE", "APP_WEB_INGRESS_RESTRICTED"):
+        assert f'name: {name}\n              value: {{{{ index .Env "{name}" | printf "%q" }}}}' in api
+    assert (operator_identity.AUTH_MODE_SETTING, operator_identity.OPERATOR_MODE) == ("MEGHKOSHA_AUTH_MODE", "operator")
+    # Only Terraform reports the restriction, after it has applied the NSG rule.
+    assert "APP_WEB_INGRESS_RESTRICTED" in _terraform_outputs()
+    assert 'output "APP_WEB_INGRESS_RESTRICTED" {\n  value = tostring(length(local.web_allowed_ip_ranges) > 0)\n}' in (
+        PROJECT_ROOT / "infra" / "outputs.tf").read_text()
 
 
 def test_azure_yaml_deploys_both_services_to_the_terraform_provisioned_cluster():

@@ -85,6 +85,14 @@ spec:
               value: {{ index .Env "MEGHKOSHA_WEB_CLIENT_ID" | printf "%q" }}
             - name: MEGHKOSHA_OBO_MANAGED_IDENTITY_CLIENT_ID
               value: {{ index .Env "MEGHKOSHA_OBO_MANAGED_IDENTITY_CLIENT_ID" | printf "%q" }}
+            - name: MEGHKOSHA_AUTH_MODE
+              value: {{ index .Env "MEGHKOSHA_AUTH_MODE" | printf "%q" }}
+            - name: MEGHKOSHA_OPERATOR_OBJECT_ID
+              value: {{ index .Env "MEGHKOSHA_OPERATOR_OBJECT_ID" | printf "%q" }}
+            - name: MEGHKOSHA_OPERATOR_UPN
+              value: {{ index .Env "MEGHKOSHA_OPERATOR_UPN" | printf "%q" }}
+            - name: APP_WEB_INGRESS_RESTRICTED
+              value: {{ index .Env "APP_WEB_INGRESS_RESTRICTED" | printf "%q" }}
             - name: MEGHKOSHA_ACTION_WRITES_PAUSED
               value: "true"
             - name: APP_PROFILE

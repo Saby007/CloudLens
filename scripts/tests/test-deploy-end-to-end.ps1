@@ -42,6 +42,8 @@ $global:deployTestState = @{
     resourceGroup = $resourceGroup
     apiPrincipalId = $apiPrincipalId
     processorPrincipalId = $processorPrincipalId
+    operatorObjectId = '66666666-6666-6666-6666-666666666666'
+    healthProbes = 0
 }
 
 function Get-StubArgument {
@@ -66,6 +68,7 @@ function Read-Host {
 function Invoke-WebRequest {
     param($Uri, [switch] $UseBasicParsing, [int] $TimeoutSec)
     if ("$Uri" -ne 'https://web.example.test/api/health') { throw "Unexpected health probe: $Uri" }
+    $global:deployTestState.healthProbes++
     return [pscustomobject]@{ StatusCode = 200 }
 }
 
@@ -168,6 +171,9 @@ function azd {
         $values['AZURE_RESOURCE_GROUP'] = $state.resourceGroup
         $values['AZURE_AKS_CLUSTER_NAME'] = 'aks-0123456789abc'
         $values['APP_WEB_ORIGIN'] = 'https://web.example.test'
+        # As Terraform reports it: restricted once the NSG limits HTTPS to the stored allow-list.
+        $values['APP_INGRESS_NSG_NAME'] = 'nsg-aks-nodes-0123456789abc'
+        $values['APP_WEB_INGRESS_RESTRICTED'] = if ($values.Contains('APP_WEB_ALLOWED_IP_RANGES') -and $values['APP_WEB_ALLOWED_IP_RANGES']) { 'true' } else { 'false' }
         $values['APP_PROCESSOR_DEPLOYED'] = if ($values.Contains('APP_ENABLE_PROCESSOR') -and $values['APP_ENABLE_PROCESSOR'] -eq 'true') { 'true' } else { 'false' }
         $values['MEGHKOSHA_OBO_MANAGED_IDENTITY_RESOURCE_ID'] = "/subscriptions/$($state.subscriptionId)/resourceGroups/$($state.resourceGroup)/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-obo"
         $state.azdCalls.Add('up:succeeded')
@@ -238,6 +244,9 @@ function az {
         if ($a -notcontains '--show-mine') { throw "Only the operator's own registrations may suggest a Service Tree ID." }
         return "$($state.serviceTreeId)`n$($state.serviceTreeId)`n99999999-9999-9999-9999-999999999999"
     }
+    if ($a[0] -eq 'ad' -and $a[1] -eq 'signed-in-user' -and $a[2] -eq 'show') {
+        return (@{ id = $state.operatorObjectId; upn = 'operator@example.test' } | ConvertTo-Json -Compress)
+    }
     throw "Unexpected az call: $($a -join ' ')"
 }
 
@@ -290,6 +299,14 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     $plan = & $script @parameters -PlanOnly | ConvertFrom-Json -AsHashtable
     if (@($plan.assessedSubscriptions) -join ',' -ne "$targetOne,$targetTwo") { throw 'Comma-separated target subscriptions were not split into separate subscriptions.' }
     if ($plan.hosting -ne 'aks' -or $plan.repository.branch -ne 'cloudlensdev') { throw 'The plan must describe the AKS deployment from the cloudlensdev branch.' }
+    if ($plan.operatorMode -or $plan.settings.MEGHKOSHA_AUTH_MODE -cne 'entra') { throw 'Entra sign-in must stay the default.' }
+    $operatorPlan = & $script @parameters -PlanOnly -OperatorMode | ConvertFrom-Json -AsHashtable
+    if (-not $operatorPlan.operatorMode -or $operatorPlan.bootstrapIdentity -or $operatorPlan.settings.MEGHKOSHA_AUTH_MODE -cne 'operator') {
+        throw '-OperatorMode must plan operator mode without the sign-in bootstrap.'
+    }
+    if ($plan.settings.ContainsKey('APP_WEB_ALLOWED_IP_RANGES')) { throw 'Without -AllowedIpRanges the stored allow-list must be left alone.' }
+    $allowPlan = & $script @parameters -PlanOnly -OperatorMode -AllowedIpRanges '203.0.113.7' | ConvertFrom-Json -AsHashtable
+    if ($allowPlan.settings.APP_WEB_ALLOWED_IP_RANGES -ne '203.0.113.7/32') { throw 'The planned allow-list must be normalized to CIDR ranges.' }
     if ($global:deployTestState.azdCalls.Count -ne 0) { throw '-PlanOnly must not deploy anything.' }
 
     $summary = & $script @parameters
@@ -308,6 +325,7 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         APP_AI_VALIDATED = 'true'
         APP_ENABLE_AI_RUNTIME = 'false'
         APP_ENABLE_PROCESSOR = 'true'
+        MEGHKOSHA_AUTH_MODE = 'entra'
         MEGHKOSHA_API_CLIENT_ID = $apiClientId
         MEGHKOSHA_WEB_CLIENT_ID = $webClientId
     }
@@ -389,6 +407,53 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     $state.requireServiceTree = $false
     if ($state.interactiveAzd.Count) { throw "azd ran without --no-prompt: $($state.interactiveAzd -join '; ')" }
 
+    # Operator mode (Dev only): the signed-in az user becomes the operator, the sign-in bootstrap and the
+    # public health probe are skipped because the public URL is closed, and the summary points at
+    # port-forward. A later run without the switch returns the environment to Entra sign-in.
+    $state.azdCalls.Clear()
+    $bootstrapsBefore = $state.bootstrapCalls
+    $probesBefore = $state.healthProbes
+    $operatorSummary = & $script @parameters -SkipPreview -OperatorMode | ConvertFrom-Json -AsHashtable
+    if ($state.bootstrapCalls -ne $bootstrapsBefore) { throw 'Operator mode must not run the Entra sign-in bootstrap.' }
+    if ($state.healthProbes -ne $probesBefore) { throw 'Operator mode closes the public URL, so it must not probe it.' }
+    if (($state.azdCalls -join ',') -ne 'up:succeeded') { throw "Operator mode made these azd calls: $($state.azdCalls -join ',')" }
+    if ($values['MEGHKOSHA_AUTH_MODE'] -cne 'operator' -or $values['MEGHKOSHA_OPERATOR_OBJECT_ID'] -ne $state.operatorObjectId -or
+        $values['MEGHKOSHA_OPERATOR_UPN'] -ne 'operator@example.test') {
+        throw 'Operator mode must pin the signed-in user as the operator in the azd environment.'
+    }
+    if ($operatorSummary.authMode -ne 'operator' -or $operatorSummary.webUrl -or $operatorSummary.healthy -or
+        $operatorSummary.portForward -ne 'kubectl port-forward --namespace cloudlens service/web 8080:8080') {
+        throw 'The operator-mode summary must point at port-forward instead of the closed public URL.'
+    }
+    $entraSummary = & $script @parameters -SkipPreview | ConvertFrom-Json -AsHashtable
+    if ($values['MEGHKOSHA_AUTH_MODE'] -cne 'entra' -or $values['MEGHKOSHA_OPERATOR_OBJECT_ID'] -or $values['MEGHKOSHA_OPERATOR_UPN']) {
+        throw 'A run without -OperatorMode must return the environment to Entra sign-in.'
+    }
+    if ($state.bootstrapCalls -ne $bootstrapsBefore + 1 -or $entraSummary.authMode -ne 'entra' -or $entraSummary.portForward -or
+        $entraSummary.webUrl -ne 'https://web.example.test' -or -not $entraSummary.healthy) {
+        throw 'Entra mode must configure sign-in again and check the public URL.'
+    }
+
+    # An IP allow-list opens the operator-mode public URL once Terraform reports the restriction. The list is
+    # stored normalized, kept by later runs that do not pass it, removed with '', and never internet-wide.
+    $probesBefore = $state.healthProbes
+    $allowSummary = & $script @parameters -SkipPreview -OperatorMode -AllowedIpRanges ' 203.0.113.7, 198.51.100.0/24,203.0.113.7/32' | ConvertFrom-Json -AsHashtable
+    if ($values['APP_WEB_ALLOWED_IP_RANGES'] -ne '203.0.113.7/32,198.51.100.0/24') { throw 'The allow-list must be stored normalized and without duplicates.' }
+    if ($allowSummary.webUrl -ne 'https://web.example.test' -or -not $allowSummary.healthy -or $allowSummary.allowedIpRanges -ne '203.0.113.7/32,198.51.100.0/24' -or
+        $allowSummary.portForward -ne 'kubectl port-forward --namespace cloudlens service/web 8080:8080' -or $state.healthProbes -ne $probesBefore + 1) {
+        throw 'An allow-listed operator deployment must serve and check its public URL, with port-forward as the fallback.'
+    }
+    & $script @parameters -SkipPreview -OperatorMode | Out-Null
+    if ($values['APP_WEB_ALLOWED_IP_RANGES'] -ne '203.0.113.7/32,198.51.100.0/24') { throw 'A run without -AllowedIpRanges must keep the stored allow-list.' }
+    $closedSummary = & $script @parameters -SkipPreview -OperatorMode -AllowedIpRanges '' | ConvertFrom-Json -AsHashtable
+    if ($values['APP_WEB_ALLOWED_IP_RANGES'] -ne '' -or $closedSummary.webUrl -or $closedSummary.allowedIpRanges) {
+        throw "-AllowedIpRanges '' must remove the allow-list and close the public URL again."
+    }
+    $state.azdCalls.Clear()
+    $refused = $null
+    try { & $script @parameters -SkipPreview -OperatorMode -AllowedIpRanges '0.0.0.0/0' | Out-Null } catch { $refused = $_.Exception.Message }
+    if ($refused -notmatch 'AllowedIpRanges' -or $state.azdCalls.Count) { throw "An internet-wide range must be refused before anything is deployed; got: $refused" }
+
     # Missing kubectl/kubelogin: the helper asks before installing them with az aks install-cli into the
     # tools directory, -InstallKubernetesTools installs without asking, and an unattended run that cannot
     # ask explains what to do instead of guessing. Tools the run had to put on PATH itself come with the
@@ -467,7 +532,8 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
 
     [ordered]@{ result = 'passed'; azdCalls = 'up,deploy'; roleAssignments = 6; rerunRedeploysOnce = $true
                 noHiddenPrompts = $true; azdQuestionsAskedInTerminal = $true; serviceTreeIdAskedAndRemembered = $true
-                kubernetesToolsOfferedAndInstalled = $true; kubernetesToolsPathExplained = $true } | ConvertTo-Json -Compress
+                kubernetesToolsOfferedAndInstalled = $true; kubernetesToolsPathExplained = $true
+                operatorModeSkipsSignInAndPublicUrl = $true; allowListOpensPublicUrl = $true } | ConvertTo-Json -Compress
 } finally {
     Remove-Variable -Name deployTestState -Scope Global -ErrorAction SilentlyContinue
     Remove-Item -Path Function:\kubectl, Function:\kubelogin -ErrorAction SilentlyContinue

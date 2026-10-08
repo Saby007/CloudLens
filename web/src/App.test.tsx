@@ -333,6 +333,8 @@ it('opens the signed-in workspace without a diagnostic panel or consent acquisit
   await act(async () => root.render(<App />));
   expect(container.querySelector('[data-testid="loaded-report"]')).not.toBeNull();
   expect(container.querySelector('.account-name')?.textContent).toBe('verified@example.com');
+  expect(button('Sign out')).toBeDefined();
+  expect(container.textContent).not.toContain('Operator mode');
   expect(container.querySelector('input[type="email"]')).toBeNull();
   expect(container.querySelector('[aria-label="Azure access"]')).toBeNull();
   expect(button('Check Azure access')).toBeUndefined();
@@ -343,4 +345,17 @@ it('opens the signed-in workspace without a diagnostic panel or consent acquisit
   expect(getLatestReport).toHaveBeenCalledOnce();
   expect(runCostAssessment).not.toHaveBeenCalled();
   expect(narrate).not.toHaveBeenCalled();
+});
+
+it('marks Dev operator mode instead of offering a Microsoft sign-out', async () => {
+  vi.mocked(initializeApiIdentity).mockResolvedValue({ userId: 'operator:66666666-6666-6666-6666-666666666666', userDetails: 'operator@example.test',
+    tenantId: 'tenant-1', features: { aiNarration: false }, operatorMode: true });
+  vi.mocked(getLatestReport).mockResolvedValue(snapshot);
+  await act(async () => root.render(<App />));
+  expect(container.querySelector('[data-testid="loaded-report"]')).not.toBeNull();
+  expect(container.querySelector('.account-name')?.textContent).toBe('operator@example.test');
+  expect(container.textContent).toContain('Operator mode');
+  expect(button('Sign out')).toBeUndefined();
+  expect(redirectApiIdentity).not.toHaveBeenCalled();
+  expect(signOutApiIdentity).not.toHaveBeenCalled();
 });

@@ -22,8 +22,8 @@ resource "azurerm_network_security_group" "aks_nodes" {
 
   # The default rules already allow traffic within the VNet, load balancer health probes and all outbound traffic.
   security_rule {
-    name                       = "AllowWebToIngress"
-    description                = "HTTPS for users and HTTP for Let's Encrypt's HTTP-01 challenge, to the ingress IP only."
+    name                       = "AllowHttpToIngress"
+    description                = "HTTP for Let's Encrypt's HTTP-01 challenge and the redirect to HTTPS, to the ingress IP only."
     priority                   = 200
     direction                  = "Inbound"
     access                     = "Allow"
@@ -31,7 +31,27 @@ resource "azurerm_network_security_group" "aks_nodes" {
     source_address_prefix      = "Internet"
     source_port_range          = "*"
     destination_address_prefix = azurerm_public_ip.ingress.ip_address
-    destination_port_ranges    = ["80", "443"]
+    destination_port_range     = "80"
+  }
+
+  # HTTPS reaches the app. An allow-list (APP_WEB_ALLOWED_IP_RANGES) limits it to those addresses. Without one it is
+  # open to the internet, except in the Dev-only operator mode, which has no sign-in: there it stays closed and
+  # kubectl port-forward is the way in. scripts/allow-my-ip.ps1 updates this rule's sources in place.
+  dynamic "security_rule" {
+    for_each = length(local.web_allowed_ip_ranges) > 0 || var.auth_mode != "operator" ? [1] : []
+    content {
+      name                       = "AllowHttpsToIngress"
+      description                = "HTTPS for users, to the ingress IP only."
+      priority                   = 210
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "Tcp"
+      source_address_prefix      = length(local.web_allowed_ip_ranges) > 0 ? null : "Internet"
+      source_address_prefixes    = length(local.web_allowed_ip_ranges) > 0 ? local.web_allowed_ip_ranges : null
+      source_port_range          = "*"
+      destination_address_prefix = azurerm_public_ip.ingress.ip_address
+      destination_port_range     = "443"
+    }
   }
 }
 

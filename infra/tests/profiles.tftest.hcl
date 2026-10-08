@@ -221,14 +221,13 @@ run "core_profile_provisions_only_the_hardened_foundation" {
   assert {
     condition = (
       startswith(azurerm_network_security_group.aks_nodes.name, "nsg-aks-nodes-") &&
-      length(azurerm_network_security_group.aks_nodes.security_rule) == 1 &&
-      one(azurerm_network_security_group.aks_nodes.security_rule).name == "AllowWebToIngress" &&
-      one(azurerm_network_security_group.aks_nodes.security_rule).direction == "Inbound" &&
-      one(azurerm_network_security_group.aks_nodes.security_rule).access == "Allow" &&
-      one(azurerm_network_security_group.aks_nodes.security_rule).protocol == "Tcp" &&
-      one(azurerm_network_security_group.aks_nodes.security_rule).source_address_prefix == "Internet" &&
-      one(azurerm_network_security_group.aks_nodes.security_rule).destination_address_prefix == azurerm_public_ip.ingress.ip_address &&
-      toset(one(azurerm_network_security_group.aks_nodes.security_rule).destination_port_ranges) == toset(["80", "443"])
+      length(azurerm_network_security_group.aks_nodes.security_rule) == 2 &&
+      alltrue([for rule in azurerm_network_security_group.aks_nodes.security_rule : (
+        rule.direction == "Inbound" && rule.access == "Allow" && rule.protocol == "Tcp" &&
+        rule.source_address_prefix == "Internet" && rule.destination_address_prefix == azurerm_public_ip.ingress.ip_address
+      )]) &&
+      toset([for rule in azurerm_network_security_group.aks_nodes.security_rule : "${rule.name}:${rule.destination_port_range}"]) == toset(["AllowHttpToIngress:80", "AllowHttpsToIngress:443"]) &&
+      output.APP_WEB_INGRESS_RESTRICTED == "false" && output.APP_INGRESS_NSG_NAME == azurerm_network_security_group.aks_nodes.name
     )
     error_message = "The node subnet's NSG must let the internet reach only the ingress IP, on HTTP and HTTPS."
   }
@@ -583,6 +582,65 @@ run "invalid_settings_are_rejected_before_any_change" {
     var.aks_outbound_ports_per_node,
     var.aks_outbound_idle_timeout_minutes,
   ]
+}
+
+run "operator_mode_without_an_allow_list_closes_https_to_the_internet" {
+  command = apply
+
+  variables {
+    auth_mode = "operator"
+  }
+
+  assert {
+    condition = (
+      length(azurerm_network_security_group.aks_nodes.security_rule) == 1 &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).name == "AllowHttpToIngress" &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).destination_port_range == "80" &&
+      output.APP_WEB_INGRESS_RESTRICTED == "false"
+    )
+    error_message = "Operator mode has no sign-in, so without an allow-list HTTPS must stay closed; HTTP remains for Let's Encrypt."
+  }
+}
+
+run "an_allow_list_limits_https_to_exactly_the_listed_ranges" {
+  command = apply
+
+  variables {
+    auth_mode             = "operator"
+    web_allowed_ip_ranges = "203.0.113.7, 198.51.100.0/24"
+  }
+
+  assert {
+    condition = (
+      length(azurerm_network_security_group.aks_nodes.security_rule) == 2 &&
+      toset(one([for rule in azurerm_network_security_group.aks_nodes.security_rule : rule if rule.name == "AllowHttpsToIngress"]).source_address_prefixes) == toset(["203.0.113.7", "198.51.100.0/24"]) &&
+      one([for rule in azurerm_network_security_group.aks_nodes.security_rule : rule if rule.name == "AllowHttpsToIngress"]).destination_port_range == "443" &&
+      one([for rule in azurerm_network_security_group.aks_nodes.security_rule : rule if rule.name == "AllowHttpToIngress"]).source_address_prefix == "Internet" &&
+      output.APP_WEB_INGRESS_RESTRICTED == "true"
+    )
+    error_message = "An allow-list must limit HTTPS to exactly the listed ranges and report the ingress as restricted."
+  }
+}
+
+run "allow_lists_and_auth_modes_must_be_exact" {
+  command = plan
+
+  variables {
+    auth_mode             = "Operator"
+    web_allowed_ip_ranges = "203.0.113.7, 0.0.0.0/0"
+  }
+
+  expect_failures = [var.auth_mode, var.web_allowed_ip_ranges]
+}
+
+run "allow_list_ranges_must_start_at_their_network_address" {
+  command = plan
+
+  variables {
+    web_allowed_ip_ranges = "198.51.100.7/24"
+  }
+
+  expect_failures = [var.web_allowed_ip_ranges]
 }
 
 run "outbound_ports_must_cover_every_node_including_upgrade_surge" {

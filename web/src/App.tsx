@@ -570,12 +570,16 @@ export default function App() {
           </button>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
           <span className="account-name">{verifiedIdentity?.userDetails ?? principal.userDetails}</span>
-          <button type="button" className="ghost-button" onClick={() => {
-            window.dispatchEvent(new Event(IDENTITY_REQUIRED_EVENT));
-            void signOutApiIdentity().catch(() => setAuthError('Sign-out failed. Please retry the connection.'));
-          }}>
-            Sign out
-          </button>
+          {principal.operatorMode ? (
+            <span className="pill" title="Dev operator mode: Entra sign-in is off and every request acts as this account. Reach the app only through kubectl port-forward.">Operator mode</span>
+          ) : (
+            <button type="button" className="ghost-button" onClick={() => {
+              window.dispatchEvent(new Event(IDENTITY_REQUIRED_EVENT));
+              void signOutApiIdentity().catch(() => setAuthError('Sign-out failed. Please retry the connection.'));
+            }}>
+              Sign out
+            </button>
+          )}
         </span>
       </header>
       {(!verifiedIdentity || identityError) && (

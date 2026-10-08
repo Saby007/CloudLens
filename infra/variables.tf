@@ -215,6 +215,32 @@ variable "aks_api_authorized_ip_ranges" {
   default     = ""
 }
 
+variable "auth_mode" {
+  description = "MEGHKOSHA_AUTH_MODE: entra (default) or operator, the Dev-only mode without sign-in, in which HTTPS is never open to the whole internet."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "entra", "operator"], var.auth_mode)
+    error_message = "auth_mode (MEGHKOSHA_AUTH_MODE) must be entra or operator, lowercase."
+  }
+}
+
+variable "web_allowed_ip_ranges" {
+  description = "Optional comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) that may reach the app over HTTPS. Empty allows the internet, except in operator mode, where HTTPS then stays closed."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = alltrue([
+      for range in compact([for item in split(",", var.web_allowed_ip_ranges) : trimspace(item)]) :
+      can(regex("^[0-9]{1,3}(\\.[0-9]{1,3}){3}(/([89]|[12][0-9]|3[0-2]))?$", range)) &&
+      try(cidrhost(strcontains(range, "/") ? range : "${range}/32", 0) == split("/", range)[0], false)
+    ])
+    error_message = "web_allowed_ip_ranges must list IPv4 addresses or CIDR ranges from /8 to /32 written with their network address, for example 203.0.113.7 or 198.51.100.0/24."
+  }
+}
+
 variable "aks_outbound_ip_count" {
   description = "Managed outbound public IPs. Each adds 64,000 SNAT ports for the nodes to share, so more IPs allow more nodes."
   type        = number

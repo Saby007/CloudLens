@@ -3,8 +3,10 @@ import { BrowserCacheLocation, InteractionRequiredAuthError, PublicClientApplica
 export const IDENTITY_REQUIRED_EVENT = 'mkai-identity-required';
 type IdentityConfiguration = { tenantId: string; apiClientId: string; webClientId: string; scope: string };
 type IdentityClient = { client: PublicClientApplication; configuration: IdentityConfiguration };
-export type VerifiedIdentity = { userId: string; userDetails: string; tenantId: string; features?: { aiNarration: boolean } };
-let clientPromise: Promise<IdentityClient> | null = null;
+// Dev-only operator mode: the API acts as one configured operator, so the browser signs nobody in.
+type OperatorSession = { operatorMode: true; tenantId: string };
+export type VerifiedIdentity = { userId: string; userDetails: string; tenantId: string; features?: { aiNarration: boolean }; operatorMode?: boolean };
+let clientPromise: Promise<IdentityClient | OperatorSession> | null = null;
 let profileInitialization: { hint: string; promise: Promise<VerifiedIdentity> } | null = null;
 let pendingChallenge: { accountId: string; claims?: string } | null = null;
 
@@ -15,14 +17,20 @@ export class ApiIdentityRequiredError extends Error {
   }
 }
 
-async function identityClient(): Promise<IdentityClient> {
+async function identitySession(): Promise<IdentityClient | OperatorSession> {
   if (!clientPromise) {
     clientPromise = (async () => {
       const response = await fetch('/api/auth/config', { credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(5000) });
       if (!response.ok) throw new Error('API identity configuration is unavailable. Contact the operator.');
-      const configuration: IdentityConfiguration = await response.json();
+      const configuration: IdentityConfiguration & { mode?: unknown } = await response.json();
       const uuid = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
-      if (![configuration.tenantId, configuration.apiClientId, configuration.webClientId].every((value) => typeof value === 'string' && uuid.test(value) && value !== '00000000-0000-0000-0000-000000000000')
+      const configuredId = (value: unknown) => typeof value === 'string' && uuid.test(value) && value !== '00000000-0000-0000-0000-000000000000';
+      if (configuration.mode === 'operator') {
+        if (!configuredId(configuration.tenantId)) throw new Error('API identity configuration is invalid. Contact the operator.');
+        const operator: OperatorSession = { operatorMode: true, tenantId: configuration.tenantId };
+        return operator;
+      }
+      if (![configuration.tenantId, configuration.apiClientId, configuration.webClientId].every(configuredId)
         || configuration.scope !== `api://${configuration.apiClientId}/access_as_user`) {
         throw new Error('API identity configuration is invalid. Contact the operator.');
       }
@@ -42,6 +50,10 @@ async function identityClient(): Promise<IdentityClient> {
     })().catch((error) => { clientPromise = null; throw error; });
   }
   return clientPromise;
+}
+
+function isOperatorSession(session: IdentityClient | OperatorSession): session is OperatorSession {
+  return 'operatorMode' in session;
 }
 
 function chooseAccount(client: PublicClientApplication, configuration: IdentityConfiguration): AccountInfo | null {
@@ -82,13 +94,22 @@ function interactiveClaims(client: PublicClientApplication, configuration: Ident
     ? { claims: pendingChallenge.claims } : {};
 }
 
+function operatorFetch(path: string, init?: RequestInit): Promise<Response> {
+  // Operator mode has no token to attach, and no identity header a caller set may reach the API.
+  const headers = new Headers(init?.headers);
+  for (const name of ['authorization', 'x-meghkosha-user-token', 'x-ms-client-principal']) headers.delete(name);
+  return fetch(path, { ...init, headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
+}
+
 export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const target = new URL(path, window.location.origin);
   if (target.origin !== window.location.origin || !target.pathname.startsWith('/api/') || target.username || target.password) {
     throw new Error('Identity tokens can only be sent to this application API.');
   }
   if (init?.signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
-  const { client, configuration } = await identityClient();
+  const session = await identitySession();
+  if (isOperatorSession(session)) return operatorFetch(path, init);
+  const { client, configuration } = session;
   const account = chooseAccount(client, configuration);
   if (!account) return identityRequired();
   let token: string;
@@ -127,14 +148,17 @@ async function verifiedProfile(): Promise<VerifiedIdentity> {
   if (response.status === 401) return identityRequired();
   if (!response.ok) throw new Error('Your identity could not be verified by the API. Reconnect or contact the operator.');
   const profile: VerifiedIdentity = await response.json();
-  const { configuration } = await identityClient();
+  const session = await identitySession();
+  const tenantId = isOperatorSession(session) ? session.tenantId : session.configuration.tenantId;
   if (typeof profile.userId !== 'string' || !profile.userId || typeof profile.userDetails !== 'string' || !profile.userDetails
-    || typeof profile.tenantId !== 'string' || profile.tenantId.toLowerCase() !== configuration.tenantId.toLowerCase()) throw new Error('The API returned an invalid identity profile.');
-  return profile;
+    || typeof profile.tenantId !== 'string' || profile.tenantId.toLowerCase() !== tenantId.toLowerCase()) throw new Error('The API returned an invalid identity profile.');
+  return isOperatorSession(session) ? { ...profile, operatorMode: true } : profile;
 }
 
 async function resolveApiIdentity(loginHint: string): Promise<VerifiedIdentity> {
-  const { client, configuration } = await identityClient();
+  const session = await identitySession();
+  if (isOperatorSession(session)) return verifiedProfile();
+  const { client, configuration } = session;
   let account = chooseAccount(client, configuration);
   if (!account) {
     if (!loginHint.trim()) throw new ApiIdentityRequiredError();
@@ -159,7 +183,9 @@ export function initializeApiIdentity(loginHint: string): Promise<VerifiedIdenti
 }
 
 export async function connectApiIdentity(loginHint: string): Promise<VerifiedIdentity> {
-  const { client, configuration } = await identityClient();
+  const session = await identitySession();
+  if (isOperatorSession(session)) return verifiedProfile();
+  const { client, configuration } = session;
   const result = await client.loginPopup({ scopes: [configuration.scope], loginHint, prompt: 'select_account',
     ...interactiveClaims(client, configuration) });
   client.setActiveAccount(checkedAccount(result.account, configuration));
@@ -167,20 +193,33 @@ export async function connectApiIdentity(loginHint: string): Promise<VerifiedIde
 }
 
 export async function redirectApiIdentity(loginHint: string): Promise<void> {
-  const { client, configuration } = await identityClient();
+  const session = await identitySession();
+  // Nothing to sign in to: reloading reads the operator identity from the API again.
+  if (isOperatorSession(session)) {
+    window.location.replace('/');
+    return;
+  }
+  const { client, configuration } = session;
   await client.loginRedirect({ scopes: [configuration.scope], loginHint: loginHint || undefined, prompt: 'select_account',
     ...interactiveClaims(client, configuration) });
 }
 
 export async function completeIdentityRedirect(): Promise<void> {
-  const { client, configuration } = await identityClient();
-  const result = await client.handleRedirectPromise();
-  client.setActiveAccount(checkedAccount(result?.account ?? null, configuration));
+  const session = await identitySession();
+  if (!isOperatorSession(session)) {
+    const result = await session.client.handleRedirectPromise();
+    session.client.setActiveAccount(checkedAccount(result?.account ?? null, session.configuration));
+  }
   window.location.replace('/');
 }
 
 export async function signOutApiIdentity(): Promise<void> {
-  const { client, configuration } = await identityClient();
+  const session = await identitySession();
+  if (isOperatorSession(session)) {
+    profileInitialization = null;
+    return;
+  }
+  const { client, configuration } = session;
   const account = chooseAccount(client, configuration);
   pendingChallenge = null;
   profileInitialization = null;
