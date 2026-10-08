@@ -1,6 +1,13 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# The helper behaves differently in Azure Cloud Shell; clear its markers so results never depend on where tests run.
+$cloudShellMarkers = @{}
+foreach ($name in 'ACC_CLOUD', 'AZUREPS_HOST_ENVIRONMENT') {
+    $cloudShellMarkers[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
+
 $tenantId = '11111111-1111-1111-1111-111111111111'
 $subscriptionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 $targetOne = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
@@ -445,6 +452,22 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     }
     & $script @parameters -SkipPreview -OperatorMode | Out-Null
     if ($values['APP_WEB_ALLOWED_IP_RANGES'] -ne '203.0.113.7/32,198.51.100.0/24') { throw 'A run without -AllowedIpRanges must keep the stored allow-list.' }
+
+    # In Cloud Shell, whose own address is not one to allow-list, an allow-listed URL is not probed (that could only
+    # time out), and the run warns up front about Cloud Shell's session limits.
+    [Environment]::SetEnvironmentVariable('ACC_CLOUD', 'AzureCloud', 'Process')
+    try {
+        $probesBefore = $state.healthProbes
+        $cloudShellOutput = @(& $script @parameters -SkipPreview -OperatorMode 3>&1)
+    } finally {
+        [Environment]::SetEnvironmentVariable('ACC_CLOUD', $null, 'Process')
+    }
+    $cloudShellWarnings = @($cloudShellOutput | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+    $cloudShellSummary = (@($cloudShellOutput | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] }) -join "`n") | ConvertFrom-Json -AsHashtable
+    if ($state.healthProbes -ne $probesBefore -or $cloudShellSummary.healthy -or $cloudShellSummary.webUrl -ne 'https://web.example.test' -or
+        -not @($cloudShellWarnings | Where-Object { "$_" -match '20 minutes' -and "$_" -match 'ephemeral' }).Count) {
+        throw 'In Cloud Shell the helper must warn about the session limits and must not probe an allow-listed URL.'
+    }
     $closedSummary = & $script @parameters -SkipPreview -OperatorMode -AllowedIpRanges '' | ConvertFrom-Json -AsHashtable
     if ($values['APP_WEB_ALLOWED_IP_RANGES'] -ne '' -or $closedSummary.webUrl -or $closedSummary.allowedIpRanges) {
         throw "-AllowedIpRanges '' must remove the allow-list and close the public URL again."
@@ -533,8 +556,10 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     [ordered]@{ result = 'passed'; azdCalls = 'up,deploy'; roleAssignments = 6; rerunRedeploysOnce = $true
                 noHiddenPrompts = $true; azdQuestionsAskedInTerminal = $true; serviceTreeIdAskedAndRemembered = $true
                 kubernetesToolsOfferedAndInstalled = $true; kubernetesToolsPathExplained = $true
-                operatorModeSkipsSignInAndPublicUrl = $true; allowListOpensPublicUrl = $true } | ConvertTo-Json -Compress
+                operatorModeSkipsSignInAndPublicUrl = $true; allowListOpensPublicUrl = $true
+                cloudShellSkipsBlockedHealthCheck = $true } | ConvertTo-Json -Compress
 } finally {
+    foreach ($name in $cloudShellMarkers.Keys) { [Environment]::SetEnvironmentVariable($name, $cloudShellMarkers[$name], 'Process') }
     Remove-Variable -Name deployTestState -Scope Global -ErrorAction SilentlyContinue
     Remove-Item -Path Function:\kubectl, Function:\kubelogin -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $repoRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -171,6 +171,8 @@ if ($PSBoundParameters.ContainsKey('AllowedIpRanges')) { $settings.APP_WEB_ALLOW
 # always runs with --no-prompt. These are the errors it reports when it needed an answer instead; the
 # command is then rerun attached to the terminal so the question can be answered there.
 $azdNeedsInput = 'prompting (for|to) |interactive mode required|missing required inputs|no default response'
+# Azure Cloud Shell sets ACC_CLOUD in every shell, and AZUREPS_HOST_ENVIRONMENT in PowerShell.
+$inCloudShell = [bool]$env:ACC_CLOUD -or "$env:AZUREPS_HOST_ENVIRONMENT" -like 'cloud-shell*'
 
 $subscriptionIds = @(
     $TargetSubscriptionId |
@@ -481,6 +483,9 @@ if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
     throw "'terraform' (1.11 or later) is required: azd provisions this app with Terraform. Install it (for example 'winget install Hashicorp.Terraform'), then rerun."
 }
 Write-Host 'git, azd, az and terraform are available.'
+if ($inCloudShell) {
+    Write-Warning 'Azure Cloud Shell ends a session after 20 minutes without keyboard input, and a first deployment takes 30-45 minutes: interact with this tab now and then, and if the session ends, rerun this command. azd keeps the Terraform state under your home directory, so use a Cloud Shell session with storage, not an ephemeral one.'
+}
 
 $repoRoot = $RepoDirectory
 if (-not $repoRoot) {
@@ -778,6 +783,9 @@ try {
     $healthy = $false
     if (-not $publicUrlOpen) {
         Write-Host 'Operator mode without an IP allow-list closes the public URL, so the HTTPS health check is skipped.' -ForegroundColor Yellow
+    } elseif ($restricted -and $inCloudShell) {
+        # Cloud Shell's address is not one to allow-list (other people's sessions share it), so the check could only time out.
+        Write-Host "Cloud Shell's address is not on the IP allow-list, so the public URL is not checked from here. Open it from an allowed address." -ForegroundColor Yellow
     } elseif ($url) {
         $healthy = Wait-AppHealthy $url
         if (-not $healthy -and $restricted) {

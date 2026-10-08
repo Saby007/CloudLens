@@ -1,6 +1,13 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# The script behaves differently in Azure Cloud Shell; clear its markers so results never depend on where tests run.
+$cloudShellMarkers = @{}
+foreach ($name in 'ACC_CLOUD', 'AZUREPS_HOST_ENVIRONMENT') {
+    $cloudShellMarkers[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
+
 # Offline harness for scripts/allow-my-ip.ps1: azd, az and the public-address lookup are stubbed.
 $global:allowTestState = @{
     environments = @{
@@ -168,6 +175,25 @@ try {
     }
     $state.routeFailure = $false
 
+    # Cloud Shell runs in Azure, so a lookup there would return its own, shared address: looking up is refused before
+    # anything else happens, and an explicit address still works.
+    foreach ($marker in @(@('ACC_CLOUD', 'AzureCloud'), @('AZUREPS_HOST_ENVIRONMENT', 'cloud-shell/1.0'))) {
+        [Environment]::SetEnvironmentVariable($marker[0], $marker[1], 'Process')
+        try {
+            $probesBefore = $state.routeProbes.Count
+            $refused = $null
+            try { & $script -EnvironmentName 'app-test' | Out-Null } catch { $refused = $_.Exception.Message }
+            if ($refused -notmatch 'Cloud Shell' -or $refused -notmatch '-IpAddress' -or $refused -notmatch 'Nothing was changed' -or
+                $state.lookups -ne 2 -or $state.routeProbes.Count -ne $probesBefore -or $state.ruleUpdates.Count) {
+                throw "With $($marker[0]) set, the lookup must be refused before anything else; got: $refused"
+            }
+            $explicit = & $script -EnvironmentName 'app-test' -IpAddress '192.0.2.1' -PlanOnly | ConvertFrom-Json
+            if ($explicit.allowedIpRanges -ne '192.0.2.1/32') { throw 'An explicit -IpAddress must still work in Cloud Shell.' }
+        } finally {
+            [Environment]::SetEnvironmentVariable($marker[0], $null, 'Process')
+        }
+    }
+
     # Without an allow-list there is no rule to update: the helper points at the deploy script instead.
     $refused = $null
     try { & $script -EnvironmentName 'open-test' | Out-Null } catch { $refused = $_.Exception.Message }
@@ -177,8 +203,10 @@ try {
     if ($state.otherAzd.Count) { throw "The helper must never redeploy: $($state.otherAzd -join '; ')" }
 
     [ordered]@{ result = 'passed'; detectsAddress = $true; keepsOthersWithAdd = $true; refusesBroadRanges = $true
-                savesOnlyAfterRuleUpdate = $true; noRedeploy = $true; detectsVpnSplitTunnel = $true } | ConvertTo-Json -Compress
+                savesOnlyAfterRuleUpdate = $true; noRedeploy = $true; detectsVpnSplitTunnel = $true
+                refusesCloudShellLookup = $true } | ConvertTo-Json -Compress
 } finally {
     Remove-Variable -Name allowTestState -Scope Global -ErrorAction SilentlyContinue
     Remove-Item -Path Alias:\Resolve-SourceAddress -ErrorAction SilentlyContinue
+    foreach ($name in $cloudShellMarkers.Keys) { [Environment]::SetEnvironmentVariable($name, $cloudShellMarkers[$name], 'Process') }
 }

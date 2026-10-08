@@ -12,6 +12,8 @@
     the one the app sees if your traffic to the app takes the same network path as the lookup. A VPN that carries
     only some destinations - Microsoft's carries Azure's address ranges - sends your traffic to the app through the
     VPN instead, so the app sees the VPN's exit address. The script checks this first and stops without changes.
+    In Azure Cloud Shell, which runs in Azure, it does not look the address up at all: pass your computer's
+    address with -IpAddress.
 
 .PARAMETER EnvironmentName
     The azd environment whose allow-list to update.
@@ -105,6 +107,11 @@ try {
     }
 
     if (-not $IpAddress) {
+        # Cloud Shell sets ACC_CLOUD in every shell. It runs in Azure, so a lookup there would return Cloud Shell's own
+        # address, which other people's sessions share.
+        if ($env:ACC_CLOUD -or "$env:AZUREPS_HOST_ENVIRONMENT" -like 'cloud-shell*') {
+            throw "This is Azure Cloud Shell, which runs in Azure: looking your address up here would return Cloud Shell's own address, shared with other people's sessions, not your computer's. Nothing was changed. Open https://api.ipify.org in your computer's browser (with any VPN off) and pass that address with -IpAddress."
+        }
         # The lookup site sees whichever network carries traffic to it, which is not always the one carrying traffic to the app.
         $appHost = Get-AzdValue 'APP_INGRESS_PUBLIC_IP'
         if (-not $appHost) { $appHost = (Get-AzdValue 'APP_WEB_ORIGIN') -replace '^https://', '' }

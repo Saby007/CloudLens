@@ -363,13 +363,14 @@ def test_end_to_end_helper_deploys_once_retries_and_never_hides_a_question():
     assert summary["serviceTreeIdAskedAndRemembered"] and summary["kubernetesToolsOfferedAndInstalled"]
     assert summary["kubernetesToolsPathExplained"]
     assert summary["operatorModeSkipsSignInAndPublicUrl"] and summary["allowListOpensPublicUrl"]
+    assert summary["cloudShellSkipsBlockedHealthCheck"]
 
 
 def test_allow_my_ip_keeps_the_allow_list_current_without_a_redeploy():
     summary = run_powershell_harness("test-allow-my-ip.ps1")
     assert summary == {"result": "passed", "detectsAddress": True, "keepsOthersWithAdd": True,
                        "refusesBroadRanges": True, "savesOnlyAfterRuleUpdate": True, "noRedeploy": True,
-                       "detectsVpnSplitTunnel": True}
+                       "detectsVpnSplitTunnel": True, "refusesCloudShellLookup": True}
 
 
 def test_aks_bootstrap_hook_waits_for_rbac_and_installs_only_the_pinned_cert_manager():
