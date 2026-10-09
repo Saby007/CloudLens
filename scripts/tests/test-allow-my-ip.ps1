@@ -26,6 +26,14 @@ $global:allowTestState = @{
             APP_INGRESS_NSG_NAME = 'nsg-aks-nodes-fedcba9876543'
             APP_WEB_INGRESS_RESTRICTED = 'false'
         }
+        'private-test' = [ordered]@{
+            AZURE_RESOURCE_GROUP = 'rg-private-test'
+            AZURE_SUBSCRIPTION_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            APP_INGRESS_NSG_NAME = 'nsg-aks-nodes-0000000000000'
+            APP_INGRESS_VISIBILITY = 'private'
+            APP_INGRESS_PRIVATE_IP = '10.42.1.36'
+            APP_WEB_INGRESS_RESTRICTED = 'true'
+        }
     }
     ruleUpdates = [System.Collections.Generic.List[string]]::new()
     otherAzd = [System.Collections.Generic.List[string]]::new()
@@ -201,6 +209,16 @@ try {
         throw "An environment without an allow-list must be refused without changes; got: $refused"
     }
     if ($state.otherAzd.Count) { throw "The helper must never redeploy: $($state.otherAzd -join '; ')" }
+
+    # A private ingress has no public address, hence no allow-list: refused with a pointer, before anything is looked up or changed.
+    $lookupsBefore = $state.lookups
+    $probesBefore = $state.routeProbes.Count
+    $refused = $null
+    try { & $script -EnvironmentName 'private-test' -IpAddress '192.0.2.1' | Out-Null } catch { $refused = $_.Exception.Message }
+    if ($refused -notmatch 'private ingress' -or $refused -notmatch 'no public address' -or $refused -notmatch '-IngressVisibility public' -or
+        $state.lookups -ne $lookupsBefore -or $state.routeProbes.Count -ne $probesBefore -or $state.ruleUpdates.Count) {
+        throw "A private environment must be refused without any lookup or change; got: $refused"
+    }
 
     [ordered]@{ result = 'passed'; detectsAddress = $true; keepsOthersWithAdd = $true; refusesBroadRanges = $true
                 savesOnlyAfterRuleUpdate = $true; noRedeploy = $true; detectsVpnSplitTunnel = $true

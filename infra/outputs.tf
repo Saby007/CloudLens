@@ -74,41 +74,78 @@ output "MEGHKOSHA_OBO_MANAGED_IDENTITY_PRINCIPAL_ID" {
 }
 
 output "APP_INGRESS_HOST" {
-  value = var.custom_domain != "" ? lower(var.custom_domain) : azurerm_public_ip.ingress.fqdn
+  value = local.ingress_host
 }
 
 output "APP_WEB_ORIGIN" {
-  value = "https://${var.custom_domain != "" ? lower(var.custom_domain) : azurerm_public_ip.ingress.fqdn}"
+  value = "https://${local.ingress_host}"
 }
 
+# Empty for a private ingress, which has no Azure-provided public name.
 output "APP_INGRESS_AZURE_FQDN" {
-  value = azurerm_public_ip.ingress.fqdn
+  value = local.public_ingress ? one(azurerm_public_ip.ingress[*].fqdn) : ""
 }
 
 output "APP_INGRESS_CLASS" {
   value = local.ingress_class
 }
 
+output "APP_INGRESS_VISIBILITY" {
+  value = var.ingress_visibility
+}
+
 output "APP_INGRESS_PUBLIC_IP" {
-  value = azurerm_public_ip.ingress.ip_address
+  value = local.public_ingress ? one(azurerm_public_ip.ingress[*].ip_address) : ""
 }
 
 output "APP_INGRESS_PUBLIC_IP_NAME" {
-  value = azurerm_public_ip.ingress.name
+  value = local.public_ingress ? one(azurerm_public_ip.ingress[*].name) : ""
+}
+
+# Private ingress: where the host name must point. A private DNS zone for it exists in this network; anything
+# else that reaches the app (peered or connected networks, on-premises DNS) needs its own record.
+output "APP_INGRESS_PRIVATE_IP" {
+  value = local.ingress_private_ip
+}
+
+output "APP_INGRESS_SUBNET_NAME" {
+  value = local.private_ingress ? azurerm_subnet.ingress[0].name : ""
+}
+
+# The Private Link Service that AKS creates for the internal load balancer once the ingress controller is bound to
+# it (infra/k8s/cluster-bootstrap.yaml), in the cluster's node resource group. A private endpoint connects to this ID.
+output "APP_PRIVATE_LINK_NAME" {
+  value = local.private_link_service_enabled ? local.private_link_name : ""
+}
+
+output "APP_PRIVATE_LINK_ID" {
+  value = local.private_link_service_enabled ? "/subscriptions/${data.azurerm_client_config.current.subscription_id}/resourceGroups/${azurerm_kubernetes_cluster.main.node_resource_group}/providers/Microsoft.Network/privateLinkServices/${local.private_link_name}" : ""
+}
+
+output "APP_PRIVATE_LINK_SUBNET_NAME" {
+  value = local.private_link_service_enabled ? azurerm_subnet.private_link[0].name : ""
+}
+
+# Space separated, as the Private Link Service annotations want them: the subscriptions that may see it and whose
+# private endpoints connect without manual approval.
+output "APP_PRIVATE_LINK_SUBSCRIPTIONS" {
+  value = local.private_link_service_enabled ? join(" ", local.private_link_subscriptions) : ""
 }
 
 output "APP_INGRESS_NSG_NAME" {
   value = azurerm_network_security_group.aks_nodes.name
 }
 
-# "true" once HTTPS is limited to APP_WEB_ALLOWED_IP_RANGES. Operator mode opens the public URL only then: the value
-# reaches the manifests after Terraform has applied the rule, so a plain azd deploy cannot open it early.
+# "true" once the internet cannot reach the app unchecked: the ingress is private, or HTTPS is limited to
+# APP_WEB_ALLOWED_IP_RANGES. Operator mode (no sign-in) lets the API serve requests that came through the ingress only
+# then; the value reaches the manifests after Terraform has applied the network change, so a plain azd deploy
+# cannot open the app early.
 output "APP_WEB_INGRESS_RESTRICTED" {
-  value = tostring(length(local.web_allowed_ip_ranges) > 0)
+  value = tostring(local.private_ingress || length(local.web_allowed_ip_ranges) > 0)
 }
 
 output "APP_TLS_CLUSTER_ISSUER" {
-  value = var.tls_cluster_issuer
+  value = local.tls_issuer
 }
 
 output "APP_PROCESSOR_DEPLOYED" {
@@ -178,6 +215,8 @@ output "APP_DEPLOYMENT_STATE" {
     chatRuntimeEnabled            = local.chat_enabled
     nativeExportIngressException  = local.data_enabled && var.allow_native_export_trusted_services
     apiServerAuthorizedRangesUsed = length(local.aks_api_authorized_ip_ranges) > 0
+    ingressVisibility             = var.ingress_visibility
+    privateLinkServiceEnabled     = local.private_link_service_enabled
     liveValidationRequired        = true
   }
 }

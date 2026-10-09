@@ -51,6 +51,7 @@ $global:deployTestState = @{
     processorPrincipalId = $processorPrincipalId
     operatorObjectId = '66666666-6666-6666-6666-666666666666'
     healthProbes = 0
+    webOrigin = ''
 }
 
 function Get-StubArgument {
@@ -177,10 +178,34 @@ function azd {
         $values['SERVICE_WEB_IMAGE_NAME'] = 'acrtest.azurecr.io/cost-assessment-app/web-app-test:azd-deploy-1'
         $values['AZURE_RESOURCE_GROUP'] = $state.resourceGroup
         $values['AZURE_AKS_CLUSTER_NAME'] = 'aks-0123456789abc'
-        $values['APP_WEB_ORIGIN'] = 'https://web.example.test'
-        # As Terraform reports it: restricted once the NSG limits HTTPS to the stored allow-list.
+        # As Terraform reports them. The visibility defaults to private, as the azd parameter file does, and Terraform
+        # refuses what only works in public: an allow-list, or Let's Encrypt.
+        $visibility = if ($values.Contains('APP_INGRESS_VISIBILITY') -and $values['APP_INGRESS_VISIBILITY']) { $values['APP_INGRESS_VISIBILITY'] } else { 'private' }
+        $values['APP_INGRESS_VISIBILITY'] = $visibility
+        $customDomain = if ($values.Contains('APP_CUSTOM_DOMAIN')) { $values['APP_CUSTOM_DOMAIN'] } else { '' }
+        $allowList = if ($values.Contains('APP_WEB_ALLOWED_IP_RANGES')) { $values['APP_WEB_ALLOWED_IP_RANGES'] } else { '' }
+        $issuer = if ($values.Contains('APP_TLS_CLUSTER_ISSUER') -and $values['APP_TLS_CLUSTER_ISSUER']) { $values['APP_TLS_CLUSTER_ISSUER'] } elseif ($visibility -eq 'private') { 'private-ca' } else { 'letsencrypt' }
+        if ($visibility -eq 'private' -and $allowList) { throw 'Terraform refuses an IP allow-list on a private ingress.' }
+        if ($visibility -eq 'private' -and $issuer -like 'letsencrypt*') { throw 'Terraform refuses Let''s Encrypt on a private ingress.' }
+        $values['APP_TLS_CLUSTER_ISSUER'] = $issuer
         $values['APP_INGRESS_NSG_NAME'] = 'nsg-aks-nodes-0123456789abc'
-        $values['APP_WEB_INGRESS_RESTRICTED'] = if ($values.Contains('APP_WEB_ALLOWED_IP_RANGES') -and $values['APP_WEB_ALLOWED_IP_RANGES']) { 'true' } else { 'false' }
+        if ($visibility -eq 'private') {
+            $appHost = if ($customDomain) { $customDomain } else { 'cloudlens-test.internal' }
+            $privateLinkOn = -not ($values.Contains('APP_PRIVATE_LINK_ENABLED') -and $values['APP_PRIVATE_LINK_ENABLED'] -eq 'false')
+            $values['APP_INGRESS_PUBLIC_IP'] = ''
+            $values['APP_INGRESS_PRIVATE_IP'] = '10.42.1.36'
+            $values['APP_PRIVATE_LINK_ID'] = if ($privateLinkOn) { "/subscriptions/$($state.subscriptionId)/resourceGroups/$($state.resourceGroup)-aks-nodes/providers/Microsoft.Network/privateLinkServices/pls-cloudlens-test" } else { '' }
+            $values['APP_WEB_INGRESS_RESTRICTED'] = 'true'
+        } else {
+            $appHost = if ($customDomain) { $customDomain } else { 'web.example.test' }
+            $values['APP_INGRESS_PUBLIC_IP'] = '192.0.2.10'
+            $values['APP_INGRESS_PRIVATE_IP'] = ''
+            $values['APP_PRIVATE_LINK_ID'] = ''
+            # Restricted once the NSG limits HTTPS to the stored allow-list.
+            $values['APP_WEB_INGRESS_RESTRICTED'] = if ($allowList) { 'true' } else { 'false' }
+        }
+        $values['APP_WEB_ORIGIN'] = "https://$appHost"
+        $state.webOrigin = $values['APP_WEB_ORIGIN']
         $values['APP_PROCESSOR_DEPLOYED'] = if ($values.Contains('APP_ENABLE_PROCESSOR') -and $values['APP_ENABLE_PROCESSOR'] -eq 'true') { 'true' } else { 'false' }
         $values['MEGHKOSHA_OBO_MANAGED_IDENTITY_RESOURCE_ID'] = "/subscriptions/$($state.subscriptionId)/resourceGroups/$($state.resourceGroup)/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-obo"
         $state.azdCalls.Add('up:succeeded')
@@ -278,7 +303,7 @@ param(
 )
 if (-not `$Apply) { throw 'The helper must apply the identity configuration.' }
 if (`$env:APP_ALLOW_AZURE_CHANGES -ne 'true') { throw 'The helper must set the explicit approval flag.' }
-if ("`$WebOrigin" -ne 'https://web.example.test/') { throw "The sign-in redirect must use the ingress origin, not `$WebOrigin." }
+if ("`$WebOrigin" -ne "`$(`$global:deployTestState.webOrigin)/") { throw "The sign-in redirect must use the ingress origin, not `$WebOrigin." }
 `$global:deployTestState.bootstrapCalls++
 if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementReference) {
     throw 'Microsoft Graph POST /v1.0/applications was refused because this tenant requires a Service Tree ID (serviceManagementReference) on new app registrations. Rerun with -ServiceManagementReference <id>.'
@@ -301,6 +326,8 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         SettleSeconds = 0
         MaxAttempts = 3
         KubernetesToolsDirectory = $toolsHome
+        # The scenarios below that predate the private ingress describe the internet-facing one.
+        IngressVisibility = 'public'
     }
 
     $plan = & $script @parameters -PlanOnly | ConvertFrom-Json -AsHashtable
@@ -468,6 +495,91 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         -not @($cloudShellWarnings | Where-Object { "$_" -match '20 minutes' -and "$_" -match 'ephemeral' }).Count) {
         throw 'In Cloud Shell the helper must warn about the session limits and must not probe an allow-listed URL.'
     }
+
+    # ---- The private ingress: the default for a new environment -------------------------------------------------
+    # No public address, so nothing is probed from here; the run reports the private address, the Private Link Service and
+    # the certificate, and the sign-in still registers the private host.
+    $privateParameters = $parameters.Clone()
+    $privateParameters.Remove('IngressVisibility')
+    $privateParameters.EnvironmentName = 'priv-test'
+    $probesBefore = $state.healthProbes
+    $bootstrapsBefore = $state.bootstrapCalls
+    $privateSummary = & $script @privateParameters -SkipPreview | ConvertFrom-Json -AsHashtable
+    $privateValues = $state.environments['priv-test']
+    if ($privateValues['APP_INGRESS_VISIBILITY'] -cne 'private') { throw 'A new environment must be private without being asked.' }
+    if ($privateSummary.ingressVisibility -ne 'private' -or $privateSummary.webUrl -ne 'https://cloudlens-test.internal' -or $privateSummary.privateIp -ne '10.42.1.36' -or
+        $privateSummary.privateLinkServiceId -notlike '*/providers/Microsoft.Network/privateLinkServices/pls-cloudlens-test' -or $privateSummary.tlsIssuer -ne 'private-ca' -or
+        $privateSummary.healthy -or $privateSummary.allowedIpRanges -or $privateSummary.portForward) {
+        throw "The private summary misreports the deployment: $($privateSummary | ConvertTo-Json -Compress)"
+    }
+    if ($state.healthProbes -ne $probesBefore) { throw 'A private ingress has no public address, so it must not be probed.' }
+    if ($state.bootstrapCalls -ne $bootstrapsBefore + 1) { throw 'Entra sign-in must still be configured, against the private host.' }
+    $state.azdCalls.Clear()
+    & $script @privateParameters -SkipPreview | Out-Null
+    if ($privateValues['APP_INGRESS_VISIBILITY'] -cne 'private' -or ($state.azdCalls -join ',') -ne 'up:succeeded') { throw 'A rerun must keep the stored visibility.' }
+
+    # A custom domain, no Private Link Service and another subscription: normalized and kept.
+    $domainSummary = & $script @privateParameters -SkipPreview -CustomDomain 'CloudLens.Contoso.com' -NoPrivateLink -PrivateLinkSubscriptionIds 'BBBBBBBB-bbbb-bbbb-bbbb-bbbbbbbbbbbb, bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' | ConvertFrom-Json -AsHashtable
+    if ($privateValues['APP_CUSTOM_DOMAIN'] -cne 'cloudlens.contoso.com' -or $privateValues['APP_PRIVATE_LINK_ENABLED'] -cne 'false' -or
+        $privateValues['APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS'] -cne 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb') {
+        throw 'The custom domain, the Private Link switch and the allowed subscriptions must be stored normalized.'
+    }
+    if ($domainSummary.webUrl -ne 'https://cloudlens.contoso.com' -or $domainSummary.privateLinkServiceId) { throw 'The summary must show the custom domain and no Private Link Service.' }
+    foreach ($bad in @(@{ CustomDomain = 'not a domain' }, @{ PrivateLinkSubscriptionIds = 'not-a-subscription' })) {
+        $refused = $null
+        $badParameters = $privateParameters + $bad
+        try { & $script @badParameters -PlanOnly | Out-Null } catch { $refused = $_.Exception.Message }
+        $name = @($bad.Keys)[0]
+        if ($refused -notmatch "-$name") { throw "-$name '$($bad[$name])' was not refused: $refused" }
+    }
+
+    # Private and public-only settings never combine: refused before anything is deployed.
+    $state.azdCalls.Clear()
+    foreach ($case in @(
+            @{ Arguments = @{ IngressVisibility = 'private'; AllowedIpRanges = '203.0.113.7' }; Pattern = 'public ingress' },
+            @{ Arguments = @{ IngressVisibility = 'private'; TlsClusterIssuer = 'letsencrypt' }; Pattern = 'public internet' },
+            @{ Arguments = @{ AllowedIpRanges = '203.0.113.7' }; Pattern = 'this environment is private' },
+            @{ Arguments = @{ TlsClusterIssuer = 'letsencrypt-staging' }; Pattern = 'public internet' })) {
+        $refused = $null
+        $combined = $privateParameters + $case.Arguments
+        try { & $script @combined -SkipPreview | Out-Null } catch { $refused = $_.Exception.Message }
+        if ($refused -notmatch $case.Pattern -or $state.azdCalls.Count) { throw "$(($case.Arguments.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ') must be refused before azd runs; got: $refused" }
+    }
+
+    # An environment that already has a public address is never switched silently.
+    $keptVisibility = $values['APP_INGRESS_VISIBILITY']
+    $values.Remove('APP_INGRESS_VISIBILITY')
+    $unspecified = $parameters.Clone()
+    $unspecified.Remove('IngressVisibility')
+    $refused = $null
+    try { & $script @unspecified -SkipPreview | Out-Null } catch { $refused = $_.Exception.Message }
+    if ($refused -notmatch 'already has a public address' -or $refused -notmatch '-IngressVisibility public' -or $refused -notmatch '-IngressVisibility private' -or $state.azdCalls.Count) {
+        throw "An existing public environment must be refused without a choice, before azd runs; got: $refused"
+    }
+    $values['APP_INGRESS_VISIBILITY'] = $keptVisibility
+
+    # Switching it on purpose: the old ingress's settings are reset, a warning explains, and the result is private.
+    $values['APP_WEB_ALLOWED_IP_RANGES'] = '203.0.113.7/32'
+    $values['APP_TLS_CLUSTER_ISSUER'] = 'letsencrypt'
+    $switchOutput = @(& $script @unspecified -SkipPreview -IngressVisibility private -OperatorMode 3>&1)
+    $switchWarnings = @($switchOutput | Where-Object { $_ -is [System.Management.Automation.WarningRecord] } | ForEach-Object { "$_" })
+    $switchSummary = (@($switchOutput | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] }) -join "`n") | ConvertFrom-Json -AsHashtable
+    if ($values['APP_INGRESS_VISIBILITY'] -cne 'private' -or $values['APP_WEB_ALLOWED_IP_RANGES'] -ne '' -or $values['APP_TLS_CLUSTER_ISSUER'] -ne 'private-ca') {
+        throw 'Switching to private must reset the allow-list and the certificate source of the public ingress.'
+    }
+    if (-not @($switchWarnings | Where-Object { $_ -match 'Switching' -and $_ -match 'public to a private' }).Count) { throw "Switching must warn; got: $($switchWarnings -join ' | ')" }
+    if ($switchSummary.ingressVisibility -ne 'private' -or $switchSummary.webUrl -ne 'https://web.example.test'.Replace('web.example.test', 'cloudlens-test.internal') -or
+        $switchSummary.portForward -ne 'kubectl port-forward --namespace cloudlens service/web 8080:8080' -or $switchSummary.healthy) {
+        throw "Private operator mode must report the private URL and keep port-forward: $($switchSummary | ConvertTo-Json -Compress)"
+    }
+
+    # ... and back to public, which resets the private CA, so Let's Encrypt is chosen again.
+    $backOutput = @(& $script @parameters -SkipPreview -SkipIdentityBootstrap 3>&1)
+    $backSummary = (@($backOutput | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] }) -join "`n") | ConvertFrom-Json -AsHashtable
+    if ($values['APP_INGRESS_VISIBILITY'] -cne 'public' -or $values['APP_TLS_CLUSTER_ISSUER'] -ne 'letsencrypt' -or $backSummary.ingressVisibility -ne 'public' -or
+        $backSummary.webUrl -ne 'https://web.example.test' -or $backSummary.privateIp) {
+        throw 'Switching back to public must pick Let''s Encrypt again and report the public URL.'
+    }
     $closedSummary = & $script @parameters -SkipPreview -OperatorMode -AllowedIpRanges '' | ConvertFrom-Json -AsHashtable
     if ($values['APP_WEB_ALLOWED_IP_RANGES'] -ne '' -or $closedSummary.webUrl -or $closedSummary.allowedIpRanges) {
         throw "-AllowedIpRanges '' must remove the allow-list and close the public URL again."
@@ -557,7 +669,8 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
                 noHiddenPrompts = $true; azdQuestionsAskedInTerminal = $true; serviceTreeIdAskedAndRemembered = $true
                 kubernetesToolsOfferedAndInstalled = $true; kubernetesToolsPathExplained = $true
                 operatorModeSkipsSignInAndPublicUrl = $true; allowListOpensPublicUrl = $true
-                cloudShellSkipsBlockedHealthCheck = $true } | ConvertTo-Json -Compress
+                cloudShellSkipsBlockedHealthCheck = $true; privateIngressIsTheDefault = $true
+                publicAddressNeverSwitchedSilently = $true } | ConvertTo-Json -Compress
 } finally {
     foreach ($name in $cloudShellMarkers.Keys) { [Environment]::SetEnvironmentVariable($name, $cloudShellMarkers[$name], 'Process') }
     Remove-Variable -Name deployTestState -Scope Global -ErrorAction SilentlyContinue

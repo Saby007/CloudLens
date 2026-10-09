@@ -18,6 +18,7 @@ You deploy it once into a subscription of your choice, grant it three read/cost-
 - [Deploying to Azure](#deploying-to-azure)
 - [The three manual role assignments](#the-three-manual-role-assignments)
 - [Running on AKS](#running-on-aks)
+  - [Private ingress (the default)](#private-ingress-the-default)
 - [Local development](#local-development)
 - [Security notes](#security-notes)
 
@@ -38,9 +39,9 @@ flowchart TB
     end
 
     subgraph Azure["Your Azure subscription"]
-        PIP["Static public IP<br/>label.region.cloudapp.azure.com"]
+        PIP["Internal load balancer (private IP) + Private Link service<br/>(default; a public IP is opt-in)"]
         subgraph AKS["AKS cluster (Entra ID + Azure RBAC, Azure CNI Overlay + Cilium)"]
-            Ingress["App routing NGINX ingress<br/>(TLS from cert-manager + Let's Encrypt)"]
+            Ingress["App routing NGINX ingress<br/>(TLS from cert-manager: private CA by default, Let's Encrypt on a public ingress)"]
             subgraph NS["Namespace cloudlens"]
                 Web["web pods<br/>(static SPA + nginx)"]
                 API["api pods<br/>(FastAPI, cluster-internal only)"]
@@ -61,7 +62,7 @@ flowchart TB
 
     Entra["Microsoft Entra ID"]
 
-    Browser -- "HTTPS" --> PIP --> Ingress --> Web
+    Browser -- "HTTPS over the private network (VPN / private endpoint)" --> PIP --> Ingress --> Web
     Web -- "/api reverse proxy (only web may reach the API)" --> API
     Browser -. "sign-in" .-> Entra
     API -. "validate bearer token" .-> Entra
@@ -81,7 +82,7 @@ flowchart TB
 
 | Profile | Adds | Use it when |
 | --- | --- | --- |
-| `core` | Network, AKS cluster (system and application node pools), container registry, logging, static ingress IP, the API identities | You just want the foundation up, or you're not ready to run exports yet |
+| `core` | Network, AKS cluster (system and application node pools), container registry, logging, ingress subnets and private DNS (or a public ingress IP), the API identities | You just want the foundation up, or you're not ready to run exports yet |
 | `data` | Private, key-less Blob storage behind a private endpoint, retention rules, container-scoped data roles, the processor identity | You want the app to create exports and run the rolling monthly and daily pulls |
 | `ai` | A private Foundry account/project and model deployments | You want the executive-summary narrative and the Chat tab |
 
@@ -169,12 +170,12 @@ az provider show --namespace Microsoft.CostManagementExports --subscription <sub
 
 There are two ways to deploy: one command that does the whole thing, or the step-by-step Azure Developer CLI workflow. Both use [azure.yaml](azure.yaml), and one `azd up` does all of this:
 
-1. **`azd provision` runs Terraform** ([infra/](infra)): resource group, network with an NSG on each subnet, AKS cluster, container registry, Log Analytics with Container Insights, managed identities with their workload-identity federation, and — per profile — the export storage and the Foundry account. Terraform state is kept in `.azure/<environment>/infra/`.
-2. **The postprovision hook** ([scripts/aks-bootstrap.ps1](scripts/aks-bootstrap.ps1)) prepares the cluster: it installs a pinned, checksum-verified cert-manager release, creates an app-routing NGINX ingress controller on the Terraform-owned static IP, and adds the Let's Encrypt issuers. It is safe to rerun.
+1. **`azd provision` runs Terraform** ([infra/](infra)): resource group, network with an NSG on each subnet (plus dedicated ingress and Private Link subnets), AKS cluster, container registry, Log Analytics with Container Insights, managed identities with their workload-identity federation, and — per profile — the export storage and the Foundry account. Terraform state is kept in `.azure/<environment>/infra/`.
+2. **The postprovision hook** ([scripts/aks-bootstrap.ps1](scripts/aks-bootstrap.ps1)) prepares the cluster: it installs a pinned, checksum-verified cert-manager release, creates an app-routing NGINX ingress controller behind an internal load balancer with a Private Link service (or, for a public ingress, on the Terraform-owned static IP), and adds the certificate issuers. It is safe to rerun.
 3. **`azd deploy`** builds both container images remotely in Azure Container Registry, then applies [api/manifests](api/manifests) and [web/manifests](web/manifests) to the `cloudlens` namespace and waits for the rollout.
-4. **cert-manager** obtains the Let's Encrypt certificate for the app's host name, usually within a minute or two, and renews it automatically.
+4. **cert-manager** issues the certificate for the app's host name, usually within a minute or two, and renews it automatically: from the cluster's own CA by default, or from Let's Encrypt on a public ingress.
 
-The app is then served at `https://<label>.<region>.cloudapp.azure.com` (the `APP_WEB_ORIGIN` value in the azd environment), or at your own domain once you [add one](#https-and-custom-domains).
+**The app is private by default.** It has no public address: it is served at `https://<label>.internal` (the `APP_WEB_ORIGIN` value in the azd environment) from an internal load balancer, and reached only from inside the virtual network, from a network connected to it (VPN, ExpressRoute, peering), or through a private endpoint — see [Private ingress](#private-ingress-the-default). Pass `-IngressVisibility public` to get the older public URL, `https://<label>.<region>.cloudapp.azure.com`, and use your own domain with `APP_CUSTOM_DOMAIN` either way ([HTTPS and custom domains](#https-and-custom-domains)).
 
 ### Option 1 — One command, end to end (recommended)
 
@@ -205,8 +206,13 @@ pwsh ./scripts/deploy-end-to-end.ps1 `
 | `-InstallKubernetesTools` | Install kubectl and kubelogin with `az aks install-cli` without asking. |
 | `-AcmeEmail` | Register a contact address with Let's Encrypt for the TLS certificate. |
 | `-SkipIdentityBootstrap` | A separate Entra administrator creates the app registrations. |
+| `-IngressVisibility` | `private` (the default for a new environment) or `public`. An existing environment keeps its stored value; one that has a public address and no stored value is refused until you choose, so an address is never removed or added silently. |
+| `-CustomDomain` | Serve the app on your own host name — see [HTTPS and custom domains](#https-and-custom-domains). |
+| `-TlsClusterIssuer` | `private-ca` (private default), `byo` (you supply the certificate), or `letsencrypt` / `letsencrypt-staging` (public ingress only). |
+| `-PrivateLinkSubscriptionIds` | Subscriptions whose private endpoints may connect to the Private Link service automatically. Everyone else needs your approval. |
+| `-NoPrivateLink` | Skip the Private Link service; the app is then reachable only from the virtual network and networks connected to it. |
 | `-OperatorMode` | Dev only: you cannot create Entra app registrations. Deploys without sign-in; the public URL stays closed unless you add `-AllowedIpRanges` — see [operator mode](#operator-mode-dev-without-entra-app-registrations). |
-| `-AllowedIpRanges` | Only these IPv4 addresses or CIDR ranges may reach the public URL over HTTPS. With `-OperatorMode`, this is what opens it; `scripts/allow-my-ip.ps1` keeps it current when your address changes. |
+| `-AllowedIpRanges` | Public ingress only. Only these IPv4 addresses or CIDR ranges may reach the public URL over HTTPS. With `-OperatorMode`, this is what opens it; `scripts/allow-my-ip.ps1` keeps it current when your address changes. |
 | `-ServiceManagementReference` | Your tenant requires a Service Tree ID on app registrations. If you leave it out, the script asks when the tenant refuses, suggests the ID your existing registrations use, and remembers your answer. |
 | `-SkipRoleAssignments` | A subscription Owner grants the three roles separately. |
 | `-SkipProcessor` | Scheduled exports are intentionally out of scope (the processor setting is left as it is). |
@@ -327,7 +333,7 @@ If **Schedules** keeps reporting **Export status unavailable** or *"FOCUS export
 
 ### Operator mode: Dev without Entra app registrations
 
-For a **Dev environment** whose operator cannot create Entra app registrations, deploy without sign-in. With no sign-in, the network decides who reaches the app, so choose one of two ways in.
+For a **Dev environment** whose operator cannot create Entra app registrations, deploy without sign-in. With no sign-in, the network decides who reaches the app. With the default [private ingress](#private-ingress-the-default) only the private network does, so the people who can reach it are the people who can reach that network. The rest of this section is for a **public** ingress (`-IngressVisibility public`), where you choose one of two ways in.
 
 **Public URL, limited to your IP addresses.** The app keeps its usual `https://<label>.<region>.cloudapp.azure.com` address, but the node subnet's network security group lets only the addresses you list reach it over HTTPS:
 
@@ -336,6 +342,7 @@ pwsh ./scripts/deploy-end-to-end.ps1 `
   -EnvironmentName my-dev `
   -TargetSubscriptionId '<subscription-id>' `
   -OperatorMode `
+  -IngressVisibility public `
   -AllowedIpRanges '<your-public-ip>'
 ```
 
@@ -370,6 +377,7 @@ Every run of the script sets the mode, so a run without `-OperatorMode` turns si
 
 ```powershell
 azd env set MEGHKOSHA_AUTH_MODE operator
+azd env set APP_INGRESS_VISIBILITY public                  # or leave it private and reach the app over the private network
 azd env set MEGHKOSHA_OPERATOR_OBJECT_ID (az ad signed-in-user show --query id --output tsv)
 azd env set MEGHKOSHA_OPERATOR_UPN (az ad signed-in-user show --query userPrincipalName --output tsv)
 azd env set APP_WEB_ALLOWED_IP_RANGES '<your-public-ip>'   # optional: open the public URL to these addresses
@@ -435,14 +443,18 @@ Set these with `azd env set <name> <value>` before `azd provision`. Values marke
 | `APP_AKS_KUBERNETES_VERSION` | region default | The `stable` auto-upgrade channel keeps the cluster current inside the maintenance window. |
 | `APP_AKS_MAINTENANCE_DAY`, `APP_AKS_MAINTENANCE_START` | `Sunday`, `02:00` | Weekly four-hour UTC window for cluster and node-image upgrades. |
 | `APP_AKS_API_AUTHORIZED_IP_RANGES` | *(any)* | Comma-separated CIDR ranges allowed to reach the Kubernetes API server. Include the machine that runs `azd`. |
-| `APP_WEB_ALLOWED_IP_RANGES` | *(any)* | Comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) allowed to reach the app over HTTPS. Required to open the public URL in [operator mode](#operator-mode-dev-without-entra-app-registrations). Applied by Terraform; `scripts/allow-my-ip.ps1` updates it in place. |
+| `APP_INGRESS_VISIBILITY` | `private` | `private` or `public`. Private serves the app from an internal load balancer; public adds a static public IP. Switching recreates the ingress address — see [Moving an existing environment](#moving-an-existing-environment-between-public-and-private). |
+| `APP_INGRESS_SUBNET_PREFIX`, `APP_PRIVATE_LINK_SUBNET_PREFIX` | `10.42.1.32/27`, `10.42.1.64/27` | **Day-0.** Subnets for the internal load balancer (it takes the 5th address) and for the Private Link service's NAT addresses. They must sit inside the VNet and not overlap the other subnets. |
+| `APP_PRIVATE_LINK_ENABLED` | `true` | Create a Private Link service so other networks can reach the app through a private endpoint. |
+| `APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS` | *(none)* | Comma-separated subscription IDs whose private-endpoint connections are approved automatically and may see the service. Empty means every connection waits for approval. |
+| `APP_WEB_ALLOWED_IP_RANGES` | *(any)* | Public ingress only (rejected on a private one). Comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) allowed to reach the app over HTTPS. Required to open the public URL in [operator mode](#operator-mode-dev-without-entra-app-registrations). Applied by Terraform; `scripts/allow-my-ip.ps1` updates it in place. |
 | `APP_AKS_OUTBOUND_PORTS`, `APP_AKS_OUTBOUND_IPS` | `6400`, `1` | SNAT ports each node gets for outbound connections, and the managed outbound IPs that provide them (64,000 each). The pools at their maximum size, plus one upgrade surge node per pool, must fit: the defaults allow 10 nodes. See [Networking, outbound connections and logs](#networking-outbound-connections-and-logs). |
 | `APP_AKS_OUTBOUND_IDLE_TIMEOUT` | `4` | Minutes an idle outbound connection keeps its SNAT port (4-120; Azure's default is 30). |
 | `APP_VNET_PREFIX`, `APP_AKS_SUBNET_PREFIX`, `APP_PRIVATE_ENDPOINT_SUBNET_PREFIX` | `10.42.0.0/23`, `10.42.0.0/24`, `10.42.1.0/27` | **Day-0.** Nodes take addresses from the AKS subnet; pods use the overlay range. |
 | `APP_AKS_POD_CIDR`, `APP_AKS_SERVICE_CIDR` | `10.244.0.0/16`, `10.0.0.0/16` | **Day-0.** Cluster-internal ranges; must not overlap the VNet or networks it is peered with. |
-| `APP_INGRESS_DNS_LABEL` | `cloudlens-<token>` | **Day-0.** The `<label>` in `<label>.<region>.cloudapp.azure.com`; must be unique in the region. |
+| `APP_INGRESS_DNS_LABEL` | `cloudlens-<token>` | **Day-0.** The `<label>` in `<label>.internal` (private) or `<label>.<region>.cloudapp.azure.com` (public; must be unique in the region). |
 | `APP_CUSTOM_DOMAIN` | *(none)* | Serve the app on your own host name — see below. |
-| `APP_TLS_CLUSTER_ISSUER` | `letsencrypt` | `letsencrypt-staging` issues untrusted test certificates with much higher rate limits. |
+| `APP_TLS_CLUSTER_ISSUER` | `private-ca` (private) / `letsencrypt` (public) | `private-ca` is the cluster's own CA; `byo` means you create the `web-tls` secret; `letsencrypt-staging` issues untrusted test certificates with much higher rate limits. Let's Encrypt needs a public address, so it is refused on a private ingress. |
 | `APP_ACME_EMAIL` | *(none)* | Optional contact address registered with Let's Encrypt. |
 | `APP_PROCESSOR_CRON` | `*/5 * * * *` | Processor CronJob schedule (UTC). Ticks never overlap. |
 
@@ -450,7 +462,7 @@ Set these with `azd env set <name> <value>` before `azd provision`. Values marke
 
 ### Networking, outbound connections and logs
 
-- **Subnet NSGs.** Terraform attaches an NSG to both subnets. The node subnet's NSG allows only HTTP and HTTPS from the internet, and only to the ingress IP (HTTP is for Let's Encrypt's challenge); Azure's default rules cover traffic inside the VNet, load balancer probes and outbound traffic. Some tenants' Azure Policy attaches its own NSG to any subnet without one, and that NSG blocks the app. Terraform therefore sets the NSG in the request that creates the subnet and, on an environment where a policy already attached one, replaces it on the next `azd provision`. Once the subnets have these NSGs, such a policy has no reason to touch them again.
+- **Subnet NSGs.** Terraform attaches an NSG to both subnets. On a private ingress the node subnet's NSG denies all inbound traffic from the internet; on a public one it allows only HTTP and HTTPS, and only to the ingress IP (HTTP is for Let's Encrypt's challenge). The ingress and Private Link subnets have NSGs of their own; Azure's default rules cover traffic inside the VNet, load balancer probes and outbound traffic. Some tenants' Azure Policy attaches its own NSG to any subnet without one, and that NSG blocks the app. Terraform therefore sets the NSG in the request that creates the subnet and, on an environment where a policy already attached one, replaces it on the next `azd provision`. Once the subnets have these NSGs, such a policy has no reason to touch them again.
 - **Outbound connections.** Every connection from the cluster to Azure or the internet holds one of its node's SNAT ports on the load balancer. Each node gets `APP_AKS_OUTBOUND_PORTS` ports, and an idle connection gives its port back after `APP_AKS_OUTBOUND_IDLE_TIMEOUT` minutes. The API and the processor share one connection pool and one managed identity credential per process instead of opening a connection and fetching a token for every call, and they close idle connections after 30 seconds.
 - **Replicas on separate nodes.** The two api replicas, and the two web replicas, are never placed on the same node while another application node can take one, so a single node failure doesn't take the app down. Each rollout's new pods are spread the same way.
 - **Logs.** Container Insights sends container logs (`ContainerLogV2`), Kubernetes events (`KubeEvents`) and pod inventory (`KubePodInventory`) to the environment's Log Analytics workspace. These are the streams of Microsoft's default *Logs and Events* preset, without the `kube-system`, `gatekeeper-system` and `azure-arc` namespaces. Data starts arriving about 10 minutes after the first `azd provision` that creates the rule. The API and the processor log at INFO, but the Azure SDKs' request-by-request tracing is left out. For example, the processor's warnings from the last day:
@@ -462,13 +474,67 @@ Set these with `azd env set <name> <value>` before `azd provision`. Values marke
   | project TimeGenerated, PodName, LogMessage
   ```
 
+### Private ingress (the default)
+
+A new environment has **no public address**. Terraform creates an `ingress` subnet and a `private-link` subnet, and the app's NGINX ingress controller sits behind an **internal load balancer** at a fixed private address (the fifth address of the ingress subnet, `APP_INGRESS_PRIVATE_IP`). The node subnet's network security group denies all inbound traffic from the internet. There are two ways to reach the app:
+
+- **From the virtual network, or a network connected to it** (VPN, ExpressRoute, peering). A private DNS zone named after the app's host (`cloudlens-<token>.internal`, or your `APP_CUSTOM_DOMAIN`) is linked to the VNet, with a record pointing at the private address. From another network, create a record for the host that points at `APP_INGRESS_PRIVATE_IP`, or forward the name to a resolver that can see the zone.
+- **Through a private endpoint to the Private Link service** (`APP_PRIVATE_LINK_NAME`; `APP_PRIVATE_LINK_ENABLED`, on by default). Any network, in any subscription you allow, can create a private endpoint to it, which needs no peering or address planning with the application's VNet:
+
+  ```powershell
+  az network private-endpoint create --name pe-cloudlens --resource-group <your-rg> --vnet-name <your-vnet> --subnet <your-subnet> `
+    --private-connection-resource-id (azd env get-value APP_PRIVATE_LINK_ID) --connection-name cloudlens --location <region>
+  ```
+
+  Then point the app's host name at the endpoint's address in your DNS. Connections from subscriptions listed in `-PrivateLinkSubscriptionIds` (`APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS`) are approved automatically; any other waits for approval on the Private Link service (`az network private-endpoint-connection approve`).
+
+```powershell
+pwsh ./scripts/deploy-end-to-end.ps1 `
+  -EnvironmentName my-environment `
+  -TargetSubscriptionId '<subscription-id>' `
+  -CustomDomain cloudlens.contoso.com `
+  -TlsClusterIssuer byo `
+  -PrivateLinkSubscriptionIds '<customer-subscription-id>'
+```
+
+**Certificates.** Let's Encrypt must reach the app from the internet, so it cannot issue for a private address. Choose:
+
+- `private-ca` (the default): cert-manager creates a CA inside the cluster and signs the app's certificate with it. Browsers do not trust it until you install the CA certificate: `kubectl get secret cloudlens-private-ca --namespace cert-manager -o jsonpath='{.data.tls\.crt}'` holds it, base64 encoded (never export `tls.key`). The test jump box installs it for you.
+- `byo`: you create the `web-tls` TLS secret in the `cloudlens` namespace from a certificate your organization's CA issued for the host. cert-manager is not asked for anything.
+
+**Sign-in.** Entra sign-in needs the redirect URI `https://<host>/auth-callback.html`. `bootstrap-identity.ps1` registers it for a new environment, and refuses to replace an existing one.
+
+**What stays public.** The private ingress covers the application. The AKS API server and the container registry keep their public endpoints, protected by Entra ID and Azure RBAC; limit the API server with `APP_AKS_API_AUTHORIZED_IP_RANGES`. Making them private is a separate change.
+
+#### Moving an existing environment between public and private
+
+Changing `APP_INGRESS_VISIBILITY` replaces the ingress address (the static public IP is created or deleted and the controller's load balancer is recreated), so the deploy script never does it silently:
+
+- An environment that was created before this option and has a public address is **refused** until you pass `-IngressVisibility public` (keep it) or `-IngressVisibility private` (move it).
+- Moving between the two resets the certificate source and removes any IP allow-list, because neither applies to the other. For Entra sign-in, the redirect URI must change with the host name: remove the old one (or delete the registrations) first, since `bootstrap-identity.ps1` will not overwrite it.
+- Raw `azd` keeps stored values, so an environment holding `APP_TLS_CLUSTER_ISSUER=letsencrypt` fails validation if switched to private without clearing it. That is deliberate.
+
+#### Testing a private deployment from your own laptop: the test jump box
+
+A private app cannot be opened from a laptop outside the network. For **testing only**, `scripts/deploy-test-jumpbox.ps1` builds the path a customer's network would use, in a separate network that has no relation to the application's: a private endpoint to the Private Link service, a private DNS zone for the app's host, a Windows Server VM with no public address (trusting the private CA when the app uses it, and shutting down every day), and Azure Bastion. It is not part of the generic deployment, and nothing in `azd up` depends on it.
+
+```powershell
+pwsh ./scripts/deploy-test-jumpbox.ps1 -EnvironmentName my-environment        # add -ShowPassword to print the VM password
+# Azure portal -> the jump box VM (rg-<environment>-jumpbox) -> Connect -> Bastion, sign in as cloudlensadmin, open Microsoft Edge on the app URL
+pwsh ./scripts/deploy-test-jumpbox.ps1 -EnvironmentName my-environment -Destroy   # removes everything it created
+```
+
+Bastion bills hourly until it is destroyed, so run `-Destroy` when you are done. Use `-ManualConnection` when the deployment's Private Link service does not auto-approve your subscription (then approve the connection on the service), and `-PlanOnly` to see what would be built. The password is also kept in the state under `.azure/<environment>/test-jumpbox`, which is git-ignored and sensitive.
+
 ### HTTPS and custom domains
 
-Terraform gives the ingress a static public IP whose DNS label provides the app's stable host name before anything is deployed. cert-manager proves control of that name to Let's Encrypt with an HTTP-01 challenge on port 80, stores the certificate in the `web-tls` secret and renews it automatically. If you recreate environments often, switch to `APP_TLS_CLUSTER_ISSUER=letsencrypt-staging` while testing so you don't hit Let's Encrypt's duplicate-certificate limits, then run `azd deploy web`.
+On a **private** ingress, the host name is `<label>.internal` unless you set `APP_CUSTOM_DOMAIN`, the certificate comes from the issuer described under [Private ingress](#private-ingress-the-default), and DNS is the private zone and records described there; the rest of this section is for a **public** ingress.
+
+Terraform gives a public ingress a static public IP whose DNS label provides the app's stable host name before anything is deployed. cert-manager proves control of that name to Let's Encrypt with an HTTP-01 challenge on port 80, stores the certificate in the `web-tls` secret and renews it automatically. If you recreate environments often, switch to `APP_TLS_CLUSTER_ISSUER=letsencrypt-staging` while testing so you don't hit Let's Encrypt's duplicate-certificate limits, then run `azd deploy web`.
 
 To serve the app on your own domain:
 
-1. Create a CNAME record from your host name (for example `cloudlens.contoso.com`) to the Azure-provided name in `azd env get-value APP_INGRESS_AZURE_FQDN`.
+1. For a public ingress, create a CNAME record from your host name (for example `cloudlens.contoso.com`) to the Azure-provided name in `azd env get-value APP_INGRESS_AZURE_FQDN`. For a private one, the private DNS zone already holds the record; add the same name to your own DNS.
 2. `azd env set APP_CUSTOM_DOMAIN cloudlens.contoso.com`.
 3. In the Entra portal, open the `<environment>-web-spa` app registration, **Authentication** → **Single-page application**, and change the redirect URI to `https://cloudlens.contoso.com/auth-callback.html`. `bootstrap-identity.ps1` deliberately never replaces an existing redirect URI by itself.
 4. Rerun `pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName <environment> -SkipPreview` (or `azd up`). The ingress switches to the new host name and cert-manager issues its certificate.
@@ -532,6 +598,7 @@ Individual suites are `Backend`, `Frontend`, `Build`, and `Browser`. The runner 
 - The app never requests Entra admin consent, never requests an Azure Resource Manager scope from the browser, and never persists user bearer tokens.
 - Its managed identities hold only the roles you explicitly grant (see above) plus what the deployment itself provisions (container-scoped storage roles for its own control-state and export data). Pods reach them through workload identity federation — there are no client secrets, storage keys or registry passwords anywhere.
 - The cluster API accepts Entra ID only (local accounts are disabled) and is authorized by Azure RBAC; restrict it further with `APP_AKS_API_AUTHORIZED_IP_RANGES`.
+- A new environment is [private](#private-ingress-the-default): no public IP, inbound internet traffic denied at the node subnet, and the app reachable only from the virtual network or through a private endpoint to its Private Link service (whose connections you approve or pre-approve by subscription). The AKS API server and container registry remain public endpoints protected by Entra ID and Azure RBAC.
 - TLS ends at the ingress controller. Network policies admit only the ingress controller to the web pods and only the web pods to the API; the API has no public endpoint. Storage and Foundry are reachable only through private endpoints.
 - [Operator mode](#operator-mode-dev-without-entra-app-registrations) (Dev only) replaces Entra sign-in with network access control: every request acts as one configured operator, and only the addresses on the IP allow-list (enforced by the network security group) or users with cluster access (through port-forward) can reach the app. Without an allow-list, HTTPS is blocked at the network security group, the network policies admit nothing from the ingress controller, and the API refuses requests it forwarded. Never use it in production.
 - Pods run as non-root users with read-only root filesystems, no privilege escalation, all Linux capabilities dropped and the runtime-default seccomp profile. Container images run on a minimal, digest-pinned base with no shell or package manager in the production API image.

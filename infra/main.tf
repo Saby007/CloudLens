@@ -85,6 +85,24 @@ locals {
   ingress_dns_label            = var.ingress_dns_label != "" ? var.ingress_dns_label : "cloudlens-${local.resource_token}"
   ingress_class                = "cloudlens-nginx"
 
+  # Private (the default): an internal load balancer on a private IP, no public address at all. Public keeps the
+  # internet-facing static IP. Only a private ingress can be reached solely through a private endpoint.
+  private_ingress = var.ingress_visibility == "private"
+  public_ingress  = !local.private_ingress
+  tls_issuer      = var.tls_cluster_issuer != "" ? var.tls_cluster_issuer : (local.private_ingress ? "private-ca" : "letsencrypt")
+
+  # Without a custom domain a private ingress is named <label>.internal; .internal is reserved for private use.
+  # Azure reserves the first four addresses of a subnet, so the fifth is the first the load balancer can take.
+  ingress_host       = var.custom_domain != "" ? lower(var.custom_domain) : (local.private_ingress ? "${local.ingress_dns_label}.internal" : one(azurerm_public_ip.ingress[*].fqdn))
+  ingress_private_ip = local.private_ingress ? cidrhost(var.ingress_subnet_prefix, 4) : ""
+
+  private_link_service_enabled = local.private_ingress && var.private_link_enabled
+  private_link_name            = "pls-cloudlens-${local.resource_token}"
+  private_link_subscriptions = distinct(concat(
+    [lower(data.azurerm_client_config.current.subscription_id)],
+    [for id in compact([for item in split(",", var.private_link_allowed_subscriptions) : trimspace(item)]) : lower(id)],
+  ))
+
   role_definition_prefix = "/subscriptions/${data.azurerm_client_config.current.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/"
   role_ids = {
     acr_pull                    = "7f951dda-4ed3-4680-a7ca-43fe172d538d"

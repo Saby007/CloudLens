@@ -20,8 +20,15 @@
       5. Runs scripts/bootstrap-identity.ps1, feeds the two client IDs back into the environment, and
          runs `azd deploy` so the API pods pick them up. Skipped with -OperatorMode.
       6. Grants Reader / Cost Management Contributor on every subscription you want to assess.
-      7. Waits for the Let's Encrypt certificate and checks /api/health over HTTPS, or, with -OperatorMode and
-         no IP allow-list, prints how to reach the app through `kubectl port-forward` instead.
+      7. Waits for the certificate and checks /api/health over HTTPS. A private ingress (the default) has no
+         public address, so this machine usually cannot reach it: instead the run prints the private address,
+         the Private Link Service and what DNS and certificate trust the app needs. With -OperatorMode and no
+         IP allow-list on a public ingress, it prints how to reach the app through `kubectl port-forward`.
+
+    The app is private by default: it has no public address, an internal load balancer serves it on a private IP,
+    and a Private Link Service lets a private endpoint in any virtual network reach it. -IngressVisibility public
+    keeps the internet-facing address. An environment that already has a public address is never switched
+    silently: say which you want.
 
     Every phase is idempotent and re-entrant: rerunning the script against an existing environment
     reapplies the current code once and skips whatever is already in place.
@@ -54,14 +61,42 @@
 .PARAMETER OperatorMode
     Dev only, for operators who cannot create Entra app registrations. Deploys without Entra sign-in:
     every request acts as the signed-in Azure CLI user (their own Azure role assignments still decide
-    which subscriptions the app shows). Without -AllowedIpRanges the public URL is closed and the app is
-    reached through `kubectl port-forward`. Skips the sign-in bootstrap. A later run without this switch
-    turns sign-in back on, which then needs the app registrations.
+    which subscriptions the app shows). The network decides who reaches the app: a private ingress (the
+    default) is reachable only privately; a public one is closed (reach it through `kubectl port-forward`)
+    unless -AllowedIpRanges opens it to your addresses. Skips the sign-in bootstrap. A later run without
+    this switch turns sign-in back on, which then needs the app registrations.
+
+.PARAMETER IngressVisibility
+    private: no public address. An internal load balancer serves the app on a private IP in the virtual network,
+    and a Private Link Service publishes it so a private endpoint in any network can reach it. public: the
+    internet-facing static IP and <label>.<region>.cloudapp.azure.com name. A new environment is private. An
+    environment that already has a public address keeps it only if you say -IngressVisibility public; switching it
+    to private removes the public address and the cloudapp.azure.com name, so the app's host name changes. The
+    choice is kept in the azd environment.
+
+.PARAMETER CustomDomain
+    Host name for the app, for example cloudlens.contoso.com. Private: a private DNS zone of that name pointing at
+    the private IP is created for the virtual network; point your own DNS at the private IP (or at the private
+    endpoint's) for everything else. Without one a private ingress is named cloudlens-<token>.internal. Public: a
+    CNAME to the cloudapp.azure.com name must exist first. Kept in the azd environment; pass '' to remove it.
+
+.PARAMETER TlsClusterIssuer
+    private-ca: a CA that cert-manager creates in the cluster signs the web certificate (the private default;
+    browsers must trust the CA, see the README). byo: you create the web-tls secret from your own CA. letsencrypt and
+    letsencrypt-staging need a public ingress. Without this the issuer follows the visibility.
+
+.PARAMETER PrivateLinkSubscriptionIds
+    Comma-separated subscription IDs, besides the deployment subscription, whose private endpoints may connect to
+    the Private Link Service without manual approval. Kept in the azd environment; pass '' to remove them.
+
+.PARAMETER NoPrivateLink
+    Private ingress without the Private Link Service: only the private IP remains, reachable from this virtual
+    network and from anything peered or connected to it.
 
 .PARAMETER AllowedIpRanges
-    Comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) that may reach the app's public URL over
-    HTTPS; everyone else is blocked by the network security group. With -OperatorMode this is what opens the
-    public URL. The list is kept in the azd environment, so later runs keep it unless you pass this again;
+    Public ingress only: comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) that may reach the app's
+    public URL over HTTPS; everyone else is blocked by the network security group. With -OperatorMode this is what
+    opens the public URL. The list is kept in the azd environment, so later runs keep it unless you pass this again;
     pass '' to remove it. When your address changes, scripts/allow-my-ip.ps1 updates it in seconds.
 
 .PARAMETER InstallKubernetesTools
@@ -72,15 +107,20 @@
     Defaults to your home directory.
 
 .EXAMPLE
-    pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-environment -TargetSubscriptionId 'sub-a,sub-b'
+    # A private deployment (the default): reached through a private endpoint or the virtual network, with your own host name.
+    pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-environment -TargetSubscriptionId 'sub-a' -CustomDomain cloudlens.contoso.com
 
 .EXAMPLE
-    # Dev environment without Entra app registrations: reached through kubectl port-forward only.
+    # The internet-facing deployment, as before.
+    pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-environment -TargetSubscriptionId 'sub-a,sub-b' -IngressVisibility public
+
+.EXAMPLE
+    # Dev environment without Entra app registrations: reached privately, with no sign-in.
     pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-dev -TargetSubscriptionId 'sub-a' -OperatorMode
 
 .EXAMPLE
-    # The same, served at its public URL to your own address only (scripts/allow-my-ip.ps1 keeps it current).
-    pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-dev -TargetSubscriptionId 'sub-a' -OperatorMode -AllowedIpRanges '203.0.113.7'
+    # The same on a public ingress, served at its public URL to your own address only (scripts/allow-my-ip.ps1 keeps it current).
+    pwsh ./scripts/deploy-end-to-end.ps1 -EnvironmentName my-dev -TargetSubscriptionId 'sub-a' -IngressVisibility public -OperatorMode -AllowedIpRanges '203.0.113.7'
 
 .EXAMPLE
     # Standalone: clones the cloudlensdev branch of the repository next to the current directory first.
@@ -115,6 +155,13 @@ param(
     [switch] $IncludeLocalhostRedirects,
     [switch] $GrantAdminConsent,
     [switch] $OperatorMode,
+    [ValidateSet('private', 'public')]
+    [string] $IngressVisibility,
+    [string] $CustomDomain = '',
+    [ValidateSet('private-ca', 'byo', 'letsencrypt', 'letsencrypt-staging')]
+    [string] $TlsClusterIssuer,
+    [string] $PrivateLinkSubscriptionIds = '',
+    [switch] $NoPrivateLink,
     [string] $AllowedIpRanges = '',
     [switch] $InstallKubernetesTools,
     [string] $KubernetesToolsDirectory = $HOME,
@@ -167,6 +214,32 @@ function ConvertTo-IpAllowList {
 }
 # Kept in the azd environment between runs (scripts/allow-my-ip.ps1 updates it), so only an explicit value changes it.
 if ($PSBoundParameters.ContainsKey('AllowedIpRanges')) { $settings.APP_WEB_ALLOWED_IP_RANGES = ConvertTo-IpAllowList $AllowedIpRanges }
+
+# Ingress. Each value is kept in the azd environment, so only an explicit one changes it; the visibility itself is
+# settled in section 3, once the environment (and any public address it already has) is known.
+if ($PSBoundParameters.ContainsKey('IngressVisibility') -and $IngressVisibility -eq 'private' -and $settings.Contains('APP_WEB_ALLOWED_IP_RANGES') -and $settings.APP_WEB_ALLOWED_IP_RANGES) {
+    throw '-AllowedIpRanges limits who can reach a public ingress; a private ingress has no public address. Drop it, or use -IngressVisibility public.'
+}
+if ($PSBoundParameters.ContainsKey('CustomDomain')) {
+    $domain = $CustomDomain.Trim().ToLowerInvariant()
+    if ($domain -and $domain -cnotmatch '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { throw "-CustomDomain must be a host name such as cloudlens.contoso.com; '$CustomDomain' is not one." }
+    $settings.APP_CUSTOM_DOMAIN = $domain
+}
+if ($PSBoundParameters.ContainsKey('TlsClusterIssuer')) {
+    if ($TlsClusterIssuer -like 'letsencrypt*' -and $PSBoundParameters.ContainsKey('IngressVisibility') -and $IngressVisibility -eq 'private') {
+        throw "-TlsClusterIssuer $TlsClusterIssuer validates the host over the public internet, which a private ingress does not accept. Use private-ca or byo, or -IngressVisibility public."
+    }
+    $settings.APP_TLS_CLUSTER_ISSUER = $TlsClusterIssuer
+}
+if ($PSBoundParameters.ContainsKey('PrivateLinkSubscriptionIds')) {
+    $allowedSubscriptions = @($PrivateLinkSubscriptionIds -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
+    foreach ($allowed in $allowedSubscriptions) {
+        $parsed = [guid]::Empty
+        if (-not [guid]::TryParse($allowed, [ref] $parsed)) { throw "-PrivateLinkSubscriptionIds takes subscription IDs (GUIDs) separated by commas; '$allowed' is not one." }
+    }
+    $settings.APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS = $allowedSubscriptions -join ','
+}
+if ($NoPrivateLink) { $settings.APP_PRIVATE_LINK_ENABLED = 'false' }
 # azd's output is captured to classify failures, which would also hide any question azd asked, so azd
 # always runs with --no-prompt. These are the errors it reports when it needed an answer instead; the
 # command is then rerun attached to the terminal so the question can be answered there.
@@ -203,6 +276,7 @@ if ($PlanOnly) {
         preview = -not $SkipPreview
         enableProcessor = -not $SkipProcessor
         operatorMode = [bool] $OperatorMode
+        ingressVisibility = $(if ($PSBoundParameters.ContainsKey('IngressVisibility')) { $IngressVisibility } else { '' })
         bootstrapIdentity = -not ($SkipIdentityBootstrap -or $OperatorMode)
         roleAssignments = -not $SkipRoleAssignments
         serviceManagementReference = $ServiceManagementReference
@@ -583,6 +657,38 @@ try {
     # unattended run; setting them explicitly keeps every later azd call non-interactive.
     Set-AzdValue 'AZURE_SUBSCRIPTION_ID' $deploymentSubscription
     Write-Host '  AZURE_SUBSCRIPTION_ID set.'
+
+    # Ingress visibility: an explicit choice wins, otherwise the environment keeps what it has, and a new one is private.
+    # An environment that already has a public address is never switched without being asked: going private removes the
+    # address and its cloudapp.azure.com name, so the app's host name (and its sign-in redirect URI) changes.
+    $storedVisibility = Get-AzdValue 'APP_INGRESS_VISIBILITY'
+    $hadPublicAddress = [bool](Get-AzdValue 'APP_INGRESS_PUBLIC_IP')
+    $previousVisibility = if ($storedVisibility) { $storedVisibility } elseif ($hadPublicAddress) { 'public' } else { '' }
+    if ($PSBoundParameters.ContainsKey('IngressVisibility')) {
+        $visibility = $IngressVisibility
+    } elseif ($storedVisibility) {
+        $visibility = $storedVisibility
+    } elseif ($hadPublicAddress) {
+        throw "Environment '$EnvironmentName' already has a public address, and the app is private by default now. Say which you want: -IngressVisibility public keeps the internet-facing address as it is; -IngressVisibility private removes it (the app's host name and its sign-in redirect URI change) and serves the app privately."
+    } else {
+        $visibility = 'private'
+    }
+    $settings.APP_INGRESS_VISIBILITY = $visibility
+    if ($previousVisibility -and $previousVisibility -ne $visibility) {
+        Write-Warning "Switching '$EnvironmentName' from a $previousVisibility to a $visibility ingress. Settings that only make sense for the old one are reset unless you passed them again."
+        if (-not $PSBoundParameters.ContainsKey('TlsClusterIssuer')) { $settings.APP_TLS_CLUSTER_ISSUER = '' }
+        if ($visibility -eq 'private' -and -not $PSBoundParameters.ContainsKey('AllowedIpRanges')) { $settings.APP_WEB_ALLOWED_IP_RANGES = '' }
+        if ($visibility -eq 'private' -and -not $OperatorMode -and -not $SkipIdentityBootstrap) {
+            Write-Warning "The sign-in registrations still list the old host as a redirect URI, and bootstrap-identity.ps1 refuses to replace it silently. Remove the old SPA redirect URI in the Entra admin center (or delete the registrations $EnvironmentName-api and $EnvironmentName-web-spa) before the sign-in step."
+        }
+    }
+    if ($visibility -eq 'private' -and $settings.Contains('APP_WEB_ALLOWED_IP_RANGES') -and $settings.APP_WEB_ALLOWED_IP_RANGES) {
+        throw '-AllowedIpRanges limits who can reach a public ingress; this environment is private. Drop it, or use -IngressVisibility public.'
+    }
+    if ($visibility -eq 'private' -and $settings.Contains('APP_TLS_CLUSTER_ISSUER') -and $settings.APP_TLS_CLUSTER_ISSUER -like 'letsencrypt*') {
+        throw "-TlsClusterIssuer $($settings.APP_TLS_CLUSTER_ISSUER) validates the host over the public internet, which a private ingress does not accept. Use private-ca or byo, or -IngressVisibility public."
+    }
+    Write-Host "Ingress: $visibility."
     if ($OperatorMode) {
         # Every request will act as this user, so the API authorizes against their own object ID.
         $operatorJson = Get-CliText (& az ad signed-in-user show --query '{id:id,upn:userPrincipalName}' --output json --only-show-errors 2>$null)
@@ -776,12 +882,15 @@ try {
     # -----------------------------------------------------------------------
     Write-Step 'Deployment summary'
     $url = Get-WebEndpointUrl
-    # Terraform reports the restriction only once the network security group enforces the allow-list.
+    $privateIngress = $visibility -eq 'private'
+    # Terraform reports the restriction only once the network has been changed to enforce it.
     $restricted = (Get-AzdValue 'APP_WEB_INGRESS_RESTRICTED') -eq 'true'
-    $allowedIpRanges = Get-AzdValue 'APP_WEB_ALLOWED_IP_RANGES'
-    $publicUrlOpen = -not $OperatorMode -or $restricted
+    $allowedIpRanges = if ($privateIngress) { '' } else { Get-AzdValue 'APP_WEB_ALLOWED_IP_RANGES' }
+    $publicUrlOpen = -not $privateIngress -and (-not $OperatorMode -or $restricted)
     $healthy = $false
-    if (-not $publicUrlOpen) {
+    if ($privateIngress) {
+        Write-Host 'The ingress is private: it has no public address, so this machine can reach the app only from inside the network, and the HTTPS health check is skipped.' -ForegroundColor Yellow
+    } elseif (-not $publicUrlOpen) {
         Write-Host 'Operator mode without an IP allow-list closes the public URL, so the HTTPS health check is skipped.' -ForegroundColor Yellow
     } elseif ($restricted -and $inCloudShell) {
         # Cloud Shell's address is not one to allow-list (other people's sessions share it), so the check could only time out.
@@ -798,8 +907,12 @@ try {
         resourceGroup = Get-ResourceGroupName
         cluster = Get-AzdValue 'AZURE_AKS_CLUSTER_NAME'
         authMode = $settings.MEGHKOSHA_AUTH_MODE
-        webUrl = $(if ($publicUrlOpen) { $url } else { '' })
-        allowedIpRanges = $(if ($restricted) { $allowedIpRanges } else { '' })
+        ingressVisibility = $visibility
+        webUrl = $(if ($privateIngress -or $publicUrlOpen) { $url } else { '' })
+        privateIp = $(if ($privateIngress) { Get-AzdValue 'APP_INGRESS_PRIVATE_IP' } else { '' })
+        privateLinkServiceId = $(if ($privateIngress) { Get-AzdValue 'APP_PRIVATE_LINK_ID' } else { '' })
+        tlsIssuer = Get-AzdValue 'APP_TLS_CLUSTER_ISSUER'
+        allowedIpRanges = $(if ($restricted -and -not $privateIngress) { $allowedIpRanges } else { '' })
         portForward = $(if ($OperatorMode) { 'kubectl port-forward --namespace cloudlens service/web 8080:8080' } else { '' })
         healthy = $healthy
         apiImage = Get-AzdValue 'SERVICE_API_IMAGE_NAME'
@@ -815,8 +928,32 @@ try {
 }
 
 $deployed | ConvertTo-Json -Depth 5
+if ($deployed.ingressVisibility -eq 'private') {
+    $appHost = $deployed.webUrl -replace '^https://', ''
+    Write-Host ''
+    Write-Host "Private ingress: the app has no public address. It is served at $($deployed.webUrl) on the private address $($deployed.privateIp)." -ForegroundColor Yellow
+    Write-Host "  DNS         $appHost must resolve to that address for whoever opens the app. A private DNS zone of that name in the app's virtual network already does."
+    Write-Host "              A peered, VPN or ExpressRoute network needs a record $appHost -> $($deployed.privateIp) in its own DNS."
+    if ($deployed.privateLinkServiceId) {
+        Write-Host "  Private Link  $($deployed.privateLinkServiceId)"
+        Write-Host '              A private endpoint in any virtual network connects to it; that network needs a record for the host that points at the private endpoint''s address:'
+        Write-Host "                az network private-endpoint create --resource-group <rg> --name pe-cloudlens --vnet-name <vnet> --subnet <subnet> --connection-name cloudlens --private-connection-resource-id $($deployed.privateLinkServiceId)"
+        Write-Host '              Connections from the deployment subscription (and any in -PrivateLinkSubscriptionIds) are approved automatically; others wait for approval on the service.'
+    }
+    if ($deployed.tlsIssuer -eq 'private-ca') {
+        Write-Host '  Certificate  Signed by a CA that lives in the cluster, so browsers must trust it. Export it, then install it on the machines that open the app:'
+        Write-Host '                [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((kubectl get secret cloudlens-private-ca --namespace cert-manager --output jsonpath=''{.data.tls\.crt}''))) | Set-Content cloudlens-ca.crt'
+        Write-Host '                certutil -addstore -f Root cloudlens-ca.crt        (Windows, as administrator)'
+    } elseif ($deployed.tlsIssuer -eq 'byo') {
+        Write-Host '  Certificate  Create the secret from your own CA, in the cloudlens namespace, or the ingress serves a placeholder certificate:'
+        Write-Host '                kubectl create secret tls web-tls --namespace cloudlens --cert=<chain.pem> --key=<key.pem>'
+    }
+    Write-Host "  To test from a jump box inside a virtual network (a VM behind Bastion, nothing exposed): pwsh ./scripts/deploy-test-jumpbox.ps1 -EnvironmentName $($deployed.environment)"
+}
 if ($deployed.portForward) {
-    if ($deployed.webUrl) {
+    if ($deployed.ingressVisibility -eq 'private') {
+        Write-Host 'Operator mode has no sign-in. Besides the private address, kubectl can forward the web service:' -ForegroundColor Yellow
+    } elseif ($deployed.webUrl) {
         Write-Host "Operator mode: open $($deployed.webUrl) from an allowed address ($($deployed.allowedIpRanges -replace ',', ', '))." -ForegroundColor Yellow
         Write-Host "When your IP address changes: pwsh ./scripts/allow-my-ip.ps1 -EnvironmentName $($deployed.environment)"
         Write-Host 'From any other address, connect to the cluster and forward the web service:'
@@ -827,7 +964,7 @@ if ($deployed.portForward) {
     Write-Host '    kubelogin convert-kubeconfig --login azurecli'
     Write-Host "    $($deployed.portForward)"
     Write-Host 'then open http://localhost:8080. Everyone who reaches the app acts as the operator.' -ForegroundColor Yellow
-} elseif ($deployed.webUrl) { Write-Host "Open the app: $($deployed.webUrl)" -ForegroundColor Green }
+} elseif ($deployed.webUrl -and $deployed.ingressVisibility -ne 'private') { Write-Host "Open the app: $($deployed.webUrl)" -ForegroundColor Green }
 if ($kubernetesToolsPathHint) {
     Write-Host ''
     Write-Host $kubernetesToolsPathHint -ForegroundColor Yellow

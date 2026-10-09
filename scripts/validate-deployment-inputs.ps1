@@ -86,6 +86,43 @@ foreach ($subnet in @($nodes, $endpoints)) {
     }
 }
 if (Test-Overlap $nodes $endpoints) { throw 'AKS node and private-endpoint subnets must not overlap.' }
+
+# Exact, lowercase: the same comparison Terraform, the API and the manifests make.
+$ingressVisibility = Get-Setting 'APP_INGRESS_VISIBILITY' 'private'
+if ($ingressVisibility -cnotin @('private', 'public')) { throw 'APP_INGRESS_VISIBILITY must be private or public (lowercase).' }
+$privateIngress = $ingressVisibility -ceq 'private'
+$privateLinkSetting = Get-Setting 'APP_PRIVATE_LINK_ENABLED' 'true'
+if ($privateLinkSetting -cnotin @('true', 'false')) { throw 'APP_PRIVATE_LINK_ENABLED must be true or false (lowercase).' }
+$privateLinkEnabled = $privateIngress -and $privateLinkSetting -ceq 'true'
+$ingressPrivateIp = ''
+if ($privateIngress) {
+    # A private ingress adds a subnet for the internal load balancer and, with the Private Link Service, one for its NAT addresses.
+    $ingressSubnet = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_INGRESS_SUBNET_PREFIX' '10.42.1.32/27'))
+    $privateLinkSubnet = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_PRIVATE_LINK_SUBNET_PREFIX' '10.42.1.64/27'))
+    $additional = @(@{ Name = 'APP_INGRESS_SUBNET_PREFIX'; Value = $ingressSubnet })
+    if ($privateLinkEnabled) { $additional += @{ Name = 'APP_PRIVATE_LINK_SUBNET_PREFIX'; Value = $privateLinkSubnet } }
+    foreach ($subnet in $additional) {
+        $block = $subnet.Value
+        if ($block.BaseAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+            -not $vnet.Contains($block.BaseAddress) -or $block.PrefixLength -lt $vnet.PrefixLength -or $block.PrefixLength -gt 28) {
+            throw "$($subnet.Name) must be IPv4, within the VNet, and /28 or larger."
+        }
+        foreach ($other in @($nodes, $endpoints)) {
+            if (Test-Overlap $block $other) { throw "$($subnet.Name) must not overlap the AKS node or private-endpoint subnets." }
+        }
+    }
+    if ($privateLinkEnabled -and (Test-Overlap $ingressSubnet $privateLinkSubnet)) { throw 'APP_INGRESS_SUBNET_PREFIX and APP_PRIVATE_LINK_SUBNET_PREFIX must not overlap.' }
+    # Azure reserves the first four addresses of a subnet; the internal load balancer takes the fifth.
+    $addressBytes = $ingressSubnet.BaseAddress.GetAddressBytes()
+    $addressBytes[3] += 4
+    $ingressPrivateIp = ([System.Net.IPAddress]::new($addressBytes)).ToString()
+}
+$allowedSubscriptions = @("$(Get-Setting 'APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS')" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+foreach ($subscription in $allowedSubscriptions) {
+    if ($subscription -cnotmatch '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') {
+        throw "APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS must list subscription IDs (GUIDs) separated by commas; '$subscription' is not one."
+    }
+}
 $pods = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_AKS_POD_CIDR' '10.244.0.0/16'))
 $services = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_AKS_SERVICE_CIDR' '10.0.0.0/16'))
 foreach ($range in @(@{ Name = 'APP_AKS_POD_CIDR'; Value = $pods }, @{ Name = 'APP_AKS_SERVICE_CIDR'; Value = $services })) {
@@ -109,9 +146,14 @@ foreach ($name in @('APP_AKS_SYSTEM_VM_SIZE', 'APP_AKS_USER_VM_SIZE')) {
         throw "$name must be a VM size with a local temp disk for the ephemeral OS disk, for example Standard_D4ds_v5."
     }
 }
-if ((Get-Setting 'APP_TLS_CLUSTER_ISSUER' 'letsencrypt') -cnotin @('letsencrypt', 'letsencrypt-staging')) {
-    throw 'APP_TLS_CLUSTER_ISSUER must be letsencrypt or letsencrypt-staging.'
+$tlsIssuer = Get-Setting 'APP_TLS_CLUSTER_ISSUER'
+if ($tlsIssuer -cnotin @('', 'letsencrypt', 'letsencrypt-staging', 'private-ca', 'byo')) {
+    throw 'APP_TLS_CLUSTER_ISSUER must be letsencrypt, letsencrypt-staging, private-ca or byo.'
 }
+if ($privateIngress -and $tlsIssuer -cin @('letsencrypt', 'letsencrypt-staging')) {
+    throw 'APP_TLS_CLUSTER_ISSUER cannot be letsencrypt or letsencrypt-staging for a private ingress: Let''s Encrypt validates the host over the public internet. Use private-ca or byo, clear the setting, or set APP_INGRESS_VISIBILITY=public.'
+}
+if (-not $tlsIssuer) { $tlsIssuer = if ($privateIngress) { 'private-ca' } else { 'letsencrypt' } }
 $label = Get-Setting 'APP_INGRESS_DNS_LABEL'
 if ($label -and $label -cnotmatch '^[a-z][a-z0-9-]{1,61}[a-z0-9]$') { throw 'APP_INGRESS_DNS_LABEL must be 3-63 lowercase letters, digits or hyphens and start with a letter.' }
 $domain = Get-Setting 'APP_CUSTOM_DOMAIN'
@@ -155,6 +197,9 @@ if ($null -eq $authMode) { $authMode = '' }
 if ($authMode -cnotin @('', 'entra', 'operator')) { throw 'MEGHKOSHA_AUTH_MODE must be entra or operator (lowercase, no spaces).' }
 if ($authMode -ceq 'operator') { Assert-Identifier 'MEGHKOSHA_OPERATOR_OBJECT_ID' }
 $webAllowedIpRanges = ConvertTo-IpAllowList 'APP_WEB_ALLOWED_IP_RANGES' ([Environment]::GetEnvironmentVariable('APP_WEB_ALLOWED_IP_RANGES', 'Process'))
+if ($privateIngress -and $webAllowedIpRanges.Count) {
+    throw 'APP_WEB_ALLOWED_IP_RANGES limits who can reach a public ingress; the private ingress has no public address. Clear it, or set APP_INGRESS_VISIBILITY=public.'
+}
 if ($Operation -eq 'Deploy' -and (Get-Setting 'AZURE_AKS_CLUSTER_NAME') -cnotmatch '^aks-[a-f0-9]{13}$') {
     throw 'Deploy requires the provisioned AKS cluster (run azd provision first).'
 }
@@ -217,7 +262,11 @@ if ($chatRuntime -and ($profile -ne 'ai' -or -not (Get-BooleanSetting 'APP_AI_VA
     aiRuntimeEnabled = $aiRuntime
     chatRuntimeEnabled = $chatRuntime
     nativeExportNetworkException = $trustedExports
-    tlsIssuer = Get-Setting 'APP_TLS_CLUSTER_ISSUER' 'letsencrypt'
+    tlsIssuer = $tlsIssuer
+    ingressVisibility = $ingressVisibility
+    ingressPrivateIp = $ingressPrivateIp
+    privateLinkEnabled = $privateLinkEnabled
+    privateLinkAllowedSubscriptions = @($allowedSubscriptions)
     customDomain = $domain
     cloudPreflightStillRequired = $true
 } | ConvertTo-Json -Compress

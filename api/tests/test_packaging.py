@@ -11,7 +11,7 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-TERRAFORM_ROOTS = ("infra", "infra/export-access", "infra/model-router")
+TERRAFORM_ROOTS = ("infra", "infra/export-access", "infra/model-router", "infra/test-jumpbox")
 
 
 @pytest.fixture(autouse=True)
@@ -148,7 +148,9 @@ def test_each_profile_defaults_to_no_processor_ai_runtime_or_export_exception(pr
     settings = json.loads(result.stdout)
     assert settings["profile"] == profile
     assert settings["hosting"] == "aks"
-    assert settings["tlsIssuer"] == "letsencrypt"
+    # The app is private by default, so its certificate comes from the cluster's own CA and it has a private address.
+    assert settings["ingressVisibility"] == "private" and settings["tlsIssuer"] == "private-ca"
+    assert settings["ingressPrivateIp"] == "10.42.1.36" and settings["privateLinkEnabled"] is True
     assert not settings["signInConfigured"]
     assert settings["authMode"] == "entra"
     assert not settings["processorEnabled"]
@@ -176,6 +178,17 @@ def test_azure_operations_are_blocked_without_explicit_approval(operation):
     ({"APP_AKS_SKU_TIER": "Basic"}, "APP_AKS_SKU_TIER must be"),
     ({"APP_AKS_USER_VM_SIZE": "Standard_D4s_v5"}, "local temp disk"),
     ({"APP_TLS_CLUSTER_ISSUER": "self-signed"}, "APP_TLS_CLUSTER_ISSUER must be"),
+    ({"APP_TLS_CLUSTER_ISSUER": "letsencrypt"}, "cannot be letsencrypt or letsencrypt-staging for a private ingress"),
+    ({"APP_TLS_CLUSTER_ISSUER": "letsencrypt-staging", "APP_INGRESS_VISIBILITY": "private"}, "cannot be letsencrypt or letsencrypt-staging for a private ingress"),
+    ({"APP_INGRESS_VISIBILITY": "Private"}, "APP_INGRESS_VISIBILITY must be private or public"),
+    ({"APP_INGRESS_VISIBILITY": "internal"}, "APP_INGRESS_VISIBILITY must be private or public"),
+    ({"APP_WEB_ALLOWED_IP_RANGES": "203.0.113.7"}, "limits who can reach a public ingress"),
+    ({"APP_PRIVATE_LINK_ENABLED": "yes"}, "APP_PRIVATE_LINK_ENABLED must be true or false"),
+    ({"APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS": "not-a-subscription"}, "APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS must list subscription IDs"),
+    ({"APP_INGRESS_SUBNET_PREFIX": "10.99.0.0/28"}, "APP_INGRESS_SUBNET_PREFIX must be IPv4, within the VNet, and /28 or larger"),
+    ({"APP_INGRESS_SUBNET_PREFIX": "10.42.1.32/29"}, "APP_INGRESS_SUBNET_PREFIX must be IPv4, within the VNet, and /28 or larger"),
+    ({"APP_INGRESS_SUBNET_PREFIX": "10.42.0.0/28"}, "must not overlap the AKS node or private-endpoint subnets"),
+    ({"APP_PRIVATE_LINK_SUBNET_PREFIX": "10.42.1.32/28"}, "must not overlap"),
     ({"APP_INGRESS_DNS_LABEL": "9lives"}, "APP_INGRESS_DNS_LABEL must be"),
     ({"APP_CUSTOM_DOMAIN": "not a domain"}, "APP_CUSTOM_DOMAIN must be"),
     ({"APP_ACME_EMAIL": "ops"}, "APP_ACME_EMAIL must be"),
@@ -223,7 +236,7 @@ def test_operator_mode_needs_an_operator_but_no_sign_in_registrations():
 
 
 def test_an_ip_allow_list_accepts_addresses_and_narrow_networks():
-    result = run_input_validation({"APP_WEB_ALLOWED_IP_RANGES": " 203.0.113.7 ,198.51.100.0/24,203.0.113.7/32"})
+    result = run_input_validation({"APP_INGRESS_VISIBILITY": "public", "APP_WEB_ALLOWED_IP_RANGES": " 203.0.113.7 ,198.51.100.0/24,203.0.113.7/32"})
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["webAllowedIpRanges"] == ["203.0.113.7/32", "198.51.100.0/24"]
 
@@ -364,6 +377,42 @@ def test_end_to_end_helper_deploys_once_retries_and_never_hides_a_question():
     assert summary["kubernetesToolsPathExplained"]
     assert summary["operatorModeSkipsSignInAndPublicUrl"] and summary["allowListOpensPublicUrl"]
     assert summary["cloudShellSkipsBlockedHealthCheck"]
+    assert summary["privateIngressIsTheDefault"] and summary["publicAddressNeverSwitchedSilently"]
+
+
+def test_test_jumpbox_script_builds_the_customer_path_in_a_network_of_its_own():
+    summary = run_powershell_harness("test-jumpbox.ps1")
+    assert summary == {"result": "passed", "refusesWhatCannotWork": True, "exportsTheCaWithoutKeys": True,
+                       "usesItsOwnState": True, "cleansUp": True, "destroysOnlyWhatItBuilt": True}
+
+
+def test_the_test_jumpbox_is_not_part_of_the_generic_deployment():
+    # The jump box is for testing a private deployment. Nothing the generic flow runs may depend on it.
+    for path in (PROJECT_ROOT / "azure.yaml", PROJECT_ROOT / "scripts" / "aks-bootstrap.ps1", PROJECT_ROOT / "scripts" / "deploy-ai.ps1"):
+        assert "jumpbox" not in path.read_text().lower(), path.name
+    deploy = (PROJECT_ROOT / "scripts" / "deploy-end-to-end.ps1").read_text()
+    # It may point at the test script, never run it.
+    assert not re.search(r"^\s*&\s.*test-jumpbox|^\s*(Invoke-|\.\s).*test-jumpbox", deploy, re.M)
+    assert all(line.lstrip().startswith("Write-Host") for line in deploy.splitlines() if "test-jumpbox" in line)
+    for path in (PROJECT_ROOT / "infra").glob("*.tf"):
+        code = [line for line in path.read_text().splitlines() if not line.lstrip().startswith("#")]
+        assert not any("test-jumpbox" in line for line in code), path.name
+    root = (PROJECT_ROOT / "infra" / "test-jumpbox" / "main.tf").read_text()
+    assert 'resource "azurerm_bastion_host"' in root and 'resource "azurerm_private_endpoint"' in root
+    assert "public_ip_address_id" in root and root.count("public_ip_address_id") == 1, "only Bastion has a public address"
+
+
+def test_the_ingress_is_private_unless_public_is_asked_for():
+    variables = (PROJECT_ROOT / "infra" / "variables.tf").read_text()
+    block = re.search(r'variable "ingress_visibility" \{(.*?)\n\}', variables, re.S).group(1)
+    assert 'default     = "private"' in block
+    tfvars = (PROJECT_ROOT / "infra" / "main.tfvars.json").read_text()
+    assert '"ingress_visibility": "${APP_INGRESS_VISIBILITY=private}"' in tfvars
+    # The one thing a private ingress must never have is a public address.
+    network = (PROJECT_ROOT / "infra" / "network.tf").read_text()
+    assert re.search(r'resource "azurerm_public_ip" "ingress" \{\n  count\s+= local\.public_ingress \? 1 : 0', network)
+    assert "from = azurerm_public_ip.ingress\n  to   = azurerm_public_ip.ingress[0]" in network, "environments created before the private ingress keep their address"
+    assert 'name                       = "DenyInternetInbound"' in network
 
 
 def test_allow_my_ip_keeps_the_allow_list_current_without_a_redeploy():
@@ -450,7 +499,7 @@ def terraform_roots(tmp_path_factory):
     for root in TERRAFORM_ROOTS:
         workspace = tmp_path_factory.mktemp(root.replace("/", "-"))
         copy = workspace / "module"
-        shutil.copytree(PROJECT_ROOT / root, copy, ignore=shutil.ignore_patterns(".terraform", "*.tfstate*", "export-access", "model-router", "k8s"))
+        shutil.copytree(PROJECT_ROOT / root, copy, ignore=shutil.ignore_patterns(".terraform", "*.tfstate*", "export-access", "model-router", "test-jumpbox", "k8s"))
         environment = _terraform_environment(workspace / "data")
         result = subprocess.run([terraform, f"-chdir={copy}", "init", "-backend=false", "-no-color"],
                                 env=environment, capture_output=True, text=True, timeout=600)
@@ -514,7 +563,10 @@ def test_azd_parameter_file_maps_every_terraform_variable_from_the_environment()
     assert defaults["processor_schedule"] == "*/5 * * * *"
     assert defaults["aks_zones"] == "1,2,3" and defaults["aks_sku_tier"] == "Standard"
     assert defaults["aks_system_vm_size"] == "Standard_D2ds_v5" and defaults["aks_user_vm_size"] == "Standard_D4ds_v5"
-    assert defaults["tls_cluster_issuer"] == "letsencrypt"
+    # Private by default; the certificate source is chosen from the visibility when it is left empty.
+    assert defaults["tls_cluster_issuer"] == "" and defaults["ingress_visibility"] == "private"
+    assert defaults["ingress_subnet_prefix"] == "10.42.1.32/27" and defaults["private_link_subnet_prefix"] == "10.42.1.64/27"
+    assert defaults["private_link_enabled"] == "true" and defaults["private_link_allowed_subscriptions"] == ""
     assert defaults["auth_mode"] == "" and defaults["web_allowed_ip_ranges"] == ""
     assert '"auth_mode": "${MEGHKOSHA_AUTH_MODE}"' in template and '"web_allowed_ip_ranges": "${APP_WEB_ALLOWED_IP_RANGES}"' in template
     assert '"principal_id": "${AZURE_PRINCIPAL_ID}"' in template
@@ -563,7 +615,8 @@ run "azd_strings_convert_to_the_declared_types" {
       output.APP_PROFILE == "ai" && output.APP_PROVISIONED_PROFILE == "ai" &&
       output.FOUNDRY_CHAT_ENABLED == "true" && output.MEGHKOSHA_AI_ENABLED == "false" &&
       output.APP_PROCESSOR_DEPLOYED == "true" && output.APP_PROCESSOR_CRON == "*/5 * * * *" &&
-      output.AZURE_AKS_NAMESPACE == "cloudlens" && output.APP_TLS_CLUSTER_ISSUER == "letsencrypt"
+      output.AZURE_AKS_NAMESPACE == "cloudlens" && output.APP_TLS_CLUSTER_ISSUER == "private-ca" &&
+      output.APP_INGRESS_VISIBILITY == "private" && output.APP_INGRESS_PUBLIC_IP == "" && output.APP_WEB_INGRESS_RESTRICTED == "true"
     )
     error_message = "The recommended settings must produce the outputs the manifests read."
   }
@@ -603,6 +656,9 @@ SAFE_TEMPLATE_ACTIONS = (
     r'\{\{ if eq \(index \.Env "[A-Z0-9_]+"\) "true" \}\}false\{\{ else \}\}true\{\{ end \}\}',
     r'\{\{ if and \(eq \(index \.Env "[A-Z0-9_]+"\) "[a-z]+"\) \(ne \(index \.Env "[A-Z0-9_]+"\) "true"\) \}\}'
     r'"[^"{}]+"\{\{ else \}\}"[^"{}]+"\{\{ end \}\}',
+    # The certificate annotation is left out when the operator brings their own certificate. The lookup inside it is
+    # stripped by the first pattern, so only the frame is left to match.
+    r'\{\{ if ne \(index \.Env "[A-Z0-9_]+"\) "[a-z]+" \}\}cert-manager\.io/cluster-issuer: \{\{ end \}\}',
 )
 
 
@@ -631,7 +687,12 @@ def test_every_value_read_by_the_manifests_and_hook_is_provided():
             read |= set(re.findall(r'index \.Env "([A-Z0-9_]+)"', action))
     read |= set(re.findall(r"\$\{([A-Z0-9_]+)\}", (PROJECT_ROOT / "infra" / "k8s" / "cluster-bootstrap.yaml").read_text()))
     read |= set(re.findall(r"Get-Setting '([A-Z0-9_]+)'", (PROJECT_ROOT / "scripts" / "aks-bootstrap.ps1").read_text()))
-    missing = read - outputs - produced_by_azd - set_by_operator
+    # Switches the hook itself derives from the outputs, so each template line follows its front end.
+    hook_source = (PROJECT_ROOT / "scripts" / "aks-bootstrap.ps1").read_text()
+    derived_by_hook = {"INGRESS_PUBLIC_IP_RESOURCE_GROUP", "INGRESS_INTERNAL", "INGRESS_PRIVATE_LINK_CREATE"}
+    for name in derived_by_hook:
+        assert f"$values.{name} = " in hook_source, f"{name} must be derived in aks-bootstrap.ps1"
+    missing = read - outputs - produced_by_azd - set_by_operator - derived_by_hook
     assert not missing, f"Values nothing provides: {sorted(missing)}"
     deploy_script = (PROJECT_ROOT / "scripts" / "deploy-end-to-end.ps1").read_text()
     for name in set(re.findall(r"Get-AzdValue '([A-Z0-9_]+)'", deploy_script)) - produced_by_azd - set_by_operator:
@@ -743,7 +804,8 @@ def test_only_the_web_pods_reach_the_api_and_tls_comes_from_cert_manager():
     assert "pod-security.kubernetes.io/warn: restricted" in namespace
     web = MANIFESTS["web"].read_text()
     assert "kind: Ingress" in web and "secretName: web-tls" in web
-    assert 'cert-manager.io/cluster-issuer: {{ index .Env "APP_TLS_CLUSTER_ISSUER" | printf "%q" }}' in web
+    assert ('{{ if ne (index .Env "APP_TLS_CLUSTER_ISSUER") "byo" }}cert-manager.io/cluster-issuer: '
+            '{{ index .Env "APP_TLS_CLUSTER_ISSUER" | printf "%q" }}{{ end }}') in web
     assert 'ingressClassName: {{ index .Env "APP_INGRESS_CLASS" | printf "%q" }}' in web
     assert web.count('{{ index .Env "APP_INGRESS_HOST" | printf "%q" }}') == 2
     assert "name: web-from-ingress" in web and "port: 8080" in web
@@ -751,7 +813,20 @@ def test_only_the_web_pods_reach_the_api_and_tls_comes_from_cert_manager():
     bootstrap = (PROJECT_ROOT / "infra" / "k8s" / "cluster-bootstrap.yaml").read_text()
     assert "kind: NginxIngressController" in bootstrap
     assert 'service.beta.kubernetes.io/azure-pip-name: "${APP_INGRESS_PUBLIC_IP_NAME}"' in bootstrap
-    assert bootstrap.count("kind: ClusterIssuer") == 2 and bootstrap.count("http01:") == 2
+    # Let's Encrypt (public ingress) and the cluster's own CA (private ingress): two ACME issuers, a bootstrap issuer and the CA issuer.
+    assert len(re.findall(r"^kind: ClusterIssuer", bootstrap, re.M)) == 4 and bootstrap.count("http01:") == 2
+    for name in ("letsencrypt", "letsencrypt-staging", "cloudlens-selfsigned", "private-ca"):
+        assert f"  name: {name}\n" in bootstrap
+    assert "isCA: true" in bootstrap and "secretName: cloudlens-private-ca" in bootstrap and "selfSigned: {}" in bootstrap
+    # One template serves both front ends: lines whose value is empty are dropped, so exactly one set of annotations remains.
+    for annotation, placeholder in (
+        ("azure-load-balancer-internal", "INGRESS_INTERNAL"), ("azure-load-balancer-internal-subnet", "APP_INGRESS_SUBNET_NAME"),
+        ("azure-load-balancer-ipv4", "APP_INGRESS_PRIVATE_IP"), ("azure-pls-create", "INGRESS_PRIVATE_LINK_CREATE"),
+        ("azure-pls-name", "APP_PRIVATE_LINK_NAME"), ("azure-pls-ip-configuration-subnet", "APP_PRIVATE_LINK_SUBNET_NAME"),
+        ("azure-pls-visibility", "APP_PRIVATE_LINK_SUBSCRIPTIONS"), ("azure-pls-auto-approval", "APP_PRIVATE_LINK_SUBSCRIPTIONS"),
+        ("azure-load-balancer-resource-group", "INGRESS_PUBLIC_IP_RESOURCE_GROUP"),
+    ):
+        assert f'service.beta.kubernetes.io/{annotation}: "${{{placeholder}}}"' in bootstrap, annotation
     hook = (PROJECT_ROOT / "scripts" / "aks-bootstrap.ps1").read_text()
     assert re.search(r"\$CertManagerVersion = 'v\d+\.\d+\.\d+'", hook)
     assert re.search(r"\$CertManagerSha256 = '[a-f0-9]{64}'", hook)
@@ -781,7 +856,7 @@ def test_operator_mode_closes_the_public_ingress_with_the_setting_the_api_reads(
     assert (operator_identity.AUTH_MODE_SETTING, operator_identity.OPERATOR_MODE) == ("MEGHKOSHA_AUTH_MODE", "operator")
     # Only Terraform reports the restriction, after it has applied the NSG rule.
     assert "APP_WEB_INGRESS_RESTRICTED" in _terraform_outputs()
-    assert 'output "APP_WEB_INGRESS_RESTRICTED" {\n  value = tostring(length(local.web_allowed_ip_ranges) > 0)\n}' in (
+    assert 'output "APP_WEB_INGRESS_RESTRICTED" {\n  value = tostring(local.private_ingress || length(local.web_allowed_ip_ranges) > 0)\n}' in (
         PROJECT_ROOT / "infra" / "outputs.tf").read_text()
 
 

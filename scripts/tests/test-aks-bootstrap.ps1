@@ -108,6 +108,11 @@ $environment = @{
     APP_INGRESS_CLASS = 'cloudlens-nginx'
     APP_INGRESS_PUBLIC_IP_NAME = 'pip-ingress-0123456789abc'
     APP_INGRESS_PUBLIC_IP = '20.0.0.10'
+    APP_INGRESS_SUBNET_NAME = ''
+    APP_INGRESS_PRIVATE_IP = ''
+    APP_PRIVATE_LINK_NAME = ''
+    APP_PRIVATE_LINK_SUBNET_NAME = ''
+    APP_PRIVATE_LINK_SUBSCRIPTIONS = ''
     APP_ACME_EMAIL = ''
 }
 $saved = @{}
@@ -128,6 +133,73 @@ try {
     }
     if ($plan.manifest -match 'email:' -or $plan.manifest -match '\$\{') { throw 'An empty optional email must drop its line and no placeholder may remain.' }
     if ($global:bootstrapTestState.calls.Count) { throw '-PlanOnly must not touch Azure or the cluster.' }
+    # The public front end carries none of the private ingress's annotations, but the cluster always gets its private CA.
+    if ($plan.manifest -match 'azure-load-balancer-internal' -or $plan.manifest -match 'azure-pls-' -or $plan.manifest -match 'azure-load-balancer-ipv4') {
+        throw 'A public ingress must not carry internal load balancer or Private Link annotations.'
+    }
+    foreach ($expected in @('name: cloudlens-selfsigned', 'selfSigned: {}', 'name: cloudlens-private-ca', 'isCA: true', 'name: private-ca', 'secretName: cloudlens-private-ca')) {
+        if (-not $plan.manifest.Contains($expected)) { throw "The private CA is missing from the manifest: $expected" }
+    }
+
+    # Private ingress: an internal load balancer at the reserved address, published through the Private Link Service.
+    # The public IP lines disappear, and every value reaches the manifest exactly.
+    $env:APP_INGRESS_PUBLIC_IP_NAME = ''
+    $env:APP_INGRESS_PUBLIC_IP = ''
+    $env:APP_INGRESS_SUBNET_NAME = 'ingress'
+    $env:APP_INGRESS_PRIVATE_IP = '10.42.1.36'
+    $env:APP_PRIVATE_LINK_NAME = 'pls-cloudlens-0123456789abc'
+    $env:APP_PRIVATE_LINK_SUBNET_NAME = 'private-link'
+    $env:APP_PRIVATE_LINK_SUBSCRIPTIONS = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+    $plan = & $script -PlanOnly | ConvertFrom-Json
+    foreach ($expected in @('service.beta.kubernetes.io/azure-load-balancer-internal: "true"', 'service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "ingress"',
+            'service.beta.kubernetes.io/azure-load-balancer-ipv4: "10.42.1.36"', 'service.beta.kubernetes.io/azure-pls-create: "true"',
+            'service.beta.kubernetes.io/azure-pls-name: "pls-cloudlens-0123456789abc"', 'service.beta.kubernetes.io/azure-pls-ip-configuration-subnet: "private-link"',
+            'service.beta.kubernetes.io/azure-pls-visibility: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"',
+            'service.beta.kubernetes.io/azure-pls-auto-approval: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"', 'name: private-ca')) {
+        if (-not $plan.manifest.Contains($expected)) { throw "The private ingress manifest is missing: $expected" }
+    }
+    if ($plan.manifest -match 'azure-pip-name' -or $plan.manifest -match 'azure-load-balancer-resource-group' -or $plan.manifest -match '\$\{') {
+        throw 'A private ingress must not name a public IP, and no placeholder may remain.'
+    }
+
+    # Without the Private Link Service only the internal load balancer remains.
+    $env:APP_PRIVATE_LINK_NAME = ''
+    $env:APP_PRIVATE_LINK_SUBNET_NAME = ''
+    $env:APP_PRIVATE_LINK_SUBSCRIPTIONS = ''
+    $plan = & $script -PlanOnly | ConvertFrom-Json
+    if ($plan.manifest -match 'azure-pls-' -or -not $plan.manifest.Contains('azure-load-balancer-internal: "true"') -or -not $plan.manifest.Contains('azure-load-balancer-ipv4: "10.42.1.36"')) {
+        throw 'Without a Private Link Service the manifest must keep only the internal load balancer.'
+    }
+
+    # An environment that names both front ends, neither, or a private ingress without its subnet is refused before anything is applied.
+    $env:APP_INGRESS_PUBLIC_IP_NAME = 'pip-ingress-0123456789abc'
+    $refused = $null
+    try { & $script -PlanOnly | Out-Null } catch { $refused = $_.Exception.Message }
+    if ($refused -notmatch 'either a public ingress IP') { throw "Both front ends must be refused; got: $refused" }
+    $env:APP_INGRESS_PUBLIC_IP_NAME = ''
+    $env:APP_INGRESS_PRIVATE_IP = ''
+    $refused = $null
+    try { & $script -PlanOnly | Out-Null } catch { $refused = $_.Exception.Message }
+    if ($refused -notmatch 'either a public ingress IP') { throw "Neither front end must be refused; got: $refused" }
+    $env:APP_INGRESS_PRIVATE_IP = '10.42.1.36'
+    $env:APP_INGRESS_SUBNET_NAME = ''
+    $refused = $null
+    try { & $script -PlanOnly | Out-Null } catch { $refused = $_.Exception.Message }
+    if ($refused -notmatch 'APP_INGRESS_SUBNET_NAME') { throw "A private ingress without its subnet must be refused; got: $refused" }
+    $env:APP_PRIVATE_LINK_NAME = 'pls-cloudlens-0123456789abc'
+    $env:APP_INGRESS_SUBNET_NAME = 'ingress'
+    $refused = $null
+    try { & $script -PlanOnly | Out-Null } catch { $refused = $_.Exception.Message }
+    if ($refused -notmatch 'APP_PRIVATE_LINK_SUBNET_NAME') { throw "A Private Link Service without its subnet must be refused; got: $refused" }
+
+    # Back to the public front end for the rest of the scenarios.
+    $env:APP_INGRESS_PUBLIC_IP_NAME = 'pip-ingress-0123456789abc'
+    $env:APP_INGRESS_PUBLIC_IP = '20.0.0.10'
+    $env:APP_INGRESS_SUBNET_NAME = ''
+    $env:APP_INGRESS_PRIVATE_IP = ''
+    $env:APP_PRIVATE_LINK_NAME = ''
+    $env:APP_PRIVATE_LINK_SUBNET_NAME = ''
+    $env:APP_PRIVATE_LINK_SUBSCRIPTIONS = ''
 
     $env:APP_ACME_EMAIL = 'ops@contoso.example'
     $plan = & $script -PlanOnly | ConvertFrom-Json

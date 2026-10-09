@@ -227,7 +227,7 @@ variable "auth_mode" {
 }
 
 variable "web_allowed_ip_ranges" {
-  description = "Optional comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) that may reach the app over HTTPS. Empty allows the internet, except in operator mode, where HTTPS then stays closed."
+  description = "Optional comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) that may reach a public ingress over HTTPS. Empty allows the internet, except in operator mode, where HTTPS then stays closed. A private ingress has no public address, so it takes none."
   type        = string
   default     = ""
 
@@ -238,6 +238,11 @@ variable "web_allowed_ip_ranges" {
       try(cidrhost(strcontains(range, "/") ? range : "${range}/32", 0) == split("/", range)[0], false)
     ])
     error_message = "web_allowed_ip_ranges must list IPv4 addresses or CIDR ranges from /8 to /32 written with their network address, for example 203.0.113.7 or 198.51.100.0/24."
+  }
+
+  validation {
+    condition     = var.ingress_visibility == "public" || trimspace(var.web_allowed_ip_ranges) == ""
+    error_message = "web_allowed_ip_ranges limits who can reach a public ingress; the private ingress has no public address. Clear APP_WEB_ALLOWED_IP_RANGES, or keep the internet-facing ingress with APP_INGRESS_VISIBILITY=public."
   }
 }
 
@@ -297,7 +302,7 @@ variable "aks_maintenance_start_time" {
 }
 
 variable "ingress_dns_label" {
-  description = "DNS label for <label>.<region>.cloudapp.azure.com. Defaults to cloudlens-<resource token>."
+  description = "Public ingress only: the DNS label in <label>.<region>.cloudapp.azure.com. Defaults to cloudlens-<resource token>, which also names the private host when no custom_domain is set."
   type        = string
   default     = ""
 
@@ -307,8 +312,61 @@ variable "ingress_dns_label" {
   }
 }
 
+variable "ingress_visibility" {
+  description = "private (default): the app has no public address. It is served from a private IP in the virtual network and, optionally, through a Private Link Service that private endpoints in other networks connect to. public: an internet-facing address."
+  type        = string
+  default     = "private"
+
+  validation {
+    condition     = contains(["private", "public"], var.ingress_visibility)
+    error_message = "ingress_visibility (APP_INGRESS_VISIBILITY) must be private or public, lowercase."
+  }
+}
+
+variable "ingress_subnet_prefix" {
+  description = "Private ingress: subnet that holds the internal load balancer's address (its fifth address, the first Azure leaves usable). Inside the virtual network, /28 or larger."
+  type        = string
+  default     = "10.42.1.32/27"
+
+  validation {
+    condition     = can(cidrnetmask(var.ingress_subnet_prefix)) && tonumber(split("/", var.ingress_subnet_prefix)[1]) <= 28
+    error_message = "ingress_subnet_prefix must be an IPv4 CIDR block of /28 or larger."
+  }
+}
+
+variable "private_link_subnet_prefix" {
+  description = "Private ingress: subnet for the Private Link Service's NAT addresses (Azure requires its Private Link service network policies to be off). Inside the virtual network, /28 or larger."
+  type        = string
+  default     = "10.42.1.64/27"
+
+  validation {
+    condition     = can(cidrnetmask(var.private_link_subnet_prefix)) && tonumber(split("/", var.private_link_subnet_prefix)[1]) <= 28
+    error_message = "private_link_subnet_prefix must be an IPv4 CIDR block of /28 or larger."
+  }
+}
+
+variable "private_link_enabled" {
+  description = "Private ingress: publish the app through a Private Link Service, so a private endpoint in any virtual network (peered or not) can reach it. Off keeps only the private IP, reachable from this network and anything peered or connected to it."
+  type        = bool
+  default     = true
+}
+
+variable "private_link_allowed_subscriptions" {
+  description = "Comma-separated subscription IDs, besides the deployment subscription, whose private endpoints may connect to the Private Link Service without manual approval."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = alltrue([
+      for id in compact([for item in split(",", var.private_link_allowed_subscriptions) : trimspace(item)]) :
+      can(regex("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$", id))
+    ])
+    error_message = "private_link_allowed_subscriptions must be a comma-separated list of subscription IDs (GUIDs)."
+  }
+}
+
 variable "custom_domain" {
-  description = "Optional host name to serve instead of the Azure-provided name. Point a CNAME at the cloudapp.azure.com name first."
+  description = "Optional host name for the app. Public ingress: point a CNAME at the cloudapp.azure.com name first. Private ingress: a private DNS zone of this name, pointing at the private IP, is created for the virtual network; without one the host is <ingress label>.internal."
   type        = string
   default     = ""
 
@@ -319,13 +377,18 @@ variable "custom_domain" {
 }
 
 variable "tls_cluster_issuer" {
-  description = "cert-manager ClusterIssuer for the web certificate. letsencrypt-staging avoids production rate limits while testing."
+  description = "Certificate source for the web host. Empty chooses by ingress_visibility: letsencrypt for public, private-ca for private. letsencrypt and letsencrypt-staging validate over the public internet, so they need a public ingress (staging avoids production rate limits). private-ca is a CA that cert-manager creates in the cluster; browsers must trust it. byo expects you to create the web-tls secret in the cloudlens namespace yourself, for example from your enterprise CA."
   type        = string
-  default     = "letsencrypt"
+  default     = ""
 
   validation {
-    condition     = contains(["letsencrypt", "letsencrypt-staging"], var.tls_cluster_issuer)
-    error_message = "tls_cluster_issuer must be letsencrypt or letsencrypt-staging."
+    condition     = contains(["", "letsencrypt", "letsencrypt-staging", "private-ca", "byo"], var.tls_cluster_issuer)
+    error_message = "tls_cluster_issuer must be letsencrypt, letsencrypt-staging, private-ca or byo; empty chooses by ingress visibility."
+  }
+
+  validation {
+    condition     = var.ingress_visibility == "public" || !contains(["letsencrypt", "letsencrypt-staging"], var.tls_cluster_issuer)
+    error_message = "Let's Encrypt validates the host over the public internet, which a private ingress does not accept. Use private-ca or byo, clear the setting (azd env set APP_TLS_CLUSTER_ISSUER \"\"), or keep the internet-facing ingress with APP_INGRESS_VISIBILITY=public."
   }
 }
 

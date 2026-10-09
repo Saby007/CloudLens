@@ -168,6 +168,10 @@ override_resource {
 
 variables {
   environment_name = "app-contract-test"
+
+  # The runs below that predate the private ingress describe the internet-facing one; the private_* runs override this.
+  # The default itself (private) is checked through azd's parameter file in api/tests/test_packaging.py.
+  ingress_visibility = "public"
 }
 
 run "core_profile_provisions_only_the_hardened_foundation" {
@@ -224,12 +228,21 @@ run "core_profile_provisions_only_the_hardened_foundation" {
       length(azurerm_network_security_group.aks_nodes.security_rule) == 2 &&
       alltrue([for rule in azurerm_network_security_group.aks_nodes.security_rule : (
         rule.direction == "Inbound" && rule.access == "Allow" && rule.protocol == "Tcp" &&
-        rule.source_address_prefix == "Internet" && rule.destination_address_prefix == azurerm_public_ip.ingress.ip_address
+        rule.source_address_prefix == "Internet" && rule.destination_address_prefix == azurerm_public_ip.ingress[0].ip_address
       )]) &&
       toset([for rule in azurerm_network_security_group.aks_nodes.security_rule : "${rule.name}:${rule.destination_port_range}"]) == toset(["AllowHttpToIngress:80", "AllowHttpsToIngress:443"]) &&
       output.APP_WEB_INGRESS_RESTRICTED == "false" && output.APP_INGRESS_NSG_NAME == azurerm_network_security_group.aks_nodes.name
     )
     error_message = "The node subnet's NSG must let the internet reach only the ingress IP, on HTTP and HTTPS."
+  }
+
+  assert {
+    condition = (
+      length(azurerm_subnet.ingress) == 0 && length(azurerm_subnet.private_link) == 0 && length(azurerm_private_dns_zone.ingress) == 0 &&
+      output.APP_INGRESS_VISIBILITY == "public" && output.APP_INGRESS_PRIVATE_IP == "" && output.APP_PRIVATE_LINK_NAME == "" &&
+      output.APP_PRIVATE_LINK_ID == "" && output.APP_INGRESS_SUBNET_NAME == ""
+    )
+    error_message = "A public ingress must create none of the private ingress's subnets, DNS zone or Private Link Service."
   }
 
   assert {
@@ -325,7 +338,7 @@ run "core_profile_provisions_only_the_hardened_foundation" {
   }
 
   assert {
-    condition     = azurerm_public_ip.ingress.sku == "Standard" && azurerm_public_ip.ingress.allocation_method == "Static" && startswith(azurerm_public_ip.ingress.domain_name_label, "cloudlens-")
+    condition     = azurerm_public_ip.ingress[0].sku == "Standard" && azurerm_public_ip.ingress[0].allocation_method == "Static" && startswith(azurerm_public_ip.ingress[0].domain_name_label, "cloudlens-")
     error_message = "The ingress must use a static Standard IP with a cloudlens- DNS label."
   }
 
@@ -557,8 +570,164 @@ run "custom_domain_and_zoneless_regions" {
   }
 
   assert {
-    condition     = length(azurerm_public_ip.ingress.zones) == 0 && length(azurerm_kubernetes_cluster.main.default_node_pool[0].zones) == 0 && length(azurerm_kubernetes_cluster_node_pool.apps.zones) == 0
+    condition     = length(azurerm_public_ip.ingress[0].zones) == 0 && length(azurerm_kubernetes_cluster.main.default_node_pool[0].zones) == 0 && length(azurerm_kubernetes_cluster_node_pool.apps.zones) == 0
     error_message = "aks_zones = none must drop zones everywhere."
+  }
+}
+
+run "private_ingress_has_no_public_address_and_opens_only_inside_the_network" {
+  command = apply
+
+  variables {
+    ingress_visibility = "private"
+  }
+
+  assert {
+    condition     = length(azurerm_public_ip.ingress) == 0
+    error_message = "A private ingress has no public IP."
+  }
+
+  assert {
+    condition = (
+      length(azurerm_network_security_group.aks_nodes.security_rule) == 1 &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).name == "DenyInternetInbound" &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).access == "Deny" &&
+      one(azurerm_network_security_group.aks_nodes.security_rule).source_address_prefix == "Internet"
+    )
+    error_message = "A private ingress needs no allow rule, only the explicit deny that also replaces a public environment's old rules."
+  }
+
+  assert {
+    condition     = output.APP_INGRESS_PUBLIC_IP == "" && output.APP_INGRESS_PUBLIC_IP_NAME == "" && output.APP_INGRESS_AZURE_FQDN == ""
+    error_message = "A private ingress reports no public address or name."
+  }
+
+  assert {
+    condition = (
+      azurerm_subnet.ingress[0].name == "ingress" && tolist(azurerm_subnet.ingress[0].address_prefixes) == tolist(["10.42.1.32/27"]) &&
+      azurerm_subnet.private_link[0].name == "private-link" && tolist(azurerm_subnet.private_link[0].address_prefixes) == tolist(["10.42.1.64/27"]) &&
+      azurerm_subnet.private_link[0].private_link_service_network_policies_enabled == false &&
+      azurerm_subnet.ingress[0].network_security_group_id_wo_version == 1 && azurerm_subnet.private_link[0].network_security_group_id_wo_version == 1 &&
+      length(azurerm_network_security_group.ingress[0].security_rule) == 0 && length(azurerm_network_security_group.private_link[0].security_rule) == 0
+    )
+    error_message = "The ingress and Private Link NAT subnets must exist with their own rule-free NSGs, the NAT subnet with Private Link service network policies off."
+  }
+
+  assert {
+    condition = (
+      output.APP_INGRESS_VISIBILITY == "private" && output.APP_INGRESS_PRIVATE_IP == "10.42.1.36" && output.APP_INGRESS_SUBNET_NAME == "ingress" &&
+      startswith(output.APP_INGRESS_HOST, "cloudlens-") && endswith(output.APP_INGRESS_HOST, ".internal") &&
+      output.APP_WEB_ORIGIN == "https://${output.APP_INGRESS_HOST}" &&
+      output.APP_TLS_CLUSTER_ISSUER == "private-ca" && output.APP_WEB_INGRESS_RESTRICTED == "true"
+    )
+    error_message = "A private ingress must report its private address, a .internal host, the private CA and a restricted ingress."
+  }
+
+  assert {
+    condition = (
+      startswith(output.APP_PRIVATE_LINK_NAME, "pls-cloudlens-") && output.APP_PRIVATE_LINK_SUBNET_NAME == "private-link" &&
+      output.APP_PRIVATE_LINK_SUBSCRIPTIONS == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" &&
+      output.APP_PRIVATE_LINK_ID == "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test-aks-nodes/providers/Microsoft.Network/privateLinkServices/${output.APP_PRIVATE_LINK_NAME}"
+    )
+    error_message = "The Private Link Service lives in the node resource group, named by annotation, visible to the deployment subscription."
+  }
+
+  assert {
+    condition = (
+      azurerm_private_dns_zone.ingress[0].name == output.APP_INGRESS_HOST &&
+      azurerm_private_dns_a_record.ingress[0].name == "@" && tolist(azurerm_private_dns_a_record.ingress[0].records) == tolist(["10.42.1.36"]) &&
+      azurerm_private_dns_zone_virtual_network_link.ingress[0].registration_enabled == false
+    )
+    error_message = "The host name must resolve to the internal load balancer address through a private DNS zone named after the host."
+  }
+}
+
+run "private_ingress_serves_a_custom_domain_and_other_subscriptions" {
+  command = apply
+
+  variables {
+    ingress_visibility                 = "private"
+    custom_domain                      = "CloudLens.Contoso.com"
+    tls_cluster_issuer                 = "byo"
+    private_link_allowed_subscriptions = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+    ingress_subnet_prefix              = "10.42.1.96/28"
+    private_link_subnet_prefix         = "10.42.1.112/28"
+  }
+
+  assert {
+    condition = (
+      output.APP_INGRESS_HOST == "cloudlens.contoso.com" && output.APP_WEB_ORIGIN == "https://cloudlens.contoso.com" &&
+      azurerm_private_dns_zone.ingress[0].name == "cloudlens.contoso.com" && output.APP_TLS_CLUSTER_ISSUER == "byo" &&
+      output.APP_INGRESS_PRIVATE_IP == "10.42.1.100"
+    )
+    error_message = "A custom domain must name the host and its private DNS zone, and the address must follow a moved ingress subnet."
+  }
+
+  assert {
+    condition     = output.APP_PRIVATE_LINK_SUBSCRIPTIONS == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    error_message = "The deployment subscription and each allowed subscription must appear once, lowercase, deployment first."
+  }
+}
+
+run "private_link_can_be_switched_off_leaving_only_the_private_address" {
+  command = apply
+
+  variables {
+    ingress_visibility   = "private"
+    private_link_enabled = false
+  }
+
+  assert {
+    condition = (
+      length(azurerm_subnet.private_link) == 0 && length(azurerm_network_security_group.private_link) == 0 &&
+      output.APP_PRIVATE_LINK_NAME == "" && output.APP_PRIVATE_LINK_ID == "" && output.APP_PRIVATE_LINK_SUBNET_NAME == "" &&
+      output.APP_PRIVATE_LINK_SUBSCRIPTIONS == "" && length(azurerm_subnet.ingress) == 1 && output.APP_INGRESS_PRIVATE_IP == "10.42.1.36"
+    )
+    error_message = "Without the Private Link Service only the internal address remains."
+  }
+}
+
+run "a_private_ingress_refuses_settings_that_only_work_in_public" {
+  command = plan
+
+  variables {
+    ingress_visibility    = "private"
+    tls_cluster_issuer    = "letsencrypt"
+    web_allowed_ip_ranges = "203.0.113.7"
+  }
+
+  expect_failures = [var.tls_cluster_issuer, var.web_allowed_ip_ranges]
+}
+
+run "private_ingress_settings_must_be_exact" {
+  command = plan
+
+  variables {
+    ingress_visibility                 = "Private"
+    ingress_subnet_prefix              = "10.42.1.32/29"
+    private_link_subnet_prefix         = "not-a-block"
+    private_link_allowed_subscriptions = "not-a-subscription"
+  }
+
+  expect_failures = [
+    var.ingress_visibility,
+    var.ingress_subnet_prefix,
+    var.private_link_subnet_prefix,
+    var.private_link_allowed_subscriptions,
+  ]
+}
+
+run "the_public_ingress_keeps_letsencrypt_and_a_private_one_cannot_use_it" {
+  command = plan
+
+  variables {
+    ingress_visibility = "public"
+    tls_cluster_issuer = "private-ca"
+  }
+
+  assert {
+    condition     = output.APP_TLS_CLUSTER_ISSUER == "private-ca"
+    error_message = "A public ingress may still choose the private CA or bring its own certificate."
   }
 }
 

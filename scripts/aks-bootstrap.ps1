@@ -1,15 +1,18 @@
 <#
 .SYNOPSIS
-    Prepares the AKS cluster after `azd provision`: cert-manager, the static-IP ingress controller and
-    the Let's Encrypt issuers. azure.yaml runs it as the postprovision hook; it is safe to rerun.
+    Prepares the AKS cluster after `azd provision`: cert-manager, the ingress controller (private by default, or
+    bound to the static public IP) and the certificate issuers. azure.yaml runs it as the postprovision hook; it
+    is safe to rerun.
 
 .DESCRIPTION
     1. Signs in to the cluster with Entra ID (az aks get-credentials + kubelogin) into a temporary kubeconfig,
        leaving your own kubeconfig untouched.
     2. Waits until the cluster-admin role Terraform granted has reached the API server.
     3. Installs cert-manager from its pinned release manifest after checking the file's SHA-256.
-    4. Applies infra/k8s/cluster-bootstrap.yaml: an app-routing NGINX controller bound to the Terraform-owned
-       public IP, and production/staging Let's Encrypt ClusterIssuers.
+    4. Applies infra/k8s/cluster-bootstrap.yaml: an app-routing NGINX controller bound either to an internal load
+       balancer at the private address Terraform reserved (published through a Private Link Service when enabled)
+       or to the Terraform-owned public IP, the production/staging Let's Encrypt ClusterIssuers (public ingress
+       only) and the cluster's private CA issuer.
 
     Values come from the azd environment, which azd exposes to hooks as environment variables.
 
@@ -111,8 +114,31 @@ $values = @{
     AZURE_AKS_CLUSTER_NAME = Get-Setting 'AZURE_AKS_CLUSTER_NAME'
     APP_INGRESS_CLASS = Get-Setting 'APP_INGRESS_CLASS'
     APP_INGRESS_PUBLIC_IP_NAME = Get-Setting 'APP_INGRESS_PUBLIC_IP_NAME'
+    APP_INGRESS_SUBNET_NAME = Get-Setting 'APP_INGRESS_SUBNET_NAME'
+    APP_INGRESS_PRIVATE_IP = Get-Setting 'APP_INGRESS_PRIVATE_IP'
+    APP_PRIVATE_LINK_NAME = Get-Setting 'APP_PRIVATE_LINK_NAME'
+    APP_PRIVATE_LINK_SUBNET_NAME = Get-Setting 'APP_PRIVATE_LINK_SUBNET_NAME'
+    APP_PRIVATE_LINK_SUBSCRIPTIONS = Get-Setting 'APP_PRIVATE_LINK_SUBSCRIPTIONS'
     APP_ACME_EMAIL = Get-Setting 'APP_ACME_EMAIL'
 }
+# Exactly one front end exists. Terraform reports a public IP name or a private address, never both, and the lines
+# of the other front end are dropped from the template because their values are empty.
+if ([bool]$values.APP_INGRESS_PUBLIC_IP_NAME -eq [bool]$values.APP_INGRESS_PRIVATE_IP -and $values.AZURE_AKS_CLUSTER_NAME) {
+    throw 'The azd environment must name either a public ingress IP (APP_INGRESS_PUBLIC_IP_NAME) or a private ingress address (APP_INGRESS_PRIVATE_IP), not both and not neither; run azd provision first.'
+}
+$privateIngress = [bool]$values.APP_INGRESS_PRIVATE_IP
+$values.INGRESS_PUBLIC_IP_RESOURCE_GROUP = if ($privateIngress) { '' } else { $values.AZURE_RESOURCE_GROUP }
+$values.INGRESS_INTERNAL = if ($privateIngress) { 'true' } else { '' }
+$values.INGRESS_PRIVATE_LINK_CREATE = if ($privateIngress -and $values.APP_PRIVATE_LINK_NAME) { 'true' } else { '' }
+if ($privateIngress -and (-not $values.APP_INGRESS_SUBNET_NAME)) {
+    throw 'A private ingress needs APP_INGRESS_SUBNET_NAME from the azd environment; run azd provision first.'
+}
+if ($values.APP_PRIVATE_LINK_NAME -and (-not $values.APP_PRIVATE_LINK_SUBNET_NAME -or -not $values.APP_PRIVATE_LINK_SUBSCRIPTIONS)) {
+    throw 'A Private Link Service needs APP_PRIVATE_LINK_SUBNET_NAME and APP_PRIVATE_LINK_SUBSCRIPTIONS from the azd environment; run azd provision first.'
+}
+$optionalValues = @('APP_ACME_EMAIL', 'APP_INGRESS_PUBLIC_IP_NAME', 'INGRESS_PUBLIC_IP_RESOURCE_GROUP', 'INGRESS_INTERNAL',
+    'APP_INGRESS_SUBNET_NAME', 'APP_INGRESS_PRIVATE_IP', 'INGRESS_PRIVATE_LINK_CREATE', 'APP_PRIVATE_LINK_NAME',
+    'APP_PRIVATE_LINK_SUBNET_NAME', 'APP_PRIVATE_LINK_SUBSCRIPTIONS')
 $cluster = $values.AZURE_AKS_CLUSTER_NAME
 if (-not $cluster) {
     Write-Host 'AZURE_AKS_CLUSTER_NAME is not set yet, so there is no cluster to prepare. Skipping the AKS bootstrap.'
@@ -122,7 +148,7 @@ if ($values.APP_ACME_EMAIL -and $values.APP_ACME_EMAIL -notmatch '^[^@\s]+@[^@\s
     throw "APP_ACME_EMAIL '$($values.APP_ACME_EMAIL)' is not an email address."
 }
 
-$manifest = ConvertTo-BootstrapManifest -Template (Get-Content -LiteralPath $templatePath -Raw) -Values $values -Optional @('APP_ACME_EMAIL')
+$manifest = ConvertTo-BootstrapManifest -Template (Get-Content -LiteralPath $templatePath -Raw) -Values $values -Optional $optionalValues
 $certManagerUrl = "https://github.com/cert-manager/cert-manager/releases/download/$CertManagerVersion/cert-manager.yaml"
 
 if ($PlanOnly) {
@@ -188,7 +214,7 @@ try {
     }
 
     # cert-manager's webhook can refuse requests for a short while after it reports ready.
-    Write-Host '==> Applying the ingress controller and Let''s Encrypt issuers' -ForegroundColor Cyan
+    Write-Host '==> Applying the ingress controller and the certificate issuers' -ForegroundColor Cyan
     $script:lastError = ''
     $applied = Wait-Until -TimeoutSeconds $ReadyTimeoutSeconds -Activity 'waiting for the cert-manager webhook' -Status { $script:lastError } -Condition {
         try {
@@ -201,7 +227,8 @@ try {
     }
     if (-not $applied) { throw "The cluster bootstrap manifest could not be applied: $($script:lastError)" }
 
-    Write-Host "==> Waiting for the ingress controller to take the static IP $(Get-Setting 'APP_INGRESS_PUBLIC_IP')" -ForegroundColor Cyan
+    $frontEnd = if ($privateIngress) { "the private address $($values.APP_INGRESS_PRIVATE_IP)" } else { "the static IP $(Get-Setting 'APP_INGRESS_PUBLIC_IP')" }
+    Write-Host "==> Waiting for the ingress controller to take $frontEnd" -ForegroundColor Cyan
     $available = Invoke-Kubectl @('wait', 'nginxingresscontroller/cloudlens', '--for=condition=Available=True', "--timeout=$($ReadyTimeoutSeconds)s") -AllowFailure
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "The ingress controller is not available yet: $(Get-CliText @($available, $script:KubectlError))"

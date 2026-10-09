@@ -1,8 +1,13 @@
 # Cluster-wide setup applied by scripts/aks-bootstrap.ps1 (the azd postprovision hook) once cert-manager is ready.
-# The dollar-brace placeholders come from the azd environment; a line whose optional value is empty is dropped.
+# The dollar-brace placeholders come from the azd environment; a line whose optional value is empty is dropped, which
+# is how one template serves both ways of exposing the app.
 
-# App-routing NGINX controller bound to the Terraform-owned static IP, so the app keeps its
-# <label>.<region>.cloudapp.azure.com name for the life of the environment.
+# App-routing NGINX controller. Its Service is bound by annotation to one of two front ends:
+#  - public: the Terraform-owned static IP, so the app keeps its <label>.<region>.cloudapp.azure.com name for the life
+#    of the environment (the pip-name and resource-group lines);
+#  - private (the default): an internal load balancer at a fixed address in the ingress subnet, no public address at
+#    all (the internal lines), published through a Private Link Service when one is wanted (the pls lines), so that a
+#    private endpoint in any virtual network can reach it. visibility and auto-approval take the same subscription list.
 apiVersion: approuting.kubernetes.azure.com/v1alpha1
 kind: NginxIngressController
 metadata:
@@ -12,7 +17,15 @@ spec:
   controllerNamePrefix: cloudlens-nginx
   loadBalancerAnnotations:
     service.beta.kubernetes.io/azure-pip-name: "${APP_INGRESS_PUBLIC_IP_NAME}"
-    service.beta.kubernetes.io/azure-load-balancer-resource-group: "${AZURE_RESOURCE_GROUP}"
+    service.beta.kubernetes.io/azure-load-balancer-resource-group: "${INGRESS_PUBLIC_IP_RESOURCE_GROUP}"
+    service.beta.kubernetes.io/azure-load-balancer-internal: "${INGRESS_INTERNAL}"
+    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "${APP_INGRESS_SUBNET_NAME}"
+    service.beta.kubernetes.io/azure-load-balancer-ipv4: "${APP_INGRESS_PRIVATE_IP}"
+    service.beta.kubernetes.io/azure-pls-create: "${INGRESS_PRIVATE_LINK_CREATE}"
+    service.beta.kubernetes.io/azure-pls-name: "${APP_PRIVATE_LINK_NAME}"
+    service.beta.kubernetes.io/azure-pls-ip-configuration-subnet: "${APP_PRIVATE_LINK_SUBNET_NAME}"
+    service.beta.kubernetes.io/azure-pls-visibility: "${APP_PRIVATE_LINK_SUBSCRIPTIONS}"
+    service.beta.kubernetes.io/azure-pls-auto-approval: "${APP_PRIVATE_LINK_SUBSCRIPTIONS}"
 ---
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -45,3 +58,42 @@ spec:
       - http01:
           ingress:
             ingressClassName: "${APP_INGRESS_CLASS}"
+---
+# A private ingress cannot use Let's Encrypt: it validates the host over the public internet. APP_TLS_CLUSTER_ISSUER=private-ca
+# (the private default) uses a CA that lives only in this cluster: a self-signed bootstrap issuer signs the CA certificate
+# once, and the private-ca issuer then signs the web certificate and renews it. Browsers trust it only after the CA
+# certificate is installed on them: kubectl get secret cloudlens-private-ca --namespace cert-manager
+#   --output jsonpath='{.data.tls\.crt}' (base64). To use your own certificate instead, set APP_TLS_CLUSTER_ISSUER=byo.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: cloudlens-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: cloudlens-private-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: CloudLens private CA
+  secretName: cloudlens-private-ca
+  duration: 87600h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: cloudlens-selfsigned
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: private-ca
+spec:
+  ca:
+    secretName: cloudlens-private-ca

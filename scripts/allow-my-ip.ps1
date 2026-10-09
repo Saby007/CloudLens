@@ -3,8 +3,9 @@
     Keeps an environment's IP allow-list current: points it at your public IP address in seconds, without a redeploy.
 
 .DESCRIPTION
-    In operator mode (deploy-end-to-end.ps1 -OperatorMode) the app has no sign-in, so its public URL answers only
-    the addresses in APP_WEB_ALLOWED_IP_RANGES. When your address changes, run this script. It updates the HTTPS
+    Public ingress only. In operator mode (deploy-end-to-end.ps1 -OperatorMode) on a public ingress the app has no
+    sign-in, so its public URL answers only the addresses in APP_WEB_ALLOWED_IP_RANGES. (A private ingress has no
+    public address, so there is no list to keep.) When your address changes, run this script. It updates the HTTPS
     rule of the node subnet's network security group in place, then stores the new list in the azd environment so
     later provisions keep it. The list must already be in place: deploy once with -AllowedIpRanges to create it.
 
@@ -96,6 +97,9 @@ function Resolve-SourceAddress {
 # azd finds the environment through the project's azure.yaml.
 Push-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
 try {
+    if ((Get-AzdValue 'APP_INGRESS_VISIBILITY') -eq 'private') {
+        throw "'$EnvironmentName' has a private ingress: it has no public address, so there is no IP allow-list to keep current. People reach it through its private address or a private endpoint (see the README's private ingress section). To serve it publicly to chosen addresses, redeploy with scripts/deploy-end-to-end.ps1 -IngressVisibility public -AllowedIpRanges '<your IP>'."
+    }
     if ((Get-AzdValue 'APP_WEB_INGRESS_RESTRICTED') -ne 'true') {
         throw "The public URL of '$EnvironmentName' is not on an IP allow-list yet, so there is no rule to update. Run scripts/deploy-end-to-end.ps1 with -AllowedIpRanges '<your IP>' once (with -OperatorMode for an environment without sign-in); this script keeps the list current after that."
     }

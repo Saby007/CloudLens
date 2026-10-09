@@ -16,6 +16,8 @@ param(
     [string] $SubscriptionId = '',
     [ValidateRange(1, 5)]
     [int] $MaxAttempts = 3,
+    [ValidateSet('private', 'public')]
+    [string] $IngressVisibility,
     [switch] $SkipPreview,
     [switch] $SkipProcessor,
     [switch] $InstallKubernetesTools,
@@ -33,6 +35,7 @@ $parameters = @{
     SkipRoleAssignments = $true
 }
 if ($SubscriptionId) { $parameters.SubscriptionId = $SubscriptionId }
+if ($PSBoundParameters.ContainsKey('IngressVisibility')) { $parameters.IngressVisibility = $IngressVisibility }
 foreach ($name in @('SkipPreview', 'SkipProcessor', 'InstallKubernetesTools', 'PlanOnly')) {
     if ($PSBoundParameters.ContainsKey($name)) { $parameters[$name] = $PSBoundParameters[$name] }
 }

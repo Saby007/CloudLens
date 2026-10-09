@@ -167,8 +167,9 @@ spec:
           averageUtilization: 70
 ---
 # The only rule admitting traffic to the web pods (10-network-policies.yaml denies everything else).
-# Operator mode (MEGHKOSHA_AUTH_MODE=operator, Dev only) has no sign-in, so unless Terraform has limited HTTPS to an
-# IP allow-list (APP_WEB_INGRESS_RESTRICTED=true) the public ingress must not reach them: the selector then names a
+# Operator mode (MEGHKOSHA_AUTH_MODE=operator, Dev only) has no sign-in, so unless the internet cannot reach the app
+# unchecked - the ingress is private, or Terraform has limited HTTPS to an IP allow-list; both report
+# APP_WEB_INGRESS_RESTRICTED=true - the ingress controller must not reach the web pods: the selector then names a
 # namespace that cannot exist - namespace names are lowercase DNS labels - and the rule admits nothing. The app is then
 # reached with `kubectl port-forward`, which network policies do not filter.
 apiVersion: networking.k8s.io/v1
@@ -192,7 +193,10 @@ spec:
         - protocol: TCP
           port: 8080
 ---
-# cert-manager sees the issuer annotation, requests the certificate into web-tls and renews it automatically.
+# cert-manager sees the issuer annotation, requests the certificate into web-tls and renews it automatically. With
+# APP_TLS_CLUSTER_ISSUER=byo there is no annotation: the operator creates the web-tls secret in this namespace, from their
+# own CA, and the ingress serves it (see the README). Without that secret the ingress controller serves its built-in
+# placeholder certificate.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -201,7 +205,7 @@ metadata:
     app.kubernetes.io/name: web
     app.kubernetes.io/part-of: cloudlens
   annotations:
-    cert-manager.io/cluster-issuer: {{ index .Env "APP_TLS_CLUSTER_ISSUER" | printf "%q" }}
+    {{ if ne (index .Env "APP_TLS_CLUSTER_ISSUER") "byo" }}cert-manager.io/cluster-issuer: {{ index .Env "APP_TLS_CLUSTER_ISSUER" | printf "%q" }}{{ end }}
 spec:
   ingressClassName: {{ index .Env "APP_INGRESS_CLASS" | printf "%q" }}
   tls:
