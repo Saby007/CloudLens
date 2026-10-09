@@ -8,6 +8,12 @@ resource "azurerm_kubernetes_cluster" "main" {
   kubernetes_version  = var.aks_kubernetes_version != "" ? var.aks_kubernetes_version : null
   tags                = local.tags
 
+  # A private cluster's API server has only a private address in this virtual network. AKS creates its private
+  # endpoint in the node resource group and a private DNS zone, linked to the network, that resolves it.
+  private_cluster_enabled             = var.aks_private_cluster
+  private_dns_zone_id                 = var.aks_private_cluster ? "System" : null
+  private_cluster_public_fqdn_enabled = false
+
   automatic_upgrade_channel    = "stable"
   node_os_upgrade_channel      = "NodeImage"
   oidc_issuer_enabled          = true
@@ -63,14 +69,19 @@ resource "azurerm_kubernetes_cluster" "main" {
     service_cidr        = var.aks_service_cidr
     dns_service_ip      = cidrhost(var.aks_service_cidr, 10)
     load_balancer_sku   = "standard"
-    outbound_type       = "loadBalancer"
+    outbound_type       = local.aks_nat_gateway_outbound ? "userAssignedNATGateway" : "loadBalancer"
 
-    # Every outbound connection holds a SNAT port. AKS's default of 1,024 ports per node, each held for
-    # 30 minutes after its connection goes idle, ran out on the node hosting the app's pods.
-    load_balancer_profile {
-      managed_outbound_ip_count = var.aks_outbound_ip_count
-      outbound_ports_allocated  = var.aks_outbound_ports_per_node
-      idle_timeout_in_minutes   = var.aks_outbound_idle_timeout_minutes
+    # With a load balancer for outbound traffic, every outbound connection holds a SNAT port. AKS's default of
+    # 1,024 ports per node, each held for 30 minutes after its connection goes idle, ran out on the node hosting
+    # the app's pods. A NAT gateway has 64,000 ports per IP and takes none of these settings.
+    dynamic "load_balancer_profile" {
+      for_each = local.aks_nat_gateway_outbound ? [] : [1]
+
+      content {
+        managed_outbound_ip_count = var.aks_outbound_ip_count
+        outbound_ports_allocated  = var.aks_outbound_ports_per_node
+        idle_timeout_in_minutes   = var.aks_outbound_idle_timeout_minutes
+      }
     }
   }
 
@@ -123,12 +134,12 @@ resource "azurerm_kubernetes_cluster" "main" {
 
     # Each pool upgrades with a 10% surge, so its largest size plus that surge must also get its ports.
     precondition {
-      condition     = (var.aks_system_max_nodes + ceil(var.aks_system_max_nodes * 0.1) + var.aks_user_max_nodes + ceil(var.aks_user_max_nodes * 0.1)) * var.aks_outbound_ports_per_node <= 64000 * var.aks_outbound_ip_count
+      condition     = local.aks_nat_gateway_outbound || (var.aks_system_max_nodes + ceil(var.aks_system_max_nodes * 0.1) + var.aks_user_max_nodes + ceil(var.aks_user_max_nodes * 0.1)) * var.aks_outbound_ports_per_node <= 64000 * var.aks_outbound_ip_count
       error_message = "The node pools at their maximum size, plus one upgrade surge node per pool, need more SNAT ports than the outbound IPs provide (64,000 each). Lower APP_AKS_OUTBOUND_PORTS, raise APP_AKS_OUTBOUND_IPS, or lower the pools' maximum node counts."
     }
   }
 
-  depends_on = [time_sleep.aks_identity_propagation]
+  depends_on = [time_sleep.aks_identity_propagation, azurerm_subnet_nat_gateway_association.aks]
 }
 
 resource "azurerm_kubernetes_cluster_node_pool" "apps" {

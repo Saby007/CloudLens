@@ -16,6 +16,9 @@
 
     Values come from the azd environment, which azd exposes to hooks as environment variables.
 
+    A private cluster (APP_AKS_PRIVATE_CLUSTER=true) can be prepared only from inside its network. With
+    CLOUDLENS_PROVISION_ONLY set the hook skips it; otherwise it stops with an error unless the API server is reachable.
+
 .PARAMETER PlanOnly
     Print the rendered bootstrap manifest and the cert-manager release without contacting Azure or the cluster.
 #>
@@ -49,6 +52,20 @@ function Get-CliText {
     param($Value)
     if ($null -eq $Value) { return '' }
     return ((@($Value | Where-Object { $null -ne $_ }) -join "`n")).Trim()
+}
+
+function Test-ApiServerReachable {
+    # True when the name resolves and port 443 accepts a connection, which a private cluster does only inside its network.
+    # CLOUDLENS_API_SERVER_PORT exists for the offline tests, which stand in for the API server with a local listener.
+    param([Parameter(Mandatory)][string] $HostName)
+    $port = if ($env:CLOUDLENS_API_SERVER_PORT -match '^[0-9]{1,5}$') { [int] $env:CLOUDLENS_API_SERVER_PORT } else { 443 }
+    try {
+        $addresses = [System.Net.Dns]::GetHostAddresses($HostName)
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try { return ($client.ConnectAsync($addresses[0], $port).Wait(5000) -and $client.Connected) } finally { $client.Dispose() }
+    } catch {
+        return $false
+    }
 }
 
 function ConvertTo-BootstrapManifest {
@@ -168,6 +185,21 @@ foreach ($tool in @('az', 'kubectl', 'kubelogin')) {
 }
 foreach ($required in @('AZURE_SUBSCRIPTION_ID', 'AZURE_RESOURCE_GROUP')) {
     if (-not $values[$required]) { throw "$required is not set in the azd environment." }
+}
+
+# A private cluster's API server has no public address, so only a machine inside the network (the deploy host, or one
+# connected to it) can prepare it. The deploy script provisions from anywhere, sets CLOUDLENS_PROVISION_ONLY for
+# that, and runs this hook again on the deploy host.
+if ((Get-Setting 'APP_AKS_PRIVATE_CLUSTER') -eq 'true') {
+    if (Get-Setting 'CLOUDLENS_PROVISION_ONLY') {
+        Write-Host "The cluster $cluster is private. Skipping the cluster bootstrap here; run it from the deploy host (scripts/prepare-deploy-host.ps1 shows how)." -ForegroundColor Yellow
+        exit 0
+    }
+    $apiServer = Get-CliText (& az aks show --resource-group $values.AZURE_RESOURCE_GROUP --name $cluster --subscription $values.AZURE_SUBSCRIPTION_ID --query privateFqdn --output tsv --only-show-errors 2>&1)
+    if ($LASTEXITCODE -ne 0 -or -not $apiServer) { throw "The private API server address of $cluster could not be read: $apiServer" }
+    if (-not (Test-ApiServerReachable -HostName $apiServer)) {
+        throw "The API server of $cluster ($apiServer) is private and cannot be reached from this machine. Run this from the deploy host or a network connected to the cluster's virtual network: pwsh ./scripts/prepare-deploy-host.ps1 -EnvironmentName <environment> prepares the deploy host and prints the commands."
+    }
 }
 
 $kubeconfig = Join-Path ([System.IO.Path]::GetTempPath()) "cloudlens-$cluster-$([guid]::NewGuid().ToString('n')).kubeconfig"

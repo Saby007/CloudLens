@@ -104,6 +104,24 @@ mock_provider "azurerm" {
     }
   }
 
+  mock_resource "azurerm_nat_gateway" {
+    defaults = {
+      id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Network/natGateways/nat-test"
+    }
+  }
+
+  mock_resource "azurerm_network_interface" {
+    defaults = {
+      id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Network/networkInterfaces/nic-test"
+    }
+  }
+
+  mock_resource "azurerm_linux_virtual_machine" {
+    defaults = {
+      id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Compute/virtualMachines/vm-test"
+    }
+  }
+
   mock_resource "azurerm_cognitive_account" {
     defaults = {
       id       = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.CognitiveServices/accounts/ai-test"
@@ -119,6 +137,23 @@ mock_provider "azurerm" {
 }
 
 mock_provider "time" {}
+
+mock_provider "random" {}
+
+# The deploy host's subnets are checked by name (Azure requires AzureBastionSubnet).
+override_resource {
+  target = azurerm_subnet.bastion
+  values = {
+    id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Network/virtualNetworks/vnet-test/subnets/AzureBastionSubnet"
+  }
+}
+
+override_resource {
+  target = random_password.deploy_host
+  values = {
+    result = "Aa1!Bb2#Cc3%Dd4*Ee5-Ff6_"
+  }
+}
 
 # Distinct principals, so the assertions can tell which identity each grant went to.
 override_resource {
@@ -172,6 +207,12 @@ variables {
   # The runs below that predate the private ingress describe the internet-facing one; the private_* runs override this.
   # The default itself (private) is checked through azd's parameter file in api/tests/test_packaging.py.
   ingress_visibility = "public"
+
+  # Likewise the cluster and registry runs below describe the internet-reachable control plane with a load balancer
+  # for outbound traffic; the private_control_plane_* runs override these.
+  aks_private_cluster = false
+  private_registry    = false
+  aks_outbound_type   = "loadBalancer"
 }
 
 run "core_profile_provisions_only_the_hardened_foundation" {
@@ -860,4 +901,224 @@ run "keeping_or_raising_the_provisioned_profile_is_allowed" {
     condition     = output.APP_PROFILE == "ai"
     error_message = "Raising the profile must be allowed."
   }
+}
+
+run "private_control_plane_has_no_public_api_server_registry_or_inbound_path" {
+  command = apply
+
+  variables {
+    ingress_visibility  = "private"
+    aks_private_cluster = true
+    private_registry    = true
+    aks_outbound_type   = "natGateway"
+  }
+
+  assert {
+    condition = alltrue([
+      azurerm_kubernetes_cluster.main.private_cluster_enabled,
+      !azurerm_kubernetes_cluster.main.private_cluster_public_fqdn_enabled,
+      azurerm_kubernetes_cluster.main.private_dns_zone_id == "System",
+      length(azurerm_kubernetes_cluster.main.api_server_access_profile) == 0,
+    ])
+    error_message = "The API server must be private, with no public FQDN and no authorized-range list to maintain."
+  }
+
+  assert {
+    condition = alltrue([
+      azurerm_kubernetes_cluster.main.network_profile[0].outbound_type == "userAssignedNATGateway",
+      length(azurerm_kubernetes_cluster.main.network_profile[0].load_balancer_profile) == 0,
+      length(azurerm_subnet_nat_gateway_association.aks) == 1,
+      length(azurerm_public_ip.ingress) == 0,
+    ])
+    error_message = "Outbound traffic must leave through the NAT gateway on the node subnet, with no ingress IP and no load-balancer SNAT profile."
+  }
+
+  assert {
+    condition = alltrue([
+      azurerm_container_registry.main.sku == "Premium",
+      !azurerm_container_registry.main.public_network_access_enabled,
+      azurerm_container_registry.main.data_endpoint_enabled,
+      !azurerm_container_registry.main.admin_enabled,
+    ])
+    error_message = "The registry must be Premium with no public access and dedicated data endpoints, so layers also arrive over the private endpoint."
+  }
+
+  assert {
+    condition = alltrue([
+      length(azurerm_private_endpoint.acr) == 1,
+      azurerm_private_dns_zone.acr[0].name == "privatelink.azurecr.io",
+      length(azurerm_private_dns_zone_virtual_network_link.acr) == 1,
+    ])
+    error_message = "The registry needs a private endpoint, the privatelink.azurecr.io zone and a link from the virtual network."
+  }
+
+  assert {
+    condition     = length(azurerm_role_assignment.deployer_acr_push) >= 1 && alltrue([for assignment in azurerm_role_assignment.deployer_acr_push : endswith(assignment.role_definition_id, "8311e382-0749-4cb8-b61a-304f252e45ec")])
+    error_message = "The deployer pushes the images from the deploy host, so they need AcrPush on the registry."
+  }
+
+  assert {
+    condition = alltrue([
+      length(azurerm_nat_gateway.main) == 1,
+      length(azurerm_nat_gateway_public_ip_association.main) == 1,
+      length(azurerm_subnet_nat_gateway_association.deploy_host) == 1,
+    ])
+    error_message = "One NAT gateway serves the nodes and the deploy host."
+  }
+
+  assert {
+    condition = alltrue([
+      length(azurerm_linux_virtual_machine.deploy_host) == 1,
+      length(azurerm_bastion_host.deploy_host) == 1,
+      azurerm_subnet.bastion[0].name == "AzureBastionSubnet",
+      azurerm_subnet.bastion[0].address_prefixes[0] == "10.42.1.128/26",
+      azurerm_subnet.deploy_host[0].address_prefixes[0] == "10.42.1.96/27",
+      azurerm_linux_virtual_machine.deploy_host[0].size == "Standard_D4s_v5",
+      azurerm_linux_virtual_machine.deploy_host[0].admin_username == "cloudlensadmin",
+      azurerm_linux_virtual_machine.deploy_host[0].source_image_reference[0].publisher == "Canonical",
+      length(azurerm_dev_test_global_vm_shutdown_schedule.deploy_host) == 1,
+    ])
+    error_message = "A private control plane needs the deploy host and its Bastion in subnets of the virtual network."
+  }
+
+  assert {
+    condition = alltrue([
+      azurerm_network_interface.deploy_host[0].ip_configuration[0].public_ip_address_id == null,
+      length(azurerm_public_ip.bastion) == 1,
+      length(azurerm_public_ip.nat) == 1,
+      one([for rule in azurerm_network_security_group.deploy_host[0].security_rule : rule.source_address_prefix]) == "10.42.1.128/26",
+      one([for rule in azurerm_network_security_group.deploy_host[0].security_rule : rule.destination_port_range]) == "22",
+    ])
+    error_message = "The deploy host has no public address and takes SSH from Bastion's subnet only; the only public addresses are Bastion's and the NAT gateway's."
+  }
+
+  assert {
+    condition = alltrue([
+      output.APP_AKS_PRIVATE_CLUSTER == "true",
+      output.APP_PRIVATE_REGISTRY == "true",
+      output.APP_AKS_OUTBOUND_TYPE == "natGateway",
+      output.APP_DEPLOY_HOST_ADMIN_USERNAME == "cloudlensadmin",
+      output.APP_DEPLOY_HOST_NAME != "",
+      output.APP_DEPLOY_HOST_ID != "",
+      output.APP_NAT_GATEWAY_IP != "",
+      output.APP_DEPLOYMENT_STATE.aksPrivateCluster,
+      output.APP_DEPLOYMENT_STATE.privateRegistry,
+      output.APP_DEPLOYMENT_STATE.deployHostEnabled,
+    ])
+    error_message = "The hook and the deploy scripts read these outputs to know the control plane is private and where the deploy host is."
+  }
+}
+
+run "the_public_control_plane_keeps_its_basic_registry_and_load_balancer_outbound" {
+  command = apply
+
+  assert {
+    condition = alltrue([
+      !azurerm_kubernetes_cluster.main.private_cluster_enabled,
+      azurerm_kubernetes_cluster.main.network_profile[0].outbound_type == "loadBalancer",
+      length(azurerm_kubernetes_cluster.main.network_profile[0].load_balancer_profile) == 1,
+      azurerm_container_registry.main.sku == "Basic",
+      azurerm_container_registry.main.public_network_access_enabled,
+      !azurerm_container_registry.main.data_endpoint_enabled,
+    ])
+    error_message = "A public control plane keeps the public API server, the Basic registry and the load balancer's outbound IPs."
+  }
+
+  assert {
+    condition = alltrue([
+      length(azurerm_private_endpoint.acr) == 0,
+      length(azurerm_nat_gateway.main) == 0,
+      length(azurerm_linux_virtual_machine.deploy_host) == 0,
+      length(azurerm_bastion_host.deploy_host) == 0,
+      output.APP_AKS_PRIVATE_CLUSTER == "false",
+      output.APP_DEPLOY_HOST_ID == "",
+      output.APP_NAT_GATEWAY_IP == "",
+    ])
+    error_message = "Nothing private-only may be created for a public control plane."
+  }
+}
+
+run "the_deploy_host_is_optional_for_teams_that_deploy_from_a_connected_network" {
+  command = apply
+
+  variables {
+    aks_private_cluster = true
+    private_registry    = true
+    aks_outbound_type   = "natGateway"
+    deploy_host_enabled = false
+  }
+
+  assert {
+    condition = alltrue([
+      length(azurerm_linux_virtual_machine.deploy_host) == 0,
+      length(azurerm_bastion_host.deploy_host) == 0,
+      length(azurerm_public_ip.bastion) == 0,
+      length(azurerm_nat_gateway.main) == 1,
+      length(azurerm_subnet_nat_gateway_association.deploy_host) == 0,
+      azurerm_kubernetes_cluster.main.private_cluster_enabled,
+    ])
+    error_message = "Without the deploy host there is no VM or Bastion, but the cluster stays private and keeps the NAT gateway."
+  }
+}
+
+run "a_load_balancer_for_outbound_still_gives_the_deploy_host_a_nat_gateway" {
+  command = apply
+
+  variables {
+    aks_private_cluster = true
+    aks_outbound_type   = "loadBalancer"
+  }
+
+  assert {
+    condition = alltrue([
+      azurerm_kubernetes_cluster.main.network_profile[0].outbound_type == "loadBalancer",
+      length(azurerm_kubernetes_cluster.main.network_profile[0].load_balancer_profile) == 1,
+      length(azurerm_subnet_nat_gateway_association.aks) == 0,
+      length(azurerm_subnet_nat_gateway_association.deploy_host) == 1,
+    ])
+    error_message = "The deploy host's subnet has no default outbound access, so it needs the NAT gateway even when the nodes use the load balancer."
+  }
+}
+
+run "only_the_registry_private_still_needs_the_deploy_host_to_push_images" {
+  command = plan
+
+  variables {
+    aks_private_cluster = false
+    private_registry    = true
+  }
+
+  assert {
+    condition     = length(azurerm_linux_virtual_machine.deploy_host) == 1 && !azurerm_kubernetes_cluster.main.private_cluster_enabled
+    error_message = "A private registry cannot be built into from the cloud, so the deploy host is created even when the API server is public."
+  }
+}
+
+run "a_private_cluster_has_no_public_api_server_to_authorize" {
+  command = plan
+
+  variables {
+    aks_private_cluster          = true
+    aks_api_authorized_ip_ranges = "203.0.113.7/32"
+  }
+
+  expect_failures = [var.aks_private_cluster]
+}
+
+run "private_control_plane_settings_must_be_exact" {
+  command = plan
+
+  variables {
+    aks_outbound_type         = "natgateway"
+    deploy_host_subnet_prefix = "10.42.1.96/29"
+    bastion_subnet_prefix     = "10.42.1.128/27"
+    deploy_host_shutdown_time = "6pm"
+  }
+
+  expect_failures = [
+    var.aks_outbound_type,
+    var.deploy_host_subnet_prefix,
+    var.bastion_subnet_prefix,
+    var.deploy_host_shutdown_time,
+  ]
 }

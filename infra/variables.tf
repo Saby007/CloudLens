@@ -210,9 +210,82 @@ variable "aks_zones" {
 }
 
 variable "aks_api_authorized_ip_ranges" {
-  description = "Optional comma-separated CIDR ranges allowed to reach the Kubernetes API server. Include the machine that runs azd."
+  description = "Optional comma-separated CIDR ranges allowed to reach the Kubernetes API server of a cluster with a public API server. Include the machine that runs azd. A private cluster has no public address to limit."
   type        = string
   default     = ""
+}
+
+variable "aks_private_cluster" {
+  description = "true (default): the Kubernetes API server has only a private address inside the virtual network, so kubectl, the cluster bootstrap and azd deploy must run from a machine that can reach it (the deploy host this configuration can create, or a connected network). false: the API server keeps a public address, protected by Entra ID and Azure RBAC."
+  type        = bool
+  default     = true
+
+  validation {
+    condition     = !var.aks_private_cluster || trimspace(var.aks_api_authorized_ip_ranges) == ""
+    error_message = "aks_api_authorized_ip_ranges limits a public API server; a private cluster has none. Clear APP_AKS_API_AUTHORIZED_IP_RANGES, or keep the public API server with APP_AKS_PRIVATE_CLUSTER=false."
+  }
+}
+
+variable "private_registry" {
+  description = "true (default): the container registry is Premium with a private endpoint and no public access, so images are pushed and pulled over the virtual network only. Cloud-side builds (az acr build, azd's remote build) cannot reach it; images are built on the deploy host. false: a Basic registry with public access."
+  type        = bool
+  default     = true
+}
+
+variable "aks_outbound_type" {
+  description = "How the cluster reaches the internet. natGateway (default): a NAT gateway with one static public IP, outbound only, and no public load balancer. loadBalancer: the cluster's standard load balancer with managed outbound IPs (see aks_outbound_ip_count and the SNAT settings)."
+  type        = string
+  default     = "natGateway"
+
+  validation {
+    condition     = contains(["natGateway", "loadBalancer"], var.aks_outbound_type)
+    error_message = "aks_outbound_type (APP_AKS_OUTBOUND_TYPE) must be natGateway or loadBalancer."
+  }
+}
+
+variable "deploy_host_enabled" {
+  description = "Create the deploy host: a Linux VM with no public address, in this virtual network, reached through Azure Bastion, that has the tools to deploy a private cluster and registry. Only created when the cluster or the registry is private; turn it off when you deploy from a network you already connect to this one."
+  type        = bool
+  default     = true
+}
+
+variable "deploy_host_subnet_prefix" {
+  description = "Subnet for the deploy host, inside the virtual network, /28 or larger."
+  type        = string
+  default     = "10.42.1.96/27"
+
+  validation {
+    condition     = can(cidrnetmask(var.deploy_host_subnet_prefix)) && tonumber(split("/", var.deploy_host_subnet_prefix)[1]) <= 28
+    error_message = "deploy_host_subnet_prefix must be an IPv4 CIDR block of /28 or larger."
+  }
+}
+
+variable "bastion_subnet_prefix" {
+  description = "AzureBastionSubnet for the deploy host's Azure Bastion, inside the virtual network; Azure requires /26 or larger."
+  type        = string
+  default     = "10.42.1.128/26"
+
+  validation {
+    condition     = can(cidrnetmask(var.bastion_subnet_prefix)) && tonumber(split("/", var.bastion_subnet_prefix)[1]) <= 26
+    error_message = "bastion_subnet_prefix must be an IPv4 CIDR block of /26 or larger."
+  }
+}
+
+variable "deploy_host_vm_size" {
+  description = "Size of the deploy host. It builds the container images, so it needs a few cores."
+  type        = string
+  default     = "Standard_D4s_v5"
+}
+
+variable "deploy_host_shutdown_time" {
+  description = "UTC time (HHmm) at which the deploy host shuts itself down every day, to stop its compute charge. It starts again with az vm start. Empty disables it."
+  type        = string
+  default     = "1800"
+
+  validation {
+    condition     = var.deploy_host_shutdown_time == "" || can(regex("^([01][0-9]|2[0-3])[0-5][0-9]$", var.deploy_host_shutdown_time))
+    error_message = "deploy_host_shutdown_time must be HHmm, for example 1800, or empty."
+  }
 }
 
 variable "auth_mode" {

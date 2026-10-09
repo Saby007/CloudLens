@@ -1,0 +1,51 @@
+#cloud-config
+# Installs what deploying a private CloudLens needs. Progress is in /var/log/cloudlens-tools.log; the file
+# /var/lib/cloudlens/tools-ready appears once every tool is in place.
+package_update: true
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - git
+  - gnupg
+  - jq
+  - lsb-release
+  - unzip
+  - docker.io
+write_files:
+  - path: /usr/local/sbin/cloudlens-install-tools.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      # Azure CLI
+      curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+
+      # Azure Developer CLI
+      curl -fsSL https://aka.ms/install-azd.sh | bash
+
+      # kubectl and kubelogin (Entra ID sign-in to the cluster)
+      az aks install-cli --install-location /usr/local/bin/kubectl --kubelogin-install-location /usr/local/bin/kubelogin
+
+      # Terraform
+      curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+      echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" > /etc/apt/sources.list.d/hashicorp.list
+      apt-get update
+      apt-get install -y terraform
+
+      # PowerShell: the deployment scripts are PowerShell
+      curl -fsSL -o /tmp/packages-microsoft-prod.deb "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb"
+      dpkg -i /tmp/packages-microsoft-prod.deb
+      apt-get update
+      apt-get install -y powershell
+
+      # Docker builds the images, since a private registry cannot be reached by cloud-side builds.
+      systemctl enable --now docker
+      usermod -aG docker cloudlensadmin
+
+      mkdir -p /var/lib/cloudlens
+      date -u > /var/lib/cloudlens/tools-ready
+runcmd:
+  - [bash, -c, "/usr/local/sbin/cloudlens-install-tools.sh >> /var/log/cloudlens-tools.log 2>&1"]

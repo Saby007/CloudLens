@@ -11,6 +11,10 @@ terraform {
       source  = "hashicorp/time"
       version = "~> 0.13"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
   }
 }
 
@@ -103,9 +107,16 @@ locals {
     [for id in compact([for item in split(",", var.private_link_allowed_subscriptions) : trimspace(item)]) : lower(id)],
   ))
 
+  # The deploy host exists only where something private needs it, and has an outbound path through the NAT gateway
+  # (shared with the cluster when that uses one) because its subnet has no default outbound access.
+  deploy_host_enabled      = var.deploy_host_enabled && (var.aks_private_cluster || var.private_registry)
+  nat_gateway_enabled      = var.aks_outbound_type == "natGateway" || local.deploy_host_enabled
+  aks_nat_gateway_outbound = var.aks_outbound_type == "natGateway"
+
   role_definition_prefix = "/subscriptions/${data.azurerm_client_config.current.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/"
   role_ids = {
     acr_pull                    = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+    acr_push                    = "8311e382-0749-4cb8-b61a-304f252e45ec"
     aks_rbac_cluster_admin      = "b1ff04bb-8a4e-4dc4-8eb5-8693973ce19b"
     azure_ai_user               = "53ca6127-db72-4b80-b1b0-d745d6d5456d"
     blob_data_contributor       = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"

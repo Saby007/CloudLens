@@ -93,6 +93,24 @@
     Private ingress without the Private Link Service: only the private IP remains, reachable from this virtual
     network and from anything peered or connected to it.
 
+.PARAMETER ControlPlane
+    private (the default for a new environment): the Kubernetes API server and the container registry have no
+    public access, and outbound traffic leaves through a NAT gateway. Provisioning, sign-in and role assignments run
+    from anywhere, but the cluster bootstrap and the image build need a machine inside the network, so the services
+    are deployed from the deploy host this creates (this script prepares it; deploy-on-host.ps1 finishes there), or
+    right here when this machine already reaches the cluster (a VPN, say). public: the API server and registry keep
+    public addresses protected by Entra ID and Azure RBAC, and everything deploys from here. An environment whose
+    cluster has a public API server keeps it only if you say -ControlPlane public: AKS cannot make an API server
+    private in place, so going private means a new environment.
+
+.PARAMETER OutboundType
+    natGateway (default): the cluster and the deploy host reach the internet through a NAT gateway (one static public
+    address, outbound only, no public load balancer). loadBalancer: the cluster's load balancer with managed outbound IPs.
+
+.PARAMETER NoDeployHost
+    Do not create the deploy host (a VM and Azure Bastion inside the network). Use this when you deploy from a
+    network you already connect to the cluster's virtual network.
+
 .PARAMETER AllowedIpRanges
     Public ingress only: comma-separated IPv4 addresses or CIDR ranges (/8 or narrower) that may reach the app's
     public URL over HTTPS; everyone else is blocked by the network security group. With -OperatorMode this is what
@@ -162,6 +180,11 @@ param(
     [string] $TlsClusterIssuer,
     [string] $PrivateLinkSubscriptionIds = '',
     [switch] $NoPrivateLink,
+    [ValidateSet('private', 'public')]
+    [string] $ControlPlane,
+    [ValidateSet('natGateway', 'loadBalancer')]
+    [string] $OutboundType,
+    [switch] $NoDeployHost,
     [string] $AllowedIpRanges = '',
     [switch] $InstallKubernetesTools,
     [string] $KubernetesToolsDirectory = $HOME,
@@ -240,6 +263,9 @@ if ($PSBoundParameters.ContainsKey('PrivateLinkSubscriptionIds')) {
     $settings.APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS = $allowedSubscriptions -join ','
 }
 if ($NoPrivateLink) { $settings.APP_PRIVATE_LINK_ENABLED = 'false' }
+# Outbound path and the deploy host; the control plane itself (API server and registry) is settled in section 3.
+if ($PSBoundParameters.ContainsKey('OutboundType')) { $settings.APP_AKS_OUTBOUND_TYPE = $OutboundType }
+if ($NoDeployHost) { $settings.APP_DEPLOY_HOST_ENABLED = 'false' }
 # azd's output is captured to classify failures, which would also hide any question azd asked, so azd
 # always runs with --no-prompt. These are the errors it reports when it needed an answer instead; the
 # command is then rerun attached to the terminal so the question can be answered there.
@@ -277,6 +303,7 @@ if ($PlanOnly) {
         enableProcessor = -not $SkipProcessor
         operatorMode = [bool] $OperatorMode
         ingressVisibility = $(if ($PSBoundParameters.ContainsKey('IngressVisibility')) { $IngressVisibility } else { '' })
+        controlPlane = $(if ($PSBoundParameters.ContainsKey('ControlPlane')) { $ControlPlane } else { '' })
         bootstrapIdentity = -not ($SkipIdentityBootstrap -or $OperatorMode)
         roleAssignments = -not $SkipRoleAssignments
         serviceManagementReference = $ServiceManagementReference
@@ -458,6 +485,27 @@ function Invoke-Azd {
         }
         Wait-Settle "$command failed, retrying ($($attempt + 1) of $MaxAttempts)"
     }
+}
+
+function Test-ApiServerReachable {
+    # True when the private API server's name resolves and port 443 answers, which is so only from inside its network.
+    # CLOUDLENS_API_SERVER_PORT exists for the offline tests, which stand in for the API server with a local listener.
+    param([Parameter(Mandatory)][string] $HostName)
+    $port = if ($env:CLOUDLENS_API_SERVER_PORT -match '^[0-9]{1,5}$') { [int] $env:CLOUDLENS_API_SERVER_PORT } else { 443 }
+    try {
+        $addresses = [System.Net.Dns]::GetHostAddresses($HostName)
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try { return ($client.ConnectAsync($addresses[0], $port).Wait(5000) -and $client.Connected) } finally { $client.Dispose() }
+    } catch {
+        return $false
+    }
+}
+
+function Test-PrivateClusterReachable {
+    $subscriptionArgs = Get-SubscriptionArgument
+    $apiServer = Get-CliText (& az aks show --resource-group (Get-ResourceGroupName) --name (Get-AzdValue 'AZURE_AKS_CLUSTER_NAME') @subscriptionArgs --query privateFqdn --output tsv --only-show-errors 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $apiServer) { return $false }
+    return (Test-ApiServerReachable -HostName $apiServer)
 }
 
 function Get-WebEndpointUrl {
@@ -689,6 +737,29 @@ try {
         throw "-TlsClusterIssuer $($settings.APP_TLS_CLUSTER_ISSUER) validates the host over the public internet, which a private ingress does not accept. Use private-ca or byo, or -IngressVisibility public."
     }
     Write-Host "Ingress: $visibility."
+
+    # Control plane: the API server and the registry are private by default too. As with the ingress, an explicit choice
+    # wins, the environment keeps what it has, and a new one is private. An existing cluster is never made private
+    # silently: AKS cannot change that in place, so Terraform would replace the cluster.
+    $storedControlPlane = Get-AzdValue 'APP_AKS_PRIVATE_CLUSTER'
+    $hadCluster = [bool](Get-AzdValue 'AZURE_AKS_CLUSTER_NAME')
+    $previousControlPlane = if ($storedControlPlane -eq 'true') { 'private' } elseif ($storedControlPlane -eq 'false' -or $hadCluster) { 'public' } else { '' }
+    if ($PSBoundParameters.ContainsKey('ControlPlane')) {
+        $controlPlaneAccess = $ControlPlane
+    } elseif ($storedControlPlane) {
+        $controlPlaneAccess = if ($storedControlPlane -eq 'true') { 'private' } else { 'public' }
+    } elseif ($hadCluster) {
+        throw "Environment '$EnvironmentName' already has a cluster with a public API server, and the control plane is private by default now. Say which you want: -ControlPlane public keeps it as it is; -ControlPlane private replaces the cluster (AKS cannot make an API server private in place), so redeploy into a new environment instead."
+    } else {
+        $controlPlaneAccess = 'private'
+    }
+    $privateControlPlane = $controlPlaneAccess -eq 'private'
+    $settings.APP_AKS_PRIVATE_CLUSTER = if ($privateControlPlane) { 'true' } else { 'false' }
+    $settings.APP_PRIVATE_REGISTRY = $settings.APP_AKS_PRIVATE_CLUSTER
+    if ($previousControlPlane -and $previousControlPlane -ne $controlPlaneAccess) {
+        Write-Warning "Switching '$EnvironmentName' from a $previousControlPlane to a $controlPlaneAccess control plane replaces its cluster; review the azd provision preview before it applies."
+    }
+    Write-Host "Control plane: $controlPlaneAccess$(if ($privateControlPlane) { ' (private API server and registry; images are built and deployed from the deploy host)' } else { '' })."
     if ($OperatorMode) {
         # Every request will act as this user, so the API authorizes against their own object ID.
         $operatorJson = Get-CliText (& az ad signed-in-user show --query '{id:id,upn:userPrincipalName}' --output json --only-show-errors 2>$null)
@@ -730,16 +801,27 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Infrastructure preview failed. Nothing was deployed.' }
     }
 
-    Invoke-Azd @('up') 'provision the cluster and deploy both services'
+    if ($privateControlPlane) {
+        # The API server and the registry are reachable only from inside the network, so the cluster bootstrap and the
+        # image build wait for the deploy stage below. Provisioning itself goes through Azure Resource Manager.
+        $env:CLOUDLENS_PROVISION_ONLY = '1'
+        try { Invoke-Azd @('provision') 'provision the network, private cluster, private registry and deploy host' } finally { Remove-Item Env:CLOUDLENS_PROVISION_ONLY -ErrorAction SilentlyContinue }
+    } else {
+        Invoke-Azd @('up') 'provision the cluster and deploy both services'
+    }
 
-    Write-Step 'Verifying the deployment'
-    $apiImage = Get-AzdValue 'SERVICE_API_IMAGE_NAME'
-    $webImage = Get-AzdValue 'SERVICE_WEB_IMAGE_NAME'
-    Write-Host "AKS cluster            = $(Get-AzdValue 'AZURE_AKS_CLUSTER_NAME')"
-    Write-Host "SERVICE_API_IMAGE_NAME = $(if ($apiImage) { $apiImage } else { '<not set>' })"
-    Write-Host "SERVICE_WEB_IMAGE_NAME = $(if ($webImage) { $webImage } else { '<not set>' })"
-    if (-not $apiImage -or -not $webImage) {
-        throw 'azd did not publish both container images. Review the azd output above, then rerun this script.'
+    if ($privateControlPlane) {
+        Write-Step 'Infrastructure is in place; the services are deployed from the deploy host after sign-in and role assignments'
+    } else {
+        Write-Step 'Verifying the deployment'
+        $apiImage = Get-AzdValue 'SERVICE_API_IMAGE_NAME'
+        $webImage = Get-AzdValue 'SERVICE_WEB_IMAGE_NAME'
+        Write-Host "AKS cluster            = $(Get-AzdValue 'AZURE_AKS_CLUSTER_NAME')"
+        Write-Host "SERVICE_API_IMAGE_NAME = $(if ($apiImage) { $apiImage } else { '<not set>' })"
+        Write-Host "SERVICE_WEB_IMAGE_NAME = $(if ($webImage) { $webImage } else { '<not set>' })"
+        if (-not $apiImage -or -not $webImage) {
+            throw 'azd did not publish both container images. Review the azd output above, then rerun this script.'
+        }
     }
     if ($SkipProcessor) {
         Write-Host 'Scheduled processor: left as configured (-SkipProcessor).'
@@ -818,7 +900,9 @@ try {
         $currentWebClientId = Get-AzdValue 'MEGHKOSHA_WEB_CLIENT_ID'
         Set-AzdValue 'MEGHKOSHA_API_CLIENT_ID' $apiClientId
         Set-AzdValue 'MEGHKOSHA_WEB_CLIENT_ID' $webClientId
-        if ($currentApiClientId -ne $apiClientId -or $currentWebClientId -ne $webClientId) {
+        if ($privateControlPlane) {
+            Write-Host 'The services are deployed from the deploy host next, and they carry these client IDs; no redeploy needed.'
+        } elseif ($currentApiClientId -ne $apiClientId -or $currentWebClientId -ne $webClientId) {
             # The client IDs only feed the pods' environment, so redeploying the services is enough.
             Invoke-Azd @('deploy') 'roll out the sign-in configuration'
         } else {
@@ -878,6 +962,30 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    # 6b. Deploy stage for a private control plane
+    # -----------------------------------------------------------------------
+    $deployStage = 'complete'
+    if ($privateControlPlane) {
+        if (Test-PrivateClusterReachable) {
+            Write-Step 'This machine can reach the private cluster: preparing it and deploying the services here'
+            & (Join-Path $PSScriptRoot 'deploy-on-host.ps1') -EnvironmentName $EnvironmentName -MaxAttempts $MaxAttempts -SettleSeconds $SettleSeconds -SkipLogin
+            $deployStage = 'complete'
+        } else {
+            $deployStage = 'pending-on-deploy-host'
+            Write-Step 'The cluster and registry are private, so the services are deployed from inside the network'
+            if (Get-AzdValue 'APP_DEPLOY_HOST_ID') {
+                try {
+                    & (Join-Path $PSScriptRoot 'prepare-deploy-host.ps1') -EnvironmentName $EnvironmentName -RepoUrl $RepoUrl -RepoBranch $RepoBranch
+                } catch {
+                    Write-Warning "The deploy host could not be prepared automatically: $($_.Exception.Message) Rerun: pwsh ./scripts/prepare-deploy-host.ps1 -EnvironmentName $EnvironmentName"
+                }
+            } else {
+                Write-Host 'This environment has no deploy host (-NoDeployHost). From a machine that reaches the cluster''s virtual network, with this environment''s settings imported, run: pwsh ./scripts/deploy-on-host.ps1 -EnvironmentName' $EnvironmentName -ForegroundColor Yellow
+            }
+        }
+    }
+
+    # -----------------------------------------------------------------------
     # 7. Summary
     # -----------------------------------------------------------------------
     Write-Step 'Deployment summary'
@@ -908,6 +1016,10 @@ try {
         cluster = Get-AzdValue 'AZURE_AKS_CLUSTER_NAME'
         authMode = $settings.MEGHKOSHA_AUTH_MODE
         ingressVisibility = $visibility
+        controlPlane = $controlPlaneAccess
+        deployStage = $deployStage
+        deployHost = Get-AzdValue 'APP_DEPLOY_HOST_NAME'
+        natGatewayIp = Get-AzdValue 'APP_NAT_GATEWAY_IP'
         webUrl = $(if ($privateIngress -or $publicUrlOpen) { $url } else { '' })
         privateIp = $(if ($privateIngress) { Get-AzdValue 'APP_INGRESS_PRIVATE_IP' } else { '' })
         privateLinkServiceId = $(if ($privateIngress) { Get-AzdValue 'APP_PRIVATE_LINK_ID' } else { '' })
@@ -928,6 +1040,11 @@ try {
 }
 
 $deployed | ConvertTo-Json -Depth 5
+if ($deployed.deployStage -eq 'pending-on-deploy-host') {
+    Write-Host ''
+    Write-Host 'The infrastructure, sign-in and role assignments are in place, but the app is NOT deployed yet: the cluster and registry are private.' -ForegroundColor Yellow
+    Write-Host "  Finish from the deploy host ($($deployed.deployHost)); the commands are printed above. Then the app is served at $($deployed.webUrl)."
+}
 if ($deployed.ingressVisibility -eq 'private') {
     $appHost = $deployed.webUrl -replace '^https://', ''
     Write-Host ''
@@ -941,7 +1058,7 @@ if ($deployed.ingressVisibility -eq 'private') {
         Write-Host '              Connections from the deployment subscription (and any in -PrivateLinkSubscriptionIds) are approved automatically; others wait for approval on the service.'
     }
     if ($deployed.tlsIssuer -eq 'private-ca') {
-        Write-Host '  Certificate  Signed by a CA that lives in the cluster, so browsers must trust it. Export it, then install it on the machines that open the app:'
+        Write-Host '  Certificate  Signed by a CA that lives in the cluster, so browsers must trust it. Export it, then install it on the machines that open the app (the kubectl command needs the deploy host or a network that reaches a private cluster; or wrap it in: az aks command invoke --command ...):'
         Write-Host '                [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((kubectl get secret cloudlens-private-ca --namespace cert-manager --output jsonpath=''{.data.tls\.crt}''))) | Set-Content cloudlens-ca.crt'
         Write-Host '                certutil -addstore -f Root cloudlens-ca.crt        (Windows, as administrator)'
     } elseif ($deployed.tlsIssuer -eq 'byo') {

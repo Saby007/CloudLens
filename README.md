@@ -19,6 +19,7 @@ You deploy it once into a subscription of your choice, grant it three read/cost-
 - [The three manual role assignments](#the-three-manual-role-assignments)
 - [Running on AKS](#running-on-aks)
   - [Private ingress (the default)](#private-ingress-the-default)
+  - [Private control plane (the default)](#private-control-plane-the-default)
 - [Local development](#local-development)
 - [Security notes](#security-notes)
 
@@ -171,15 +172,15 @@ az provider show --namespace Microsoft.CostManagementExports --subscription <sub
 There are two ways to deploy: one command that does the whole thing, or the step-by-step Azure Developer CLI workflow. Both use [azure.yaml](azure.yaml), and one `azd up` does all of this:
 
 1. **`azd provision` runs Terraform** ([infra/](infra)): resource group, network with an NSG on each subnet (plus dedicated ingress and Private Link subnets), AKS cluster, container registry, Log Analytics with Container Insights, managed identities with their workload-identity federation, and — per profile — the export storage and the Foundry account. Terraform state is kept in `.azure/<environment>/infra/`.
-2. **The postprovision hook** ([scripts/aks-bootstrap.ps1](scripts/aks-bootstrap.ps1)) prepares the cluster: it installs a pinned, checksum-verified cert-manager release, creates an app-routing NGINX ingress controller behind an internal load balancer with a Private Link service (or, for a public ingress, on the Terraform-owned static IP), and adds the certificate issuers. It is safe to rerun.
-3. **`azd deploy`** builds both container images remotely in Azure Container Registry, then applies [api/manifests](api/manifests) and [web/manifests](web/manifests) to the `cloudlens` namespace and waits for the rollout.
+2. **The postprovision hook** ([scripts/aks-bootstrap.ps1](scripts/aks-bootstrap.ps1)) prepares the cluster (with the default private control plane this runs on the deploy host; see [Private control plane](#private-control-plane-the-default)): it installs a pinned, checksum-verified cert-manager release, creates an app-routing NGINX ingress controller behind an internal load balancer with a Private Link service (or, for a public ingress, on the Terraform-owned static IP), and adds the certificate issuers. It is safe to rerun.
+3. **`azd deploy`** builds both container images (remotely in Azure Container Registry for a public registry; with Docker on the deploy host for a private one), then applies [api/manifests](api/manifests) and [web/manifests](web/manifests) to the `cloudlens` namespace and waits for the rollout.
 4. **cert-manager** issues the certificate for the app's host name, usually within a minute or two, and renews it automatically: from the cluster's own CA by default, or from Let's Encrypt on a public ingress.
 
 **The app is private by default.** It has no public address: it is served at `https://<label>.internal` (the `APP_WEB_ORIGIN` value in the azd environment) from an internal load balancer, and reached only from inside the virtual network, from a network connected to it (VPN, ExpressRoute, peering), or through a private endpoint — see [Private ingress](#private-ingress-the-default). Pass `-IngressVisibility public` to get the older public URL, `https://<label>.<region>.cloudapp.azure.com`, and use your own domain with `APP_CUSTOM_DOMAIN` either way ([HTTPS and custom domains](#https-and-custom-domains)).
 
 ### Option 1 — One command, end to end (recommended)
 
-`scripts/deploy-end-to-end.ps1` is this entire page in a single self-contained script: prerequisites, sign-in, environment settings, the Terraform preview, `azd up` with automatic retries, `bootstrap-identity.ps1` plus the client-ID rollout, and the three role assignments on every subscription you name. When it finishes, the app is deployed, sign-in works, and the subscriptions you listed are ready to assess — no manual follow-up steps.
+`scripts/deploy-end-to-end.ps1` is this entire page in a single self-contained script: prerequisites, sign-in, environment settings, the Terraform preview, `azd up` with automatic retries, `bootstrap-identity.ps1` plus the client-ID rollout, and the three role assignments on every subscription you name. When it finishes, the app is deployed, sign-in works, and the subscriptions you listed are ready to assess — no manual follow-up steps. **With the default private control plane the last stage, deploying the services, needs a machine inside the network:** the script does it itself when it can reach the private cluster, and otherwise prepares the deploy host and prints the one command to run there ([Private control plane](#private-control-plane-the-default)).
 
 ```powershell
 git clone --branch cloudlensdev https://github.com/Saby007/CloudLens.git
@@ -211,6 +212,9 @@ pwsh ./scripts/deploy-end-to-end.ps1 `
 | `-TlsClusterIssuer` | `private-ca` (private default), `byo` (you supply the certificate), or `letsencrypt` / `letsencrypt-staging` (public ingress only). |
 | `-PrivateLinkSubscriptionIds` | Subscriptions whose private endpoints may connect to the Private Link service automatically. Everyone else needs your approval. |
 | `-NoPrivateLink` | Skip the Private Link service; the app is then reachable only from the virtual network and networks connected to it. |
+| `-ControlPlane` | `private` (the default for a new environment) or `public`. Private means a private API server and registry, a NAT gateway and a deploy host; see [Private control plane](#private-control-plane-the-default). An existing cluster with a public API server is refused until you say `-ControlPlane public`. |
+| `-OutboundType` | `natGateway` (default) or `loadBalancer` for the cluster's outbound traffic. |
+| `-NoDeployHost` | Do not create the deploy host; you deploy from a network connected to the cluster's virtual network. |
 | `-OperatorMode` | Dev only: you cannot create Entra app registrations. Deploys without sign-in; the public URL stays closed unless you add `-AllowedIpRanges` — see [operator mode](#operator-mode-dev-without-entra-app-registrations). |
 | `-AllowedIpRanges` | Public ingress only. Only these IPv4 addresses or CIDR ranges may reach the public URL over HTTPS. With `-OperatorMode`, this is what opens it; `scripts/allow-my-ip.ps1` keeps it current when your address changes. |
 | `-ServiceManagementReference` | Your tenant requires a Service Tree ID on app registrations. If you leave it out, the script asks when the tenant refuses, suggests the ID your existing registrations use, and remembers your answer. |
@@ -230,7 +234,7 @@ az login
 pwsh ./scripts/deploy-ai.ps1 -EnvironmentName my-environment -Location centralindia
 ```
 
-The helper is Option 1 without its sign-in and role-assignment phases: it checks the tools, applies the recommended `ai` profile with the app-local Model Router and the scheduled processor, previews the Terraform plan, and runs `azd up` with the same retries. You then do [step 4 (sign-in)](#4-configure-sign-in) and [step 5 (role assignments)](#5-grant-access-to-the-subscriptions-you-want-to-assess) yourself.
+The helper is Option 1 without its sign-in and role-assignment phases: it checks the tools, applies the recommended `ai` profile with the app-local Model Router and the scheduled processor, previews the Terraform plan, and runs `azd up` with the same retries (with the default private control plane it provisions, then prepares the deploy host; see [Private control plane](#private-control-plane-the-default)). You then do [step 4 (sign-in)](#4-configure-sign-in) and [step 5 (role assignments)](#5-grant-access-to-the-subscriptions-you-want-to-assess) yourself.
 
 The equivalent raw commands are:
 
@@ -250,7 +254,7 @@ azd provision --preview
 azd up
 ```
 
-Boolean settings must be lowercase `true` or `false`. Re-running `azd up` (or `azd deploy` alone, for code changes) later updates the deployment in place, as long as kubectl and kubelogin are on your `PATH` ([Prerequisites](#prerequisites)).
+Boolean settings must be lowercase `true` or `false`. With the default private control plane, `azd up` from a machine outside the network provisions everything and then stops at the cluster bootstrap with an error that says where to run it, so use Option 1 or the deploy host ([Private control plane](#private-control-plane-the-default)), or `azd env set APP_AKS_PRIVATE_CLUSTER false` and `azd env set APP_PRIVATE_REGISTRY false` first. Re-running `azd up` (or `azd deploy` alone, for code changes) later updates the deployment in place, as long as kubectl and kubelogin are on your `PATH` ([Prerequisites](#prerequisites)).
 
 If you intentionally want exports without Foundry chat, set `APP_PROFILE=data` and omit the five Model Router/chat settings. That is an opt-out path, not the recommended deployment.
 
@@ -365,7 +369,7 @@ kubelogin convert-kubeconfig --login azurecli
 kubectl port-forward --namespace cloudlens service/web 8080:8080
 ```
 
-If you set `APP_AKS_API_AUTHORIZED_IP_RANGES`, your address must be in it.
+If you set `APP_AKS_API_AUTHORIZED_IP_RANGES`, your address must be in it. With the default private cluster, run these commands on the deploy host (or a network that reaches the cluster); from anywhere else the cluster's address does not resolve.
 
 Either way:
 
@@ -420,7 +424,7 @@ Allow a few minutes for RBAC propagation, then use **Refresh schedules** in the 
 
 ### Cluster access
 
-The cluster has no local accounts: kubectl signs in with Entra ID and is authorized by Azure RBAC. Terraform makes the identity that ran `azd provision` an **Azure Kubernetes Service RBAC Cluster Admin**; grant colleagues *Azure Kubernetes Service RBAC Reader* or *Writer* on the cluster as needed.
+The cluster has no local accounts: kubectl signs in with Entra ID (with the default private control plane, from the deploy host or a network that reaches the cluster, or through `az aks command invoke`) and is authorized by Azure RBAC. Terraform makes the identity that ran `azd provision` an **Azure Kubernetes Service RBAC Cluster Admin**; grant colleagues *Azure Kubernetes Service RBAC Reader* or *Writer* on the cluster as needed.
 
 ```powershell
 az aks get-credentials --resource-group (azd env get-value AZURE_RESOURCE_GROUP) --name (azd env get-value AZURE_AKS_CLUSTER_NAME)
@@ -442,7 +446,11 @@ Set these with `azd env set <name> <value>` before `azd provision`. Values marke
 | `APP_AKS_ZONES` | `1,2,3` | **Day-0.** Node pools and the ingress IP spread across these zones; `none` for regions without availability zones. |
 | `APP_AKS_KUBERNETES_VERSION` | region default | The `stable` auto-upgrade channel keeps the cluster current inside the maintenance window. |
 | `APP_AKS_MAINTENANCE_DAY`, `APP_AKS_MAINTENANCE_START` | `Sunday`, `02:00` | Weekly four-hour UTC window for cluster and node-image upgrades. |
-| `APP_AKS_API_AUTHORIZED_IP_RANGES` | *(any)* | Comma-separated CIDR ranges allowed to reach the Kubernetes API server. Include the machine that runs `azd`. |
+| `APP_AKS_API_AUTHORIZED_IP_RANGES` | *(any)* | Public API server only (rejected for a private cluster). Comma-separated CIDR ranges allowed to reach the Kubernetes API server. Include the machine that runs `azd`. |
+| `APP_AKS_PRIVATE_CLUSTER`, `APP_PRIVATE_REGISTRY` | `true`, `true` | **Day-0.** A private API server (no public address) and a Premium container registry reachable only through a private endpoint. `false` keeps the public API server and the Basic registry. AKS cannot make an existing API server private in place; changing it replaces the cluster. |
+| `APP_AKS_OUTBOUND_TYPE` | `natGateway` | **Day-0.** `natGateway`: outbound traffic leaves through a NAT gateway with one static public IP (`APP_NAT_GATEWAY_IP`), and there is no public load balancer. `loadBalancer`: the cluster's load balancer with managed outbound IPs (the two SNAT settings below apply only to it). |
+| `APP_DEPLOY_HOST_ENABLED` | `true` | Create the deploy host (a Linux VM with no public address, plus Azure Bastion) when the cluster or the registry is private. Turn it off if you deploy from a network that is connected to this one. |
+| `APP_DEPLOY_HOST_SUBNET_PREFIX`, `APP_BASTION_SUBNET_PREFIX`, `APP_DEPLOY_HOST_VM_SIZE`, `APP_DEPLOY_HOST_SHUTDOWN_TIME` | `10.42.1.96/27`, `10.42.1.128/26`, `Standard_D4s_v5`, `1800` | **Day-0** for the subnets (inside the VNet, not overlapping the others; Bastion needs /26 or larger). The VM stops itself daily at this UTC time (`HHmm`; empty disables). |
 | `APP_INGRESS_VISIBILITY` | `private` | `private` or `public`. Private serves the app from an internal load balancer; public adds a static public IP. Switching recreates the ingress address — see [Moving an existing environment](#moving-an-existing-environment-between-public-and-private). |
 | `APP_INGRESS_SUBNET_PREFIX`, `APP_PRIVATE_LINK_SUBNET_PREFIX` | `10.42.1.32/27`, `10.42.1.64/27` | **Day-0.** Subnets for the internal load balancer (it takes the 5th address) and for the Private Link service's NAT addresses. They must sit inside the VNet and not overlap the other subnets. |
 | `APP_PRIVATE_LINK_ENABLED` | `true` | Create a Private Link service so other networks can reach the app through a private endpoint. |
@@ -463,7 +471,7 @@ Set these with `azd env set <name> <value>` before `azd provision`. Values marke
 ### Networking, outbound connections and logs
 
 - **Subnet NSGs.** Terraform attaches an NSG to both subnets. On a private ingress the node subnet's NSG denies all inbound traffic from the internet; on a public one it allows only HTTP and HTTPS, and only to the ingress IP (HTTP is for Let's Encrypt's challenge). The ingress and Private Link subnets have NSGs of their own; Azure's default rules cover traffic inside the VNet, load balancer probes and outbound traffic. Some tenants' Azure Policy attaches its own NSG to any subnet without one, and that NSG blocks the app. Terraform therefore sets the NSG in the request that creates the subnet and, on an environment where a policy already attached one, replaces it on the next `azd provision`. Once the subnets have these NSGs, such a policy has no reason to touch them again.
-- **Outbound connections.** Every connection from the cluster to Azure or the internet holds one of its node's SNAT ports on the load balancer. Each node gets `APP_AKS_OUTBOUND_PORTS` ports, and an idle connection gives its port back after `APP_AKS_OUTBOUND_IDLE_TIMEOUT` minutes. The API and the processor share one connection pool and one managed identity credential per process instead of opening a connection and fetching a token for every call, and they close idle connections after 30 seconds.
+- **Outbound connections.** By default they leave through a NAT gateway (one static public IP, `APP_NAT_GATEWAY_IP`; it accepts no inbound connection and there is no public load balancer), which has 64,000 SNAT ports per IP, so the settings below do not apply. With `APP_AKS_OUTBOUND_TYPE=loadBalancer`, every connection from the cluster to Azure or the internet holds one of its node's SNAT ports on the load balancer. Each node gets `APP_AKS_OUTBOUND_PORTS` ports, and an idle connection gives its port back after `APP_AKS_OUTBOUND_IDLE_TIMEOUT` minutes. The API and the processor share one connection pool and one managed identity credential per process instead of opening a connection and fetching a token for every call, and they close idle connections after 30 seconds.
 - **Replicas on separate nodes.** The two api replicas, and the two web replicas, are never placed on the same node while another application node can take one, so a single node failure doesn't take the app down. Each rollout's new pods are spread the same way.
 - **Logs.** Container Insights sends container logs (`ContainerLogV2`), Kubernetes events (`KubeEvents`) and pod inventory (`KubePodInventory`) to the environment's Log Analytics workspace. These are the streams of Microsoft's default *Logs and Events* preset, without the `kube-system`, `gatekeeper-system` and `azure-arc` namespaces. Data starts arriving about 10 minutes after the first `azd provision` that creates the rule. The API and the processor log at INFO, but the Azure SDKs' request-by-request tracing is left out. For example, the processor's warnings from the last day:
 
@@ -504,7 +512,7 @@ pwsh ./scripts/deploy-end-to-end.ps1 `
 
 **Sign-in.** Entra sign-in needs the redirect URI `https://<host>/auth-callback.html`. `bootstrap-identity.ps1` registers it for a new environment, and refuses to replace an existing one.
 
-**What stays public.** The private ingress covers the application. The AKS API server and the container registry keep their public endpoints, protected by Entra ID and Azure RBAC; limit the API server with `APP_AKS_API_AUTHORIZED_IP_RANGES`. Making them private is a separate change.
+**The control plane is private too.** See [Private control plane](#private-control-plane-the-default): the AKS API server and the container registry have no public access either, and what remains public is only the NAT gateway's outbound-only address and Azure Bastion's address for administrators.
 
 #### Moving an existing environment between public and private
 
@@ -525,6 +533,36 @@ pwsh ./scripts/deploy-test-jumpbox.ps1 -EnvironmentName my-environment -Destroy 
 ```
 
 Bastion bills hourly until it is destroyed, so run `-Destroy` when you are done. Use `-ManualConnection` when the deployment's Private Link service does not auto-approve your subscription (then approve the connection on the service), and `-PlanOnly` to see what would be built. The password is also kept in the state under `.azure/<environment>/test-jumpbox`, which is git-ignored and sensitive.
+
+### Private control plane (the default)
+
+A new environment is private end to end. Besides the [private ingress](#private-ingress-the-default):
+
+- the **Kubernetes API server** is private (`APP_AKS_PRIVATE_CLUSTER`): it has only an address in the virtual network;
+- the **container registry** is Premium with a private endpoint and no public access (`APP_PRIVATE_REGISTRY`), with dedicated data endpoints so image layers also travel over the private endpoint;
+- **outbound traffic** leaves through a NAT gateway (`APP_AKS_OUTBOUND_TYPE=natGateway`): one static public IP that nothing can connect to, and no public load balancer. The cluster still needs outbound access to pull images from Microsoft and other registries and to call Azure APIs. Where that is not allowed either, use Azure Firewall with user-defined routing (not built here);
+- a **deploy host** (`APP_DEPLOY_HOST_ENABLED`) sits inside the network: a Linux VM with no public address, reached through Azure Bastion, with Azure CLI, azd, kubectl, kubelogin, Terraform, PowerShell and Docker installed. It shuts itself down daily.
+
+Provisioning goes through Azure Resource Manager, so it runs from anywhere. What cannot is everything that touches the API server or the registry: the cluster bootstrap (cert-manager, the ingress controller), building and pushing the images (ACR Tasks cannot reach a private registry, so the images are built with Docker on the deploy host), and applying the manifests. `deploy-end-to-end.ps1` therefore does the following:
+
+1. From your machine: provision (the cluster bootstrap is skipped), configure sign-in and grant the subscription roles.
+2. Check whether this machine can reach the private API server (it can on a VPN or the deploy host). If so, it runs the deploy stage itself.
+3. Otherwise `scripts/prepare-deploy-host.ps1` (called automatically) starts the deploy host, copies this environment's settings and a clone of the repository onto it through `az vm run-command`, and prints the sign-in details and commands.
+
+On the deploy host (Azure portal → the VM → Connect → Bastion, user `cloudlensadmin`, password from `azd env get-value APP_DEPLOY_HOST_ADMIN_PASSWORD`):
+
+```bash
+az login --use-device-code
+azd auth login --use-device-code
+cd ~/cloudlens/CloudLens
+pwsh ./scripts/deploy-on-host.ps1 -EnvironmentName my-environment -EnvFile ~/cloudlens/my-environment.env
+```
+
+`deploy-on-host.ps1` creates the azd environment from the exported settings, runs the cluster bootstrap, builds both images with Docker (switching azure.yaml's remote build off for the run and restoring it afterwards) and runs `azd deploy`. Terraform does not run there. Every step is safe to rerun, and rerunning `prepare-deploy-host.ps1` refreshes the settings on the host. The deploying user needs **AcrPush** on the registry, which Terraform grants to the identity that provisioned.
+
+**Use `-ControlPlane public`** to keep a public API server and a Basic registry, deployed from anywhere as before (azd's remote build stays on for it). Pass `-NoDeployHost` when you deploy from a network you already connect to the virtual network; run `deploy-on-host.ps1` there with the environment's settings. An environment whose cluster has a public API server is never made private silently: AKS cannot do that in place, so Terraform would replace the cluster. The deploy script refuses until you say `-ControlPlane public`, and going private means a new environment.
+
+**Costs and caveats.** A Premium registry, Azure Bastion (billed hourly while it exists), the NAT gateway and the deploy host's disk add to the bill (see the Azure pricing calculator). Stop the host with `az vm deallocate` when you are not deploying; Bastion keeps billing until you set `APP_DEPLOY_HOST_ENABLED=false` and run `azd provision`, which removes the host and Bastion. Terraform state (`.azure/<environment>/infra`) stays on the machine that provisioned: keep it there. Not verified against a live subscription: the deploy host's tool installation (cloud-init, about 10 minutes after creation; progress is in `/var/log/cloudlens-tools.log`) and AKS's private DNS resolution from the deploy host. The jump box for testing the app from a browser (`deploy-test-jumpbox.ps1`) is a separate, test-only network and still works against a private cluster (it reads the CA through `az aks command invoke`).
 
 ### HTTPS and custom domains
 
@@ -597,7 +635,7 @@ Individual suites are `Backend`, `Frontend`, `Build`, and `Browser`. The runner 
 
 - The app never requests Entra admin consent, never requests an Azure Resource Manager scope from the browser, and never persists user bearer tokens.
 - Its managed identities hold only the roles you explicitly grant (see above) plus what the deployment itself provisions (container-scoped storage roles for its own control-state and export data). Pods reach them through workload identity federation — there are no client secrets, storage keys or registry passwords anywhere.
-- The cluster API accepts Entra ID only (local accounts are disabled) and is authorized by Azure RBAC; restrict it further with `APP_AKS_API_AUTHORIZED_IP_RANGES`.
+- The cluster API accepts Entra ID only (local accounts are disabled) and is authorized by Azure RBAC. By default it also has no public address (a private cluster), and the container registry is reachable only through a private endpoint; with a public API server, restrict it further with `APP_AKS_API_AUTHORIZED_IP_RANGES`.
 - A new environment is [private](#private-ingress-the-default): no public IP, inbound internet traffic denied at the node subnet, and the app reachable only from the virtual network or through a private endpoint to its Private Link service (whose connections you approve or pre-approve by subscription). The AKS API server and container registry remain public endpoints protected by Entra ID and Azure RBAC.
 - TLS ends at the ingress controller. Network policies admit only the ingress controller to the web pods and only the web pods to the API; the API has no public endpoint. Storage and Foundry are reachable only through private endpoints.
 - [Operator mode](#operator-mode-dev-without-entra-app-registrations) (Dev only) replaces Entra sign-in with network access control: every request acts as one configured operator, and only the addresses on the IP allow-list (enforced by the network security group) or users with cluster access (through port-forward) can reach the app. Without an allow-list, HTTPS is blocked at the network security group, the network policies admit nothing from the ingress controller, and the API refuses requests it forwarded. Never use it in production.

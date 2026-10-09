@@ -172,22 +172,30 @@ try {
     $caPem = ''
     if ($trustCa) {
         Write-Host '==> Exporting the private CA, so the jump box trusts the app''s certificate' -ForegroundColor Cyan
-        foreach ($tool in @('kubectl', 'kubelogin')) {
-            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "'$tool' is required to export the private CA (az aks install-cli), or pass -SkipCertificateTrust and install the CA yourself." }
-        }
         $cluster = Get-AzdValue 'AZURE_AKS_CLUSTER_NAME'
         $resourceGroup = Get-AzdValue 'AZURE_RESOURCE_GROUP'
-        $kubeconfig = Join-Path ([System.IO.Path]::GetTempPath()) "cloudlens-jumpbox-$([guid]::NewGuid().ToString('n')).kubeconfig"
-        try {
-            & az aks get-credentials --resource-group $resourceGroup --name $cluster --subscription $subscription --file $kubeconfig --overwrite-existing --only-show-errors
-            if ($LASTEXITCODE -ne 0) { throw 'az aks get-credentials failed.' }
-            & kubelogin convert-kubeconfig --login azurecli --kubeconfig $kubeconfig
-            if ($LASTEXITCODE -ne 0) { throw 'kubelogin convert-kubeconfig failed.' }
-            $encoded = Get-CliText (& kubectl get secret cloudlens-private-ca --namespace cert-manager --kubeconfig $kubeconfig --output 'jsonpath={.data.tls\.crt}' 2>&1)
-            if ($LASTEXITCODE -ne 0 -or -not $encoded) { throw "The cluster's private CA secret could not be read: $encoded" }
+        if ((Get-AzdValue 'APP_AKS_PRIVATE_CLUSTER') -eq 'true') {
+            # The API server has no address this machine can reach, so the read runs on the cluster through Azure
+            # Resource Manager (az aks command invoke); no kubectl or network path is needed here.
+            $encoded = Get-CliText (& az aks command invoke --resource-group $resourceGroup --name $cluster --subscription $subscription --command 'kubectl get secret cloudlens-private-ca --namespace cert-manager --output jsonpath={.data.tls\.crt}' --query logs --output tsv --only-show-errors 2>&1)
+            if ($LASTEXITCODE -ne 0 -or -not $encoded) { throw "The cluster's private CA secret could not be read through az aks command invoke: $encoded" }
             $caPem = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
-        } finally {
-            Remove-Item -LiteralPath $kubeconfig -Force -ErrorAction SilentlyContinue
+        } else {
+            foreach ($tool in @('kubectl', 'kubelogin')) {
+                if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "'$tool' is required to export the private CA (az aks install-cli), or pass -SkipCertificateTrust and install the CA yourself." }
+            }
+            $kubeconfig = Join-Path ([System.IO.Path]::GetTempPath()) "cloudlens-jumpbox-$([guid]::NewGuid().ToString('n')).kubeconfig"
+            try {
+                & az aks get-credentials --resource-group $resourceGroup --name $cluster --subscription $subscription --file $kubeconfig --overwrite-existing --only-show-errors
+                if ($LASTEXITCODE -ne 0) { throw 'az aks get-credentials failed.' }
+                & kubelogin convert-kubeconfig --login azurecli --kubeconfig $kubeconfig
+                if ($LASTEXITCODE -ne 0) { throw 'kubelogin convert-kubeconfig failed.' }
+                $encoded = Get-CliText (& kubectl get secret cloudlens-private-ca --namespace cert-manager --kubeconfig $kubeconfig --output 'jsonpath={.data.tls\.crt}' 2>&1)
+                if ($LASTEXITCODE -ne 0 -or -not $encoded) { throw "The cluster's private CA secret could not be read: $encoded" }
+                $caPem = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
+            } finally {
+                Remove-Item -LiteralPath $kubeconfig -Force -ErrorAction SilentlyContinue
+            }
         }
         # Only the certificate may travel to the VM, never a key.
         if ($caPem -notmatch '-----BEGIN CERTIFICATE-----' -or $caPem -match 'PRIVATE KEY') { throw 'The private CA secret did not hold a plain certificate, so nothing was installed.' }

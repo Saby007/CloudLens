@@ -18,6 +18,11 @@ param(
     [int] $MaxAttempts = 3,
     [ValidateSet('private', 'public')]
     [string] $IngressVisibility,
+    [ValidateSet('private', 'public')]
+    [string] $ControlPlane,
+    [ValidateSet('natGateway', 'loadBalancer')]
+    [string] $OutboundType,
+    [switch] $NoDeployHost,
     [switch] $SkipPreview,
     [switch] $SkipProcessor,
     [switch] $InstallKubernetesTools,
@@ -36,7 +41,9 @@ $parameters = @{
 }
 if ($SubscriptionId) { $parameters.SubscriptionId = $SubscriptionId }
 if ($PSBoundParameters.ContainsKey('IngressVisibility')) { $parameters.IngressVisibility = $IngressVisibility }
-foreach ($name in @('SkipPreview', 'SkipProcessor', 'InstallKubernetesTools', 'PlanOnly')) {
+if ($PSBoundParameters.ContainsKey('ControlPlane')) { $parameters.ControlPlane = $ControlPlane }
+if ($PSBoundParameters.ContainsKey('OutboundType')) { $parameters.OutboundType = $OutboundType }
+foreach ($name in @('NoDeployHost', 'SkipPreview', 'SkipProcessor', 'InstallKubernetesTools', 'PlanOnly')) {
     if ($PSBoundParameters.ContainsKey($name)) { $parameters[$name] = $PSBoundParameters[$name] }
 }
 

@@ -123,6 +123,38 @@ foreach ($subscription in $allowedSubscriptions) {
         throw "APP_PRIVATE_LINK_ALLOWED_SUBSCRIPTIONS must list subscription IDs (GUIDs) separated by commas; '$subscription' is not one."
     }
 }
+$apiAuthorizedRanges = Get-Setting 'APP_AKS_API_AUTHORIZED_IP_RANGES'
+
+# The control plane is private by default too: a private API server, a private registry, a NAT gateway for outbound
+# traffic, and a deploy host inside the network to deploy from. Exact, lowercase, like Terraform's variables.
+foreach ($name in @('APP_AKS_PRIVATE_CLUSTER', 'APP_PRIVATE_REGISTRY', 'APP_DEPLOY_HOST_ENABLED')) {
+    if ((Get-Setting $name 'true') -cnotin @('true', 'false')) { throw "$name must be true or false (lowercase)." }
+}
+$privateCluster = (Get-Setting 'APP_AKS_PRIVATE_CLUSTER' 'true') -ceq 'true'
+$privateRegistry = (Get-Setting 'APP_PRIVATE_REGISTRY' 'true') -ceq 'true'
+$outboundType = Get-Setting 'APP_AKS_OUTBOUND_TYPE' 'natGateway'
+if ($outboundType -cnotin @('natGateway', 'loadBalancer')) { throw 'APP_AKS_OUTBOUND_TYPE must be natGateway or loadBalancer.' }
+if ($privateCluster -and $apiAuthorizedRanges) {
+    throw 'APP_AKS_API_AUTHORIZED_IP_RANGES limits a public API server; a private cluster has none. Clear it, or set APP_AKS_PRIVATE_CLUSTER=false.'
+}
+$deployHostEnabled = ((Get-Setting 'APP_DEPLOY_HOST_ENABLED' 'true') -ceq 'true') -and ($privateCluster -or $privateRegistry)
+if ($deployHostEnabled) {
+    $deployHostSubnet = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_DEPLOY_HOST_SUBNET_PREFIX' '10.42.1.96/27'))
+    $bastionSubnet = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_BASTION_SUBNET_PREFIX' '10.42.1.128/26'))
+    $taken = @($nodes, $endpoints)
+    if ($privateIngress) { $taken += $ingressSubnet; if ($privateLinkEnabled) { $taken += $privateLinkSubnet } }
+    foreach ($subnet in @(@{ Name = 'APP_DEPLOY_HOST_SUBNET_PREFIX'; Value = $deployHostSubnet; Largest = 28 }, @{ Name = 'APP_BASTION_SUBNET_PREFIX'; Value = $bastionSubnet; Largest = 26 })) {
+        $block = $subnet.Value
+        if ($block.BaseAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+            -not $vnet.Contains($block.BaseAddress) -or $block.PrefixLength -lt $vnet.PrefixLength -or $block.PrefixLength -gt $subnet.Largest) {
+            throw "$($subnet.Name) must be IPv4, within the VNet, and /$($subnet.Largest) or larger."
+        }
+        foreach ($other in $taken) {
+            if (Test-Overlap $block $other) { throw "$($subnet.Name) must not overlap the other subnets." }
+        }
+    }
+    if (Test-Overlap $deployHostSubnet $bastionSubnet) { throw 'APP_DEPLOY_HOST_SUBNET_PREFIX and APP_BASTION_SUBNET_PREFIX must not overlap.' }
+}
 $pods = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_AKS_POD_CIDR' '10.244.0.0/16'))
 $services = [System.Net.IPNetwork]::Parse((Get-Setting 'APP_AKS_SERVICE_CIDR' '10.0.0.0/16'))
 foreach ($range in @(@{ Name = 'APP_AKS_POD_CIDR'; Value = $pods }, @{ Name = 'APP_AKS_SERVICE_CIDR'; Value = $services })) {
@@ -179,7 +211,7 @@ foreach ($pool in @(@('APP_AKS_SYSTEM_MAX_NODES', '3', 20), @('APP_AKS_USER_MAX_
     $count = Get-WholeNumber $pool[0] $pool[1] 1 $pool[2]
     $nodes += $count + [Math]::Ceiling($count * 0.1)
 }
-if ($nodes * $outboundPorts -gt 64000 * $outboundIps) {
+if ($outboundType -ceq 'loadBalancer' -and $nodes * $outboundPorts -gt 64000 * $outboundIps) {
     throw "The node pools at their maximum size, plus one upgrade surge node per pool, need $($nodes * $outboundPorts) SNAT ports, but the outbound IPs provide $(64000 * $outboundIps). Lower APP_AKS_OUTBOUND_PORTS, raise APP_AKS_OUTBOUND_IPS, or lower the pools' maximum node counts."
 }
 
@@ -267,6 +299,10 @@ if ($chatRuntime -and ($profile -ne 'ai' -or -not (Get-BooleanSetting 'APP_AI_VA
     ingressPrivateIp = $ingressPrivateIp
     privateLinkEnabled = $privateLinkEnabled
     privateLinkAllowedSubscriptions = @($allowedSubscriptions)
+    aksPrivateCluster = $privateCluster
+    privateRegistry = $privateRegistry
+    outboundType = $outboundType
+    deployHostEnabled = $deployHostEnabled
     customDomain = $domain
     cloudPreflightStillRequired = $true
 } | ConvertTo-Json -Compress

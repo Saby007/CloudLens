@@ -18,6 +18,7 @@ function Reset-State {
         kubeconfig = ''
         content = $certManagerContent
         rbacDenied = $false
+        apiServer = ''
     }
 }
 
@@ -41,6 +42,11 @@ function az {
         $state.kubeconfig = $file
         $state.calls.Add("get-credentials $($a[[array]::IndexOf($a, '--name') + 1])")
         return
+    }
+    if ($a[0] -eq 'aks' -and $a[1] -eq 'show') {
+        if ($a -notcontains 'privateFqdn') { throw "Unexpected az aks show query: $($a -join ' ')" }
+        $state.calls.Add('aks show')
+        return $(if ($state.apiServer) { $state.apiServer } else { 'cluster-private.invalid' })
     }
     throw "Unexpected az call: $($a -join ' ')"
 }
@@ -258,8 +264,36 @@ try {
         throw 'Nothing may be installed before access is confirmed.'
     }
 
+    # A private cluster's API server answers only inside its network. The deploy script provisions from anywhere with
+    # CLOUDLENS_PROVISION_ONLY set, and the hook then does nothing; without it, a machine that cannot reach the API
+    # server is told where to run the hook; a machine that can proceeds as usual.
+    $env:APP_AKS_PRIVATE_CLUSTER = 'true'
+    Reset-State
+    $env:CLOUDLENS_PROVISION_ONLY = '1'
+    try { & $script -CertManagerSha256 $certManagerSha 6>$null | Out-Null } finally { Remove-Item Env:CLOUDLENS_PROVISION_ONLY -ErrorAction SilentlyContinue }
+    if ($global:bootstrapTestState.calls.Count) { throw 'A provision-only run must leave a private cluster alone without calling Azure or the cluster.' }
+    Reset-State
+    $outside = $null
+    try { & $script -CertManagerSha256 $certManagerSha -RbacTimeoutSeconds 30 6>$null | Out-Null } catch { $outside = $_.Exception.Message }
+    if ($outside -notmatch 'private and cannot be reached' -or $outside -notmatch 'prepare-deploy-host.ps1' -or $global:bootstrapTestState.calls -contains 'get-credentials aks-0123456789abc') {
+        throw "A machine outside the network must be told where to run the hook, before any credentials are fetched; got: $outside"
+    }
+    Reset-State
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        $env:CLOUDLENS_API_SERVER_PORT = "$($listener.LocalEndpoint.Port)"
+        $global:bootstrapTestState.apiServer = '127.0.0.1'
+        & $script -CertManagerSha256 $certManagerSha -RbacTimeoutSeconds 30 6>$null | Out-Null
+    } finally {
+        Remove-Item Env:CLOUDLENS_API_SERVER_PORT -ErrorAction SilentlyContinue
+        $listener.Stop()
+    }
+    if ($global:bootstrapTestState.calls -notcontains 'apply bootstrap') { throw 'A machine that reaches the private API server must prepare the cluster as usual.' }
+    Remove-Item Env:APP_AKS_PRIVATE_CLUSTER -ErrorAction SilentlyContinue
+
     [ordered]@{ result = 'passed'; rbacWaited = $true; checksumEnforced = $true; webhookRetried = $true; kubeconfigIsolated = $true
-                kubectlWarningsIgnored = $true; deniedAccessReported = $true } | ConvertTo-Json -Compress
+                kubectlWarningsIgnored = $true; deniedAccessReported = $true; privateClusterSkippedOrRefusedFromOutside = $true } | ConvertTo-Json -Compress
 } finally {
     foreach ($entry in $saved.GetEnumerator()) { [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process') }
     Remove-Variable -Name bootstrapTestState -Scope Global -ErrorAction SilentlyContinue

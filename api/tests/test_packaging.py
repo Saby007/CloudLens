@@ -151,6 +151,9 @@ def test_each_profile_defaults_to_no_processor_ai_runtime_or_export_exception(pr
     # The app is private by default, so its certificate comes from the cluster's own CA and it has a private address.
     assert settings["ingressVisibility"] == "private" and settings["tlsIssuer"] == "private-ca"
     assert settings["ingressPrivateIp"] == "10.42.1.36" and settings["privateLinkEnabled"] is True
+    # So are the API server and the registry, with a NAT gateway for outbound traffic and a deploy host inside the network.
+    assert settings["aksPrivateCluster"] is True and settings["privateRegistry"] is True
+    assert settings["outboundType"] == "natGateway" and settings["deployHostEnabled"] is True
     assert not settings["signInConfigured"]
     assert settings["authMode"] == "entra"
     assert not settings["processorEnabled"]
@@ -196,7 +199,16 @@ def test_azure_operations_are_blocked_without_explicit_approval(operation):
     ({"APP_AKS_OUTBOUND_PORTS": "512"}, "APP_AKS_OUTBOUND_PORTS must be a whole number between 1024 and 64000"),
     ({"APP_AKS_OUTBOUND_IPS": "0"}, "APP_AKS_OUTBOUND_IPS must be a whole number"),
     ({"APP_AKS_OUTBOUND_IDLE_TIMEOUT": "2"}, "APP_AKS_OUTBOUND_IDLE_TIMEOUT must be a whole number between 4 and 120"),
-    ({"APP_AKS_USER_MAX_NODES": "6"}, "need 70400 SNAT ports"),
+    ({"APP_AKS_USER_MAX_NODES": "6", "APP_AKS_OUTBOUND_TYPE": "loadBalancer"}, "need 70400 SNAT ports"),
+    ({"APP_AKS_PRIVATE_CLUSTER": "True"}, "APP_AKS_PRIVATE_CLUSTER must be true or false"),
+    ({"APP_PRIVATE_REGISTRY": "yes"}, "APP_PRIVATE_REGISTRY must be true or false"),
+    ({"APP_DEPLOY_HOST_ENABLED": "1"}, "APP_DEPLOY_HOST_ENABLED must be true or false"),
+    ({"APP_AKS_OUTBOUND_TYPE": "natgateway"}, "APP_AKS_OUTBOUND_TYPE must be natGateway or loadBalancer"),
+    ({"APP_AKS_API_AUTHORIZED_IP_RANGES": "203.0.113.7/32"}, "a private cluster has none"),
+    ({"APP_BASTION_SUBNET_PREFIX": "10.42.1.128/27"}, "APP_BASTION_SUBNET_PREFIX must be IPv4, within the VNet, and /26 or larger"),
+    ({"APP_DEPLOY_HOST_SUBNET_PREFIX": "10.99.0.0/27"}, "APP_DEPLOY_HOST_SUBNET_PREFIX must be IPv4, within the VNet, and /28 or larger"),
+    ({"APP_DEPLOY_HOST_SUBNET_PREFIX": "10.42.1.32/27"}, "APP_DEPLOY_HOST_SUBNET_PREFIX must not overlap the other subnets"),
+    ({"APP_BASTION_SUBNET_PREFIX": "10.42.1.64/26"}, "APP_BASTION_SUBNET_PREFIX must not overlap the other subnets"),
     ({"APP_AKS_USER_MAX_NODES": "five"}, "APP_AKS_USER_MAX_NODES must be a whole number"),
     ({"APP_ENABLE_PROCESSOR": "True"}, "must be true or false (lowercase)"),
     ({"MEGHKOSHA_API_CLIENT_ID": "33333333-3333-3333-3333-333333333333"}, "must contain a nonzero UUID"),
@@ -221,9 +233,21 @@ def test_invalid_or_unimplemented_configuration_fails_before_cloud_calls(overrid
 
 
 def test_a_second_outbound_ip_makes_room_for_a_larger_application_pool():
-    result = run_input_validation({"APP_AKS_USER_MAX_NODES": "6", "APP_AKS_OUTBOUND_IPS": "2"})
+    result = run_input_validation({"APP_AKS_USER_MAX_NODES": "6", "APP_AKS_OUTBOUND_IPS": "2", "APP_AKS_OUTBOUND_TYPE": "loadBalancer"})
     assert result.returncode == 0, result.stderr
 
+
+def test_a_nat_gateway_has_no_snat_port_limit_to_plan_around():
+    result = run_input_validation({"APP_AKS_USER_MAX_NODES": "6"})
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_public_control_plane_keeps_its_authorized_ranges_and_needs_no_deploy_host():
+    result = run_input_validation({"APP_AKS_PRIVATE_CLUSTER": "false", "APP_PRIVATE_REGISTRY": "false",
+                                   "APP_AKS_API_AUTHORIZED_IP_RANGES": "203.0.113.7/32", "APP_DEPLOY_HOST_SUBNET_PREFIX": "10.42.1.32/27"})
+    assert result.returncode == 0, result.stderr
+    settings = json.loads(result.stdout)
+    assert settings["aksPrivateCluster"] is False and settings["privateRegistry"] is False and settings["deployHostEnabled"] is False
 
 def test_operator_mode_needs_an_operator_but_no_sign_in_registrations():
     result = run_input_validation({"MEGHKOSHA_AUTH_MODE": "operator",
@@ -378,7 +402,53 @@ def test_end_to_end_helper_deploys_once_retries_and_never_hides_a_question():
     assert summary["operatorModeSkipsSignInAndPublicUrl"] and summary["allowListOpensPublicUrl"]
     assert summary["cloudShellSkipsBlockedHealthCheck"]
     assert summary["privateIngressIsTheDefault"] and summary["publicAddressNeverSwitchedSilently"]
+    assert summary["privateControlPlaneIsTheDefault"] and summary["deployStageRunsWhereTheClusterIsReachable"]
+    assert summary["publicClusterNeverReplacedSilently"]
 
+
+def test_the_deploy_host_deploys_from_inside_the_network_and_restores_what_it_changes():
+    summary = run_powershell_harness("test-deploy-host.ps1")
+    assert summary == {"result": "passed", "importsExportedSettings": True, "buildsLocallyForAPrivateRegistry": True,
+                       "restoresAzureYaml": True, "retriesAndReports": True, "explainsUnusableDocker": True,
+                       "refusesWhatCannotWork": True}
+
+
+def test_the_deploy_host_installs_every_tool_the_deploy_stage_uses():
+    cloud_init = (PROJECT_ROOT / "infra" / "deploy-host-cloud-init.yaml").read_text()
+    for tool in ("InstallAzureCLIDeb", "install-azd.sh", "az aks install-cli", "kubelogin", "apt-get install -y terraform",
+                 "apt-get install -y powershell", "docker.io", "usermod -aG docker cloudlensadmin", "/var/lib/cloudlens/tools-ready"):
+        assert tool in cloud_init, tool
+    # prepare-deploy-host.ps1 waits on this marker and signs in as this user.
+    assert (PROJECT_ROOT / "scripts" / "prepare-deploy-host.ps1").read_text().count("/var/lib/cloudlens/tools-ready") >= 1
+    assert 'deploy_host_admin = "cloudlensadmin"' in (PROJECT_ROOT / "infra" / "deploy-host.tf").read_text()
+    deploy_on_host = (PROJECT_ROOT / "scripts" / "deploy-on-host.ps1").read_text()
+    for command in ("docker", "azd hooks run postprovision", "azd deploy"):
+        assert command in deploy_on_host, command
+
+
+def test_a_private_registry_is_never_built_into_by_the_cloud_and_the_default_build_is_unchanged():
+    # The public default keeps azd's remote build, so a laptop without Docker still deploys. Only the deploy stage of a
+    # private registry turns it off, for its own run, on the deploy host's copy.
+    azure_yaml = (PROJECT_ROOT / "azure.yaml").read_text()
+    assert azure_yaml.count("remoteBuild: true") == 2 and "remoteBuild: false" not in azure_yaml
+    script = (PROJECT_ROOT / "scripts" / "deploy-on-host.ps1").read_text()
+    assert "Set-RemoteBuild -Enabled $false" in script and "WriteAllText($azureYaml, $originalYaml)" in script
+    core = (PROJECT_ROOT / "infra" / "core.tf").read_text()
+    assert 'sku                           = var.private_registry ? "Premium" : "Basic"' in core
+    assert "public_network_access_enabled = !var.private_registry" in core and "data_endpoint_enabled         = var.private_registry" in core
+
+
+def test_the_control_plane_is_private_unless_public_is_asked_for():
+    variables = (PROJECT_ROOT / "infra" / "variables.tf").read_text()
+    for name in ("aks_private_cluster", "private_registry"):
+        block = re.search(rf'variable "{name}" \{{(.*?)\n\}}', variables, re.S).group(1)
+        assert "default     = true" in block, name
+    outbound = re.search(r'variable "aks_outbound_type" \{(.*?)\n\}', variables, re.S).group(1)
+    assert 'default     = "natGateway"' in outbound
+    aks = (PROJECT_ROOT / "infra" / "aks.tf").read_text()
+    assert "private_cluster_enabled             = var.aks_private_cluster" in aks
+    assert "private_cluster_public_fqdn_enabled = false" in aks and 'private_dns_zone_id                 = var.aks_private_cluster ? "System" : null' in aks
+    assert '"userAssignedNATGateway"' in aks
 
 def test_test_jumpbox_script_builds_the_customer_path_in_a_network_of_its_own():
     summary = run_powershell_harness("test-jumpbox.ps1")
@@ -426,7 +496,8 @@ def test_aks_bootstrap_hook_waits_for_rbac_and_installs_only_the_pinned_cert_man
     summary = run_powershell_harness("test-aks-bootstrap.ps1")
     assert summary == {"result": "passed", "rbacWaited": True, "checksumEnforced": True,
                        "webhookRetried": True, "kubeconfigIsolated": True,
-                       "kubectlWarningsIgnored": True, "deniedAccessReported": True}
+                       "kubectlWarningsIgnored": True, "deniedAccessReported": True,
+                       "privateClusterSkippedOrRefusedFromOutside": True}
 
 
 @pytest.mark.parametrize("apply", [False, True])
@@ -567,6 +638,10 @@ def test_azd_parameter_file_maps_every_terraform_variable_from_the_environment()
     assert defaults["tls_cluster_issuer"] == "" and defaults["ingress_visibility"] == "private"
     assert defaults["ingress_subnet_prefix"] == "10.42.1.32/27" and defaults["private_link_subnet_prefix"] == "10.42.1.64/27"
     assert defaults["private_link_enabled"] == "true" and defaults["private_link_allowed_subscriptions"] == ""
+    assert defaults["aks_private_cluster"] == "true" and defaults["private_registry"] == "true"
+    assert defaults["aks_outbound_type"] == "natGateway" and defaults["deploy_host_enabled"] == "true"
+    assert defaults["deploy_host_subnet_prefix"] == "10.42.1.96/27" and defaults["bastion_subnet_prefix"] == "10.42.1.128/26"
+    assert defaults["deploy_host_vm_size"] == "Standard_D4s_v5" and defaults["deploy_host_shutdown_time"] == "1800"
     assert defaults["auth_mode"] == "" and defaults["web_allowed_ip_ranges"] == ""
     assert '"auth_mode": "${MEGHKOSHA_AUTH_MODE}"' in template and '"web_allowed_ip_ranges": "${APP_WEB_ALLOWED_IP_RANGES}"' in template
     assert '"principal_id": "${AZURE_PRINCIPAL_ID}"' in template
@@ -616,7 +691,9 @@ run "azd_strings_convert_to_the_declared_types" {
       output.FOUNDRY_CHAT_ENABLED == "true" && output.MEGHKOSHA_AI_ENABLED == "false" &&
       output.APP_PROCESSOR_DEPLOYED == "true" && output.APP_PROCESSOR_CRON == "*/5 * * * *" &&
       output.AZURE_AKS_NAMESPACE == "cloudlens" && output.APP_TLS_CLUSTER_ISSUER == "private-ca" &&
-      output.APP_INGRESS_VISIBILITY == "private" && output.APP_INGRESS_PUBLIC_IP == "" && output.APP_WEB_INGRESS_RESTRICTED == "true"
+      output.APP_INGRESS_VISIBILITY == "private" && output.APP_INGRESS_PUBLIC_IP == "" && output.APP_WEB_INGRESS_RESTRICTED == "true" &&
+      output.APP_AKS_PRIVATE_CLUSTER == "true" && output.APP_PRIVATE_REGISTRY == "true" && output.APP_AKS_OUTBOUND_TYPE == "natGateway" &&
+      output.APP_DEPLOY_HOST_ADMIN_USERNAME == "cloudlensadmin"
     )
     error_message = "The recommended settings must produce the outputs the manifests read."
   }
@@ -677,6 +754,8 @@ def test_manifest_templates_use_only_quoted_lookups_that_cannot_render_no_value(
 
 def test_every_value_read_by_the_manifests_and_hook_is_provided():
     produced_by_azd = {"SERVICE_API_IMAGE_NAME", "SERVICE_WEB_IMAGE_NAME", "AZURE_SUBSCRIPTION_ID"}
+    # Set by deploy-end-to-end.ps1 around the provisioning call only, never stored in the environment.
+    set_by_deploy_script = {"CLOUDLENS_PROVISION_ONLY"}
     set_by_operator = {"MEGHKOSHA_API_CLIENT_ID", "MEGHKOSHA_WEB_CLIENT_ID", "APP_ACME_EMAIL",
                        "MEGHKOSHA_AUTH_MODE", "MEGHKOSHA_OPERATOR_OBJECT_ID", "MEGHKOSHA_OPERATOR_UPN",
                        "APP_WEB_ALLOWED_IP_RANGES"}
@@ -692,7 +771,7 @@ def test_every_value_read_by_the_manifests_and_hook_is_provided():
     derived_by_hook = {"INGRESS_PUBLIC_IP_RESOURCE_GROUP", "INGRESS_INTERNAL", "INGRESS_PRIVATE_LINK_CREATE"}
     for name in derived_by_hook:
         assert f"$values.{name} = " in hook_source, f"{name} must be derived in aks-bootstrap.ps1"
-    missing = read - outputs - produced_by_azd - set_by_operator - derived_by_hook
+    missing = read - outputs - produced_by_azd - set_by_operator - derived_by_hook - set_by_deploy_script
     assert not missing, f"Values nothing provides: {sorted(missing)}"
     deploy_script = (PROJECT_ROOT / "scripts" / "deploy-end-to-end.ps1").read_text()
     for name in set(re.findall(r"Get-AzdValue '([A-Z0-9_]+)'", deploy_script)) - produced_by_azd - set_by_operator:

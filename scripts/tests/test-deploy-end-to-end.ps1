@@ -52,6 +52,11 @@ $global:deployTestState = @{
     operatorObjectId = '66666666-6666-6666-6666-666666666666'
     healthProbes = 0
     webOrigin = ''
+    azureYamlPath = (Join-Path $PSScriptRoot '../../azure.yaml')
+    remoteBuildOffDuringDeploy = $false
+    apiServer = ''
+    runCommands = [System.Collections.Generic.List[string]]::new()
+    dockerCalls = [System.Collections.Generic.List[string]]::new()
 }
 
 function Get-StubArgument {
@@ -135,6 +140,10 @@ function azd {
                 $state.environments[$environment][$a[4]] = $a[5]
                 return
             }
+            'get-values' {
+                $values = $state.environments[$environment]
+                return @($values.Keys | ForEach-Object { "$_=`"$($values[$_])`"" })
+            }
             'get-value' {
                 if (-not $state.environments.ContainsKey($environment)) { throw "azd env get-value targeted an unknown environment '$environment'." }
                 $name = $a[-1]
@@ -147,12 +156,19 @@ function azd {
         }
         throw "Unexpected azd env call: $($a -join ' ')"
     }
-    if ($a[0] -eq 'provision') {
-        if ($a -notcontains '--preview') { throw 'The helper must only ever call azd provision in preview mode.' }
+    if ($a[0] -eq 'provision' -and $a -contains '--preview') {
         $state.previewCalls++
         return
     }
-    if ($a[0] -eq 'up') {
+    # A private control plane provisions on its own: the cluster bootstrap and the image build wait for the deploy stage.
+    $provisioning = $a[0] -eq 'provision'
+    if ($provisioning -and $env:CLOUDLENS_PROVISION_ONLY -ne '1') { throw 'azd provision without --preview must run with CLOUDLENS_PROVISION_ONLY=1 so its hook skips the private cluster.' }
+    if ($a[0] -eq 'hooks' -and $a[1] -eq 'run' -and $a[2] -eq 'postprovision') {
+        if ($env:CLOUDLENS_PROVISION_ONLY) { throw 'The deploy stage must run the cluster bootstrap for real, not skip it.' }
+        $state.azdCalls.Add('hook:postprovision')
+        return
+    }
+    if ($a[0] -eq 'up' -or $provisioning) {
         $values = $state.environments[$environment]
         if ($state.needsAnswer) {
             # With --no-prompt azd reports the question it could not ask; the terminal rerun answers it.
@@ -174,10 +190,22 @@ function azd {
             return
         }
         # One azd up provisions with Terraform, runs the hook, builds both images and applies the manifests.
-        $values['SERVICE_API_IMAGE_NAME'] = 'acrtest.azurecr.io/cost-assessment-app/api-app-test:azd-deploy-1'
-        $values['SERVICE_WEB_IMAGE_NAME'] = 'acrtest.azurecr.io/cost-assessment-app/web-app-test:azd-deploy-1'
+        if (-not $provisioning) {
+            $values['SERVICE_API_IMAGE_NAME'] = 'acrtest.azurecr.io/cost-assessment-app/api-app-test:azd-deploy-1'
+            $values['SERVICE_WEB_IMAGE_NAME'] = 'acrtest.azurecr.io/cost-assessment-app/web-app-test:azd-deploy-1'
+        }
         $values['AZURE_RESOURCE_GROUP'] = $state.resourceGroup
         $values['AZURE_AKS_CLUSTER_NAME'] = 'aks-0123456789abc'
+        # The control plane is private unless the environment says otherwise, as the azd parameter file does.
+        $privateControlPlane = -not ($values.Contains('APP_AKS_PRIVATE_CLUSTER') -and $values['APP_AKS_PRIVATE_CLUSTER'] -eq 'false')
+        $values['APP_AKS_PRIVATE_CLUSTER'] = if ($privateControlPlane) { 'true' } else { 'false' }
+        $values['APP_PRIVATE_REGISTRY'] = $values['APP_AKS_PRIVATE_CLUSTER']
+        $hostEnabled = $privateControlPlane -and -not ($values.Contains('APP_DEPLOY_HOST_ENABLED') -and $values['APP_DEPLOY_HOST_ENABLED'] -eq 'false')
+        $values['APP_DEPLOY_HOST_NAME'] = if ($hostEnabled) { 'vm-deploy-0123456' } else { '' }
+        $values['APP_DEPLOY_HOST_ID'] = if ($hostEnabled) { "/subscriptions/$($state.subscriptionId)/resourceGroups/$($state.resourceGroup)/providers/Microsoft.Compute/virtualMachines/vm-deploy-0123456" } else { '' }
+        $values['APP_DEPLOY_HOST_ADMIN_USERNAME'] = if ($hostEnabled) { 'cloudlensadmin' } else { '' }
+        $values['APP_DEPLOY_HOST_ADMIN_PASSWORD'] = if ($hostEnabled) { 'Aa1!Bb2#Cc3%Dd4*Ee5-Ff6_' } else { '' }
+        $values['APP_NAT_GATEWAY_IP'] = if ($privateControlPlane) { '20.1.2.3' } else { '' }
         # As Terraform reports them. The visibility defaults to private, as the azd parameter file does, and Terraform
         # refuses what only works in public: an allow-list, or Let's Encrypt.
         $visibility = if ($values.Contains('APP_INGRESS_VISIBILITY') -and $values['APP_INGRESS_VISIBILITY']) { $values['APP_INGRESS_VISIBILITY'] } else { 'private' }
@@ -208,12 +236,19 @@ function azd {
         $state.webOrigin = $values['APP_WEB_ORIGIN']
         $values['APP_PROCESSOR_DEPLOYED'] = if ($values.Contains('APP_ENABLE_PROCESSOR') -and $values['APP_ENABLE_PROCESSOR'] -eq 'true') { 'true' } else { 'false' }
         $values['MEGHKOSHA_OBO_MANAGED_IDENTITY_RESOURCE_ID'] = "/subscriptions/$($state.subscriptionId)/resourceGroups/$($state.resourceGroup)/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-obo"
-        $state.azdCalls.Add('up:succeeded')
+        $state.azdCalls.Add($(if ($provisioning) { 'provision:succeeded' } else { 'up:succeeded' }))
         return
     }
     if ($a[0] -eq 'deploy') {
         $values = $state.environments[$environment]
-        if (-not $values.Contains('SERVICE_API_IMAGE_NAME')) { throw 'azd deploy ran before azd up provisioned the environment.' }
+        if (-not $values.Contains('AZURE_AKS_CLUSTER_NAME')) { throw 'azd deploy ran before the environment was provisioned.' }
+        if (-not $values.Contains('SERVICE_API_IMAGE_NAME')) {
+            # The first deploy of a private control plane: the images are built on this machine and pushed from here.
+            if ($values['APP_PRIVATE_REGISTRY'] -eq 'true' -and (Get-Content -LiteralPath $state.azureYamlPath -Raw) -match 'remoteBuild:\s*true') { throw 'A private registry cannot be built into remotely; remoteBuild must be off for the deploy stage.' }
+            $state.remoteBuildOffDuringDeploy = (Get-Content -LiteralPath $state.azureYamlPath -Raw) -notmatch 'remoteBuild:\s*true'
+            $values['SERVICE_API_IMAGE_NAME'] = 'acrtest.azurecr.io/cost-assessment-app/api-app-test:azd-deploy-1'
+            $values['SERVICE_WEB_IMAGE_NAME'] = 'acrtest.azurecr.io/cost-assessment-app/web-app-test:azd-deploy-1'
+        }
         $state.azdCalls.Add("deploy:succeeded:$($values['MEGHKOSHA_API_CLIENT_ID'])")
         return
     }
@@ -279,7 +314,22 @@ function az {
     if ($a[0] -eq 'ad' -and $a[1] -eq 'signed-in-user' -and $a[2] -eq 'show') {
         return (@{ id = $state.operatorObjectId; upn = 'operator@example.test' } | ConvertTo-Json -Compress)
     }
+    if ($a[0] -eq 'aks' -and $a[1] -eq 'show') {
+        if ((Get-StubArgument $a '--query') -ne 'privateFqdn') { throw "Unexpected az aks show query: $($a -join ' ')" }
+        return $(if ($state.apiServer) { $state.apiServer } else { 'cluster-private.invalid' })
+    }
+    if ($a[0] -eq 'vm' -and $a[1] -eq 'get-instance-view') { return 'PowerState/running' }
+    if ($a[0] -eq 'vm' -and $a[1] -eq 'start') { return }
+    if ($a[0] -eq 'vm' -and $a[1] -eq 'run-command' -and $a[2] -eq 'invoke') {
+        $state.runCommands.Add((Get-StubArgument $a '--scripts'))
+        return "TOOLS_READY`n"
+    }
     throw "Unexpected az call: $($a -join ' ')"
+}
+
+function docker {
+    $global:LASTEXITCODE = 0
+    $global:deployTestState.dockerCalls.Add(@($args) -join ' ')
 }
 
 $repoRoot = Join-Path ([System.IO.Path]::GetTempPath()) "cloudlens-deploy-test-$([guid]::NewGuid().ToString('n'))"
@@ -326,8 +376,9 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         SettleSeconds = 0
         MaxAttempts = 3
         KubernetesToolsDirectory = $toolsHome
-        # The scenarios below that predate the private ingress describe the internet-facing one.
+        # The scenarios below that predate the private ingress describe the internet-facing one, on a public control plane.
         IngressVisibility = 'public'
+        ControlPlane = 'public'
     }
 
     $plan = & $script @parameters -PlanOnly | ConvertFrom-Json -AsHashtable
@@ -589,6 +640,83 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     try { & $script @parameters -SkipPreview -OperatorMode -AllowedIpRanges '0.0.0.0/0' | Out-Null } catch { $refused = $_.Exception.Message }
     if ($refused -notmatch 'AllowedIpRanges' -or $state.azdCalls.Count) { throw "An internet-wide range must be refused before anything is deployed; got: $refused" }
 
+    # ---- The private control plane: the default for a new environment --------------------------------------------
+    # The API server and the registry have no public access, so provisioning, sign-in and role assignments run from here
+    # and the services are deployed from inside the network: from the deploy host when this machine cannot reach the
+    # cluster, or right here when it can.
+    $controlParameters = $parameters.Clone()
+    $controlParameters.Remove('ControlPlane')
+    $controlParameters.Remove('IngressVisibility')
+    $controlParameters.EnvironmentName = 'cp-test'
+    $state.azdCalls.Clear()
+    $state.runCommands.Clear()
+    $state.apiServer = ''
+    $bootstrapsBefore = $state.bootstrapCalls
+    $pendingSummary = & $script @controlParameters -SkipPreview | ConvertFrom-Json -AsHashtable
+    $controlValues = $state.environments['cp-test']
+    if ($controlValues['APP_AKS_PRIVATE_CLUSTER'] -cne 'true' -or $controlValues['APP_PRIVATE_REGISTRY'] -cne 'true') { throw 'A new environment must have a private control plane without being asked.' }
+    if (($state.azdCalls -join ',') -ne 'provision:succeeded') { throw "A private control plane must provision on its own, with no azd up and no deploy; got: $($state.azdCalls -join ',')" }
+    if (Test-Path Env:CLOUDLENS_PROVISION_ONLY) { throw 'The provision-only marker must not outlive the provisioning call.' }
+    if ($state.bootstrapCalls -ne $bootstrapsBefore + 1) { throw 'Sign-in must still be configured before the services are deployed.' }
+    if ($pendingSummary.controlPlane -ne 'private' -or $pendingSummary.deployStage -ne 'pending-on-deploy-host' -or $pendingSummary.deployHost -ne 'vm-deploy-0123456' -or
+        $pendingSummary.natGatewayIp -ne '20.1.2.3' -or $pendingSummary.apiImage -or $pendingSummary.webUrl -ne 'https://cloudlens-test.internal') {
+        throw "The summary must say the app is not deployed yet and name the deploy host: $($pendingSummary | ConvertTo-Json -Compress)"
+    }
+    if ($state.runCommands.Count -ne 1) { throw 'The deploy host must be prepared once through az vm run-command.' }
+    $hostScript = $state.runCommands[0]
+    if ($hostScript -notmatch "echo '([A-Za-z0-9+/=]+)' \| base64 -d") { throw "The settings must reach the deploy host as data, not as shell text: $hostScript" }
+    $hostSettings = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1]))
+    if ($hostSettings -notmatch 'APP_AKS_PRIVATE_CLUSTER="true"' -or $hostSettings -notmatch 'AZURE_AKS_CLUSTER_NAME="aks-0123456789abc"' -or
+        $hostSettings -match 'ADMIN_PASSWORD' -or $hostSettings.Contains('Aa1!Bb2#Cc3%Dd4*Ee5-Ff6_')) {
+        throw 'The deploy host gets this environment''s settings and never the host''s own password.'
+    }
+    if ($hostScript -notmatch "git clone --quiet --branch 'cloudlensdev' 'https://github.com/Saby007/CloudLens.git'") { throw 'The deploy host must clone the repository at the branch being deployed.' }
+
+    # A machine that already reaches the private cluster (a VPN, say) finishes the job itself, and the build setting is put back.
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $yamlBefore = [System.IO.File]::ReadAllText($state.azureYamlPath)
+    try {
+        $env:CLOUDLENS_API_SERVER_PORT = "$($listener.LocalEndpoint.Port)"
+        $state.apiServer = '127.0.0.1'
+        $state.azdCalls.Clear()
+        $state.runCommands.Clear()
+        $reachableSummary = & $script @controlParameters -SkipPreview | ConvertFrom-Json -AsHashtable
+    } finally {
+        Remove-Item Env:CLOUDLENS_API_SERVER_PORT -ErrorAction SilentlyContinue
+        $listener.Stop()
+        $state.apiServer = ''
+    }
+    if (($state.azdCalls -join ',') -ne "provision:succeeded,hook:postprovision,deploy:succeeded:$apiClientId") {
+        throw "A reachable private cluster must be prepared and deployed here, after provisioning and sign-in; got: $($state.azdCalls -join ',')"
+    }
+    if ($reachableSummary.deployStage -ne 'complete' -or $reachableSummary.apiImage -notlike '*api-app-test*' -or $state.runCommands.Count) { throw "The summary must show the finished deployment: $($reachableSummary | ConvertTo-Json -Compress)" }
+    if (-not $state.remoteBuildOffDuringDeploy -or $state.dockerCalls -notcontains 'info') { throw 'The private registry must be built into with local Docker, so remote build is off during the deploy stage.' }
+    if ([System.IO.File]::ReadAllText($state.azureYamlPath) -ne $yamlBefore) { throw 'azure.yaml must be put back exactly as it was after the deploy stage.' }
+
+    # Without a deploy host (a team that deploys from a connected network) the run says what to run instead of preparing one.
+    $state.azdCalls.Clear()
+    $state.runCommands.Clear()
+    $noHostParameters = $controlParameters.Clone()
+    $noHostParameters.EnvironmentName = 'nohost-test'
+    $noHostSummary = & $script @noHostParameters -SkipPreview -NoDeployHost | ConvertFrom-Json -AsHashtable
+    if ($state.environments['nohost-test']['APP_DEPLOY_HOST_ENABLED'] -cne 'false' -or $noHostSummary.deployStage -ne 'pending-on-deploy-host' -or $noHostSummary.deployHost -or $state.runCommands.Count) {
+        throw 'Without a deploy host nothing is prepared on one, and the run reports the deployment as pending.'
+    }
+
+    # An existing cluster with a public API server is never replaced silently: AKS cannot make it private in place.
+    $keptControlPlane = $values['APP_AKS_PRIVATE_CLUSTER']
+    $values.Remove('APP_AKS_PRIVATE_CLUSTER')
+    $unchosen = $parameters.Clone()
+    $unchosen.Remove('ControlPlane')
+    $state.azdCalls.Clear()
+    $refused = $null
+    try { & $script @unchosen -SkipPreview | Out-Null } catch { $refused = $_.Exception.Message }
+    if ($refused -notmatch 'public API server' -or $refused -notmatch '-ControlPlane public' -or $state.azdCalls.Count) {
+        throw "An existing public cluster must be refused without a choice, before azd runs; got: $refused"
+    }
+    $values['APP_AKS_PRIVATE_CLUSTER'] = $keptControlPlane
+
     # Missing kubectl/kubelogin: the helper asks before installing them with az aks install-cli into the
     # tools directory, -InstallKubernetesTools installs without asking, and an unattended run that cannot
     # ask explains what to do instead of guessing. Tools the run had to put on PATH itself come with the
@@ -670,7 +798,8 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
                 kubernetesToolsOfferedAndInstalled = $true; kubernetesToolsPathExplained = $true
                 operatorModeSkipsSignInAndPublicUrl = $true; allowListOpensPublicUrl = $true
                 cloudShellSkipsBlockedHealthCheck = $true; privateIngressIsTheDefault = $true
-                publicAddressNeverSwitchedSilently = $true } | ConvertTo-Json -Compress
+                publicAddressNeverSwitchedSilently = $true; privateControlPlaneIsTheDefault = $true
+                deployStageRunsWhereTheClusterIsReachable = $true; publicClusterNeverReplacedSilently = $true } | ConvertTo-Json -Compress
 } finally {
     foreach ($name in $cloudShellMarkers.Keys) { [Environment]::SetEnvironmentVariable($name, $cloudShellMarkers[$name], 'Process') }
     Remove-Variable -Name deployTestState -Scope Global -ErrorAction SilentlyContinue

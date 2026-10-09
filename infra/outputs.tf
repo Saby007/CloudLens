@@ -136,6 +136,45 @@ output "APP_INGRESS_NSG_NAME" {
   value = azurerm_network_security_group.aks_nodes.name
 }
 
+# "true": the Kubernetes API server has no public address, so kubectl, the bootstrap hook and azd deploy must run
+# from the deploy host or a network connected to this one. The hook and the deploy scripts read this.
+output "APP_AKS_PRIVATE_CLUSTER" {
+  value = tostring(var.aks_private_cluster)
+}
+
+# "true": the registry accepts only its private endpoint, so images are built and pushed from inside the network.
+output "APP_PRIVATE_REGISTRY" {
+  value = tostring(var.private_registry)
+}
+
+output "APP_AKS_OUTBOUND_TYPE" {
+  value = var.aks_outbound_type
+}
+
+# The one address the cluster and the deploy host reach the internet from; allow-list it where a service restricts clients.
+output "APP_NAT_GATEWAY_IP" {
+  value = local.nat_gateway_enabled ? azurerm_public_ip.nat[0].ip_address : ""
+}
+
+output "APP_DEPLOY_HOST_NAME" {
+  value = local.deploy_host_enabled ? azurerm_linux_virtual_machine.deploy_host[0].name : ""
+}
+
+output "APP_DEPLOY_HOST_ID" {
+  value = local.deploy_host_enabled ? azurerm_linux_virtual_machine.deploy_host[0].id : ""
+}
+
+output "APP_DEPLOY_HOST_ADMIN_USERNAME" {
+  value = local.deploy_host_enabled ? local.deploy_host_admin : ""
+}
+
+# Kept in the environment so the one person who deployed it can sign in to the host through Bastion. The same value is in
+# the Terraform state; reset it in the portal (VM > Reset password) to rotate it.
+output "APP_DEPLOY_HOST_ADMIN_PASSWORD" {
+  value     = local.deploy_host_enabled ? random_password.deploy_host[0].result : ""
+  sensitive = true
+}
+
 # "true" once the internet cannot reach the app unchecked: the ingress is private, or HTTPS is limited to
 # APP_WEB_ALLOWED_IP_RANGES. Operator mode (no sign-in) lets the API serve requests that came through the ingress only
 # then; the value reaches the manifests after Terraform has applied the network change, so a plain azd deploy
@@ -217,6 +256,10 @@ output "APP_DEPLOYMENT_STATE" {
     apiServerAuthorizedRangesUsed = length(local.aks_api_authorized_ip_ranges) > 0
     ingressVisibility             = var.ingress_visibility
     privateLinkServiceEnabled     = local.private_link_service_enabled
+    aksPrivateCluster             = var.aks_private_cluster
+    privateRegistry               = var.private_registry
+    outboundType                  = var.aks_outbound_type
+    deployHostEnabled             = local.deploy_host_enabled
     liveValidationRequired        = true
   }
 }
