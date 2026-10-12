@@ -43,3 +43,8 @@ output "app_url" {
 output "trusts_private_ca" {
   value = local.trust_ca
 }
+
+# True when people sign in with a Microsoft Entra account: choose "Microsoft Entra ID" on the Bastion connection page.
+output "entra_login_enabled" {
+  value = var.entra_login_enabled
+}

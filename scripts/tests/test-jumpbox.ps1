@@ -113,6 +113,7 @@ function terraform {
             private_endpoint_ip = @{ value = '10.50.0.100' }
             private_endpoint_id = @{ value = '/subscriptions/x/resourceGroups/rg/providers/Microsoft.Network/privateEndpoints/pe' }
             trusts_private_ca = @{ value = $true }
+            entra_login_enabled = @{ value = $true }
         } | ConvertTo-Json -Depth 5)
     }
 }

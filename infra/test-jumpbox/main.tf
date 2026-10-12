@@ -43,7 +43,12 @@ locals {
   endpoint_subnet_prefix = cidrsubnet(var.vnet_address_prefix, 3, 3)
 
   trust_ca = var.ca_certificate_pem != ""
+
+  # Whoever deploys can sign in with their own Entra account, besides anyone named in entra_login_principal_ids.
+  entra_login_principals = distinct(concat([data.azurerm_client_config.current.object_id], var.entra_login_principal_ids))
 }
+
+data "azurerm_client_config" "current" {}
 
 resource "azurerm_resource_group" "main" {
   name     = local.resource_group_name
@@ -327,6 +332,14 @@ resource "azurerm_windows_virtual_machine" "jumpbox" {
   patch_mode            = "AutomaticByPlatform"
   tags                  = local.tags
 
+  # The Microsoft Entra login extension needs the VM's own identity.
+  dynamic "identity" {
+    for_each = var.entra_login_enabled ? [1] : []
+    content {
+      type = "SystemAssigned"
+    }
+  }
+
   os_disk {
     caching              = "ReadWrite"
     storage_account_type = "StandardSSD_LRS"
@@ -340,6 +353,25 @@ resource "azurerm_windows_virtual_machine" "jumpbox" {
   }
 }
 
+# Sign-in with a Microsoft Entra account. The extension joins the VM to Microsoft Entra ID and accepts Bastion's Entra
+# token; the role below says who may sign in. Azure Bastion's portal connection offers "Microsoft Entra ID" once both exist.
+resource "azurerm_virtual_machine_extension" "entra_login" {
+  count                      = var.entra_login_enabled ? 1 : 0
+  name                       = "AADLoginForWindows"
+  virtual_machine_id         = azurerm_windows_virtual_machine.jumpbox.id
+  publisher                  = "Microsoft.Azure.ActiveDirectory"
+  type                       = "AADLoginForWindows"
+  type_handler_version       = "2.0"
+  auto_upgrade_minor_version = true
+}
+
+resource "azurerm_role_assignment" "entra_login" {
+  for_each             = var.entra_login_enabled ? toset(local.entra_login_principals) : toset([])
+  scope                = azurerm_windows_virtual_machine.jumpbox.id
+  role_definition_name = "Virtual Machine Administrator Login"
+  principal_id         = each.value
+}
+
 # Installs the cluster's private CA as a trusted root, so the browser accepts the app's certificate. The CA certificate
 # is public, but it travels in the protected settings to keep it out of the deployment's plain output.
 resource "azurerm_virtual_machine_extension" "trust_ca" {
@@ -349,6 +381,9 @@ resource "azurerm_virtual_machine_extension" "trust_ca" {
   publisher            = "Microsoft.Compute"
   type                 = "CustomScriptExtension"
   type_handler_version = "1.10"
+
+  # One extension at a time: a VM applies its extensions in order, and a second install racing the first can fail.
+  depends_on = [azurerm_virtual_machine_extension.entra_login]
 
   protected_settings = jsonencode({
     commandToExecute = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$pem = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${base64encode(var.ca_certificate_pem)}')); $path = Join-Path $env:TEMP 'cloudlens-ca.crt'; Set-Content -Path $path -Value $pem -Encoding ascii; Import-Certificate -FilePath $path -CertStoreLocation Cert:\\LocalMachine\\Root | Out-Null\""

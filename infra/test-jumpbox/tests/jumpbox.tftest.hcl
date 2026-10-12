@@ -2,6 +2,15 @@
 # Run with `terraform init -backend=false` then `terraform test` from infra/test-jumpbox/.
 
 mock_provider "azurerm" {
+  mock_data "azurerm_client_config" {
+    defaults = {
+      tenant_id       = "11111111-1111-1111-1111-111111111111"
+      subscription_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      object_id       = "22222222-2222-2222-2222-222222222222"
+      client_id       = "33333333-3333-3333-3333-333333333333"
+    }
+  }
+
   mock_resource "azurerm_resource_group" {
     defaults = {
       id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-test-jumpbox"
@@ -215,4 +224,59 @@ run "settings_must_be_exact_and_a_private_key_is_never_accepted" {
     var.admin_username,
     var.auto_shutdown_time,
   ]
+}
+
+run "the_deployer_signs_in_with_entra_and_more_people_can_be_added" {
+  command = apply
+
+  variables {
+    entra_login_principal_ids = ["44444444-4444-4444-4444-444444444444", "22222222-2222-2222-2222-222222222222"]
+  }
+
+  assert {
+    condition = (
+      azurerm_windows_virtual_machine.jumpbox.identity[0].type == "SystemAssigned" &&
+      azurerm_virtual_machine_extension.entra_login[0].publisher == "Microsoft.Azure.ActiveDirectory" &&
+      azurerm_virtual_machine_extension.entra_login[0].type == "AADLoginForWindows" &&
+      output.entra_login_enabled == true &&
+      azurerm_bastion_host.main.sku == "Basic"
+    )
+    error_message = "Entra sign-in needs the VM's own identity and the AADLoginForWindows extension; the Basic Bastion supports it in the portal."
+  }
+
+  assert {
+    condition = (
+      toset(keys(azurerm_role_assignment.entra_login)) == toset(["22222222-2222-2222-2222-222222222222", "44444444-4444-4444-4444-444444444444"]) &&
+      alltrue([for assignment in azurerm_role_assignment.entra_login : assignment.role_definition_name == "Virtual Machine Administrator Login"])
+    )
+    error_message = "The deployer and each extra principal get the Virtual Machine Administrator Login role once, on the VM."
+  }
+}
+
+run "entra_sign_in_can_be_switched_off_leaving_only_the_local_password" {
+  command = apply
+
+  variables {
+    entra_login_enabled = false
+  }
+
+  assert {
+    condition = (
+      length(azurerm_virtual_machine_extension.entra_login) == 0 &&
+      length(azurerm_role_assignment.entra_login) == 0 &&
+      length(azurerm_windows_virtual_machine.jumpbox.identity) == 0 &&
+      output.entra_login_enabled == false
+    )
+    error_message = "Without Entra sign-in there is no identity, extension or role."
+  }
+}
+
+run "entra_login_principals_must_be_object_ids" {
+  command = plan
+
+  variables {
+    entra_login_principal_ids = ["alice@contoso.com"]
+  }
+
+  expect_failures = [var.entra_login_principal_ids]
 }

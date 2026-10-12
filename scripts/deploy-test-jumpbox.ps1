@@ -232,7 +232,12 @@ try {
     Write-Host ''
     Write-Host 'Open the app from the jump box:' -ForegroundColor Green
     Write-Host "  1. Azure portal -> Virtual machines -> $($outputs.vm_name.value) (resource group $($outputs.resource_group_name.value)) -> Connect -> Bastion."
-    Write-Host "  2. Sign in as $($outputs.admin_username.value)$(if ($ShowPassword) { ' with the password above' } else { ", with the password from: terraform -chdir=infra/test-jumpbox output -raw admin_password -state='$statePath'" })."
+    if ($outputs.entra_login_enabled.value) {
+        Write-Host '  2. Authentication Type: Microsoft Entra ID, and sign in with your own account (it has the Virtual Machine Administrator Login role). The VM needs a few minutes after it is built to join Microsoft Entra ID; the option is missing or fails until then.'
+        Write-Host "     Fallback: Authentication Type Password, user $($outputs.admin_username.value)$(if ($ShowPassword) { ' with the password above' } else { ", password from: terraform -chdir=infra/test-jumpbox output -raw admin_password -state='$statePath'" })."
+    } else {
+        Write-Host "  2. Sign in as $($outputs.admin_username.value)$(if ($ShowPassword) { ' with the password above' } else { ", with the password from: terraform -chdir=infra/test-jumpbox output -raw admin_password -state='$statePath'" })."
+    }
     Write-Host "  3. In Microsoft Edge on the VM, open $($outputs.app_url.value)."
     if (-not $outputs.trusts_private_ca.value -and $issuer -eq 'private-ca') {
         Write-Host '     The CA was not installed on the VM (-SkipCertificateTrust), so Edge will warn about the certificate.' -ForegroundColor Yellow

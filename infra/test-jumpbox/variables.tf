@@ -117,3 +117,20 @@ variable "auto_shutdown_time" {
     error_message = "auto_shutdown_time must use HHmm, for example 1800."
   }
 }
+
+variable "entra_login_enabled" {
+  description = "Let people sign in to the jump box with their Microsoft Entra account (through Azure Bastion's Microsoft Entra ID option) instead of the local password. The VM joins Microsoft Entra ID, and the signed-in deployer gets the Virtual Machine Administrator Login role on it."
+  type        = bool
+  default     = true
+}
+
+variable "entra_login_principal_ids" {
+  description = "Object IDs of further users or groups that get the Virtual Machine Administrator Login role on the jump box. The identity that deploys it always gets it."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.entra_login_principal_ids : can(regex("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$", id))])
+    error_message = "entra_login_principal_ids must be object IDs (GUIDs)."
+  }
+}

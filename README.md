@@ -528,11 +528,11 @@ A private app cannot be opened from a laptop outside the network. For **testing 
 
 ```powershell
 pwsh ./scripts/deploy-test-jumpbox.ps1 -EnvironmentName my-environment        # add -ShowPassword to print the VM password
-# Azure portal -> the jump box VM (rg-<environment>-jumpbox) -> Connect -> Bastion, sign in as cloudlensadmin, open Microsoft Edge on the app URL
+# Azure portal -> the jump box VM (rg-<environment>-jumpbox) -> Connect -> Bastion -> Authentication Type "Microsoft Entra ID" (your own account), or "Password" as cloudlensadmin; then open Microsoft Edge on the app URL
 pwsh ./scripts/deploy-test-jumpbox.ps1 -EnvironmentName my-environment -Destroy   # removes everything it created
 ```
 
-Bastion bills hourly until it is destroyed, so run `-Destroy` when you are done. Use `-ManualConnection` when the deployment's Private Link service does not auto-approve your subscription (then approve the connection on the service), and `-PlanOnly` to see what would be built. The password is also kept in the state under `.azure/<environment>/test-jumpbox`, which is git-ignored and sensitive.
+Bastion bills hourly until it is destroyed, so run `-Destroy` when you are done. The VM joins Microsoft Entra ID (extension `AADLoginForWindows`, a system-assigned identity) and the signed-in deployer gets the *Virtual Machine Administrator Login* role on it, so Bastion offers the Microsoft Entra ID option a few minutes after it is built; `entra_login_principal_ids` (Terraform variable) adds other people. Signing in to the VM and signing in to the app are separate: your tenant's Conditional Access applies to the app sign-in from the browser on this VM too, and an unmanaged VM may be refused there. Use `-ManualConnection` when the deployment's Private Link service does not auto-approve your subscription (then approve the connection on the service), and `-PlanOnly` to see what would be built. The password is also kept in the state under `.azure/<environment>/test-jumpbox`, which is git-ignored and sensitive.
 
 ### Private control plane (the default)
 
