@@ -117,8 +117,24 @@ if [ -f /var/lib/cloudlens/tools-ready ]; then echo TOOLS_READY; else echo TOOLS
 "@
 
 Write-Host "Copying the settings and the repository to $vmName (through Azure Resource Manager, no network path needed)..." -ForegroundColor Cyan
-$result = Get-CliText (& az vm run-command invoke --ids $vmId --command-id RunShellScript --scripts $script --query 'value[0].message' --output tsv --only-show-errors 2>&1)
-if ($LASTEXITCODE -ne 0) { throw "The run command on $vmName failed: $result" }
+# On Windows az is a .cmd wrapper that cuts a multi-line argument after its first line, so the script travels as a file
+# (az reads --scripts @file), with Unix line endings.
+$scriptFile = Join-Path ([System.IO.Path]::GetTempPath()) "cloudlens-host-$([guid]::NewGuid().ToString('n')).sh"
+try {
+    [System.IO.File]::WriteAllText($scriptFile, ($script -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
+    $response = & az vm run-command invoke --ids $vmId --command-id RunShellScript --scripts "@$scriptFile" --output json --only-show-errors 2>&1
+    $invokeExit = $LASTEXITCODE
+} finally {
+    Remove-Item -LiteralPath $scriptFile -Force -ErrorAction SilentlyContinue
+}
+$responseText = Get-CliText $response
+if ($invokeExit -ne 0) { throw "The run command on $vmName failed: $responseText" }
+try { $message = "$((($responseText | ConvertFrom-Json).value | Select-Object -First 1).message)" } catch { throw "The run command on $vmName returned something unreadable: $responseText" }
+# The message carries the script's standard output, then its standard error; a failed script reports in [stderr].
+$stdout = if ($message -match '(?s)\[stdout\](.*?)(\[stderr\]|$)') { $Matches[1] } else { $message }
+$stderr = if ($message -match '(?s)\[stderr\](.*)$') { $Matches[1].Trim() } else { '' }
+if ($stderr) { throw "Preparing $vmName failed on the host: $stderr" }
+$result = $stdout
 if ($result -match 'TOOLS_PENDING') {
     Write-Warning 'The deploy host is still installing its tools (about 10 minutes after it is created). Check on it with: az vm run-command invoke --ids <vm id> --command-id RunShellScript --scripts "tail -5 /var/log/cloudlens-tools.log". Wait until /var/lib/cloudlens/tools-ready exists before deploying.'
 } elseif ($result -notmatch 'TOOLS_READY') {

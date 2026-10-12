@@ -321,8 +321,11 @@ function az {
     if ($a[0] -eq 'vm' -and $a[1] -eq 'get-instance-view') { return 'PowerState/running' }
     if ($a[0] -eq 'vm' -and $a[1] -eq 'start') { return }
     if ($a[0] -eq 'vm' -and $a[1] -eq 'run-command' -and $a[2] -eq 'invoke') {
-        $state.runCommands.Add((Get-StubArgument $a '--scripts'))
-        return "TOOLS_READY`n"
+        # Like az on Windows, a multi-line argument would be cut after its first line, so the script must be a file.
+        $scriptArgument = Get-StubArgument $a '--scripts'
+        if ($scriptArgument -notlike '@*') { throw 'The host script must be passed as a file (--scripts @file), not as a multi-line argument.' }
+        $state.runCommands.Add([System.IO.File]::ReadAllText($scriptArgument.Substring(1)))
+        return (@{ value = @(@{ code = 'ProvisioningState/succeeded'; message = "Enable succeeded: `n[stdout]`nTOOLS_READY`n`n[stderr]`n" }) } | ConvertTo-Json -Depth 4)
     }
     throw "Unexpected az call: $($a -join ' ')"
 }
