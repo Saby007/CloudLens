@@ -630,12 +630,23 @@ run "private_ingress_has_no_public_address_and_opens_only_inside_the_network" {
 
   assert {
     condition = (
-      length(azurerm_network_security_group.aks_nodes.security_rule) == 1 &&
-      one(azurerm_network_security_group.aks_nodes.security_rule).name == "DenyInternetInbound" &&
-      one(azurerm_network_security_group.aks_nodes.security_rule).access == "Deny" &&
-      one(azurerm_network_security_group.aks_nodes.security_rule).source_address_prefix == "Internet"
+      length(azurerm_network_security_group.aks_nodes.security_rule) == 2 &&
+      one([for rule in azurerm_network_security_group.aks_nodes.security_rule : rule if rule.name == "DenyInternetInbound"]).access == "Deny" &&
+      one([for rule in azurerm_network_security_group.aks_nodes.security_rule : rule if rule.name == "DenyInternetInbound"]).source_address_prefix == "Internet" &&
+      one([for rule in azurerm_network_security_group.aks_nodes.security_rule : rule if rule.name == "DenyInternetInbound"]).priority == 4000
     )
-    error_message = "A private ingress needs no allow rule, only the explicit deny that also replaces a public environment's old rules."
+    error_message = "A private ingress needs the explicit deny that also replaces a public environment's old rules."
+  }
+
+  # The deny is evaluated before Azure's default allow for the load balancer, and the probes come from 168.63.129.16:
+  # without an explicit allow in front of it every node is unhealthy and nothing reaches the app.
+  assert {
+    condition = (
+      one([for rule in azurerm_network_security_group.aks_nodes.security_rule : rule if rule.name == "AllowAzureLoadBalancerInbound"]).access == "Allow" &&
+      one([for rule in azurerm_network_security_group.aks_nodes.security_rule : rule if rule.name == "AllowAzureLoadBalancerInbound"]).source_address_prefix == "AzureLoadBalancer" &&
+      one([for rule in azurerm_network_security_group.aks_nodes.security_rule : rule if rule.name == "AllowAzureLoadBalancerInbound"]).priority < 4000
+    )
+    error_message = "The load balancer's health probes must be allowed ahead of the deny, or every backend is marked down."
   }
 
   assert {

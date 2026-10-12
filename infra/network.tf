@@ -21,11 +21,31 @@ resource "azurerm_network_security_group" "aks_nodes" {
   tags                = local.tags
 
   # The default rules already allow traffic within the VNet, load balancer health probes and all outbound traffic,
-  # and deny everything else inbound. A private ingress therefore needs no allow rule here: traffic reaches the
-  # internal load balancer from inside the network (or through the Private Link Service's NAT addresses, which are in
-  # it) and the internet has no address to send to. The one rule it does carry states that intent, and keeps this
-  # set from ever being empty: the provider treats an empty inline rule set as "unchanged", so a rule-less NSG would
-  # keep the allow rules of an environment that was public before.
+  # and deny everything else inbound. A private ingress therefore needs no allow rule for the app itself: traffic
+  # reaches the internal load balancer from inside the network (or through the Private Link Service's NAT addresses,
+  # which are in it) and the internet has no address to send to. The explicit deny below states that intent, and keeps
+  # this set from ever being empty: the provider treats an empty inline rule set as "unchanged", so a rule-less NSG
+  # would keep the allow rules of an environment that was public before.
+  #
+  # The deny is evaluated before the default rules, and the load balancer's health probes come from Azure's own
+  # address 168.63.129.16, which it also catches: every node was then marked unhealthy and the app timed out. So the
+  # probes get an explicit allow ahead of it.
+  dynamic "security_rule" {
+    for_each = local.private_ingress ? [1] : []
+    content {
+      name                       = "AllowAzureLoadBalancerInbound"
+      description                = "Health probes of the internal load balancer, which the deny below would otherwise block."
+      priority                   = 100
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "*"
+      source_address_prefix      = "AzureLoadBalancer"
+      source_port_range          = "*"
+      destination_address_prefix = "*"
+      destination_port_range     = "*"
+    }
+  }
+
   dynamic "security_rule" {
     for_each = local.private_ingress ? [1] : []
     content {
