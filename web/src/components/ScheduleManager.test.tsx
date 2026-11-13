@@ -39,7 +39,7 @@ const exportConfiguration: FocusExportConfiguration = {
   subscriptionId: schedule.subscriptionId, exportName: 'app-focus',
   storageResourceId: '/subscriptions/616dc9b8-b4aa-415f-8dcb-71bc462916c5/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/teststore',
   container: 'cost-exports', rootFolderPath: `focus/${schedule.subscriptionId}`, format: 'Csv', dataVersion: '1.2-preview',
-  windowMonths: 6, nativeSchedule: 'Inactive', destinationRole: 'Storage Blob Data Contributor',
+  windowMonths: 2, nativeSchedule: 'Inactive', destinationRole: 'Storage Blob Data Contributor',
   destinationRoleScope: '/subscriptions/616dc9b8-b4aa-415f-8dcb-71bc462916c5/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/teststore/blobServices/default/containers/cost-exports',
   state: 'missing', canConfigure: true,
 };
@@ -352,7 +352,7 @@ describe('Open Schedules', () => {
 
   it('creates a schedule from an existing accessible subscription row', async () => {
     vi.mocked(listCostSchedules).mockResolvedValue([
-      { ...schedule, state: 'not_scheduled' },
+      { ...schedule, state: 'not_scheduled', windowMonths: undefined },
       { ...schedule, subscriptionId: 'hidden', displayName: 'No cost access', costAccess: false },
     ]);
     vi.mocked(createCostSchedule).mockResolvedValue(schedule);
@@ -364,7 +364,7 @@ describe('Open Schedules', () => {
     const save = [...container.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.includes('Save schedule'))!;
     expect(save.disabled).toBe(false);
     await act(async () => save.click());
-    expect(createCostSchedule).toHaveBeenCalledWith(schedule.subscriptionId, expect.stringMatching(/Z$/), 6, { enabled: true, timeUtc: '06:00' });
+    expect(createCostSchedule).toHaveBeenCalledWith(schedule.subscriptionId, expect.stringMatching(/Z$/), 2, { enabled: false, timeUtc: '06:00' });
     expect(container.textContent).toContain('monthly UTC schedule updated');
   });
 
@@ -392,17 +392,17 @@ describe('Open Schedules', () => {
     await act(async () => root.render(<ScheduleManager />));
     await click('Schedule Subscription One');
     const select = container.querySelector<HTMLSelectElement>('select')!;
-    expect([...select.options].map(option => option.value)).toEqual(['3', '4', '5', '6']);
+    expect([...select.options].map(option => option.value)).toEqual(['2', '3', '4', '5', '6']);
     expect(select.value).toBe('6');
     await choose('3');
     await save();
-    expect(createCostSchedule).toHaveBeenCalledWith(schedule.subscriptionId, expect.stringMatching(/Z$/), 3, { enabled: true, timeUtc: '06:00' });
+    expect(createCostSchedule).toHaveBeenCalledWith(schedule.subscriptionId, expect.stringMatching(/Z$/), 3, { enabled: false, timeUtc: '06:00' });
     expect(container.textContent).toContain('with 3 months of history');
     await click('Reschedule Subscription Two');
     expect(container.querySelector<HTMLSelectElement>('select')!.value).toBe('4');
     await choose('5');
     await save();
-    expect(setCostScheduleState).toHaveBeenCalledWith(second.subscriptionId, 'active', expect.stringMatching(/Z$/), 5, { enabled: true, timeUtc: '06:00' });
+    expect(setCostScheduleState).toHaveBeenCalledWith(second.subscriptionId, 'active', expect.stringMatching(/Z$/), 5, { enabled: false, timeUtc: '06:00' });
   });
 
   it('shows each daily pull status and saves daily settings', async () => {

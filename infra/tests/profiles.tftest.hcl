@@ -42,6 +42,18 @@ mock_provider "azurerm" {
     }
   }
 
+  mock_resource "azurerm_monitor_data_collection_endpoint" {
+    defaults = {
+      id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Insights/dataCollectionEndpoints/dce-test"
+    }
+  }
+
+  mock_resource "azurerm_monitor_private_link_scope" {
+    defaults = {
+      id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Insights/privateLinkScopes/ampls-test"
+    }
+  }
+
   mock_resource "azurerm_public_ip" {
     defaults = {
       id         = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Network/publicIPAddresses/pip-ingress-test"
@@ -119,6 +131,11 @@ mock_provider "azurerm" {
   mock_resource "azurerm_linux_virtual_machine" {
     defaults = {
       id = "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg-app-contract-test/providers/Microsoft.Compute/virtualMachines/vm-test"
+      identity = {
+        type         = "SystemAssigned"
+        principal_id = "99999999-9999-9999-9999-999999999999"
+        tenant_id    = "11111111-1111-1111-1111-111111111111"
+      }
     }
   }
 
@@ -521,12 +538,12 @@ run "trusted_services_exception_opens_only_the_azure_services_bypass" {
 
   assert {
     condition = (
-      azurerm_storage_account.exports[0].public_network_access == "Enabled" &&
+      azurerm_storage_account.exports[0].public_network_access == "Disabled" &&
       azurerm_storage_account.exports[0].network_rules[0].default_action == "Deny" &&
       azurerm_storage_account.exports[0].network_rules[0].bypass == toset(["AzureServices"]) &&
       length(azurerm_storage_account.exports[0].network_rules[0].ip_rules) == 0
     )
-    error_message = "The approved exception must only add the trusted Azure services bypass."
+    error_message = "The approved trusted-service exception must never enable general public network access."
   }
 }
 
@@ -948,6 +965,8 @@ run "private_control_plane_has_no_public_api_server_registry_or_inbound_path" {
     condition = alltrue([
       azurerm_container_registry.main.sku == "Premium",
       !azurerm_container_registry.main.public_network_access_enabled,
+      azurerm_container_registry.main.network_rule_bypass_option == "None",
+      !azurerm_container_registry.main.network_rule_bypass_for_tasks_enabled,
       azurerm_container_registry.main.data_endpoint_enabled,
       !azurerm_container_registry.main.admin_enabled,
     ])
@@ -980,27 +999,28 @@ run "private_control_plane_has_no_public_api_server_registry_or_inbound_path" {
   assert {
     condition = alltrue([
       length(azurerm_linux_virtual_machine.deploy_host) == 1,
-      length(azurerm_bastion_host.deploy_host) == 1,
-      azurerm_subnet.bastion[0].name == "AzureBastionSubnet",
-      azurerm_subnet.bastion[0].address_prefixes[0] == "10.42.1.128/26",
+      length(azurerm_bastion_host.deploy_host) == 0,
+      length(azurerm_subnet.bastion) == 0,
       azurerm_subnet.deploy_host[0].address_prefixes[0] == "10.42.1.96/27",
       azurerm_linux_virtual_machine.deploy_host[0].size == "Standard_D4s_v5",
       azurerm_linux_virtual_machine.deploy_host[0].admin_username == "cloudlensadmin",
       azurerm_linux_virtual_machine.deploy_host[0].source_image_reference[0].publisher == "Canonical",
-      length(azurerm_dev_test_global_vm_shutdown_schedule.deploy_host) == 1,
+      length(azurerm_dev_test_global_vm_shutdown_schedule.deploy_host) == 0,
     ])
-    error_message = "A private control plane needs the deploy host and its Bastion in subnets of the virtual network."
+    error_message = "A private control plane needs a deploy host, but no paid or public-facing Bastion by default."
   }
 
   assert {
     condition = alltrue([
       azurerm_network_interface.deploy_host[0].ip_configuration[0].public_ip_address_id == null,
-      length(azurerm_public_ip.bastion) == 1,
+      length(azurerm_public_ip.bastion) == 0,
       length(azurerm_public_ip.nat) == 1,
-      one([for rule in azurerm_network_security_group.deploy_host[0].security_rule : rule.source_address_prefix]) == "10.42.1.128/26",
-      one([for rule in azurerm_network_security_group.deploy_host[0].security_rule : rule.destination_port_range]) == "22",
+      one([for rule in azurerm_network_security_group.deploy_host[0].security_rule : rule.access]) == "Deny",
+      one([for rule in azurerm_network_security_group.deploy_host[0].security_rule : rule.destination_port_range]) == "*",
+      azurerm_linux_virtual_machine.deploy_host[0].identity[0].type == "SystemAssigned",
+      length(azurerm_role_assignment.deploy_host) == 4,
     ])
-    error_message = "The deploy host has no public address and takes SSH from Bastion's subnet only; the only public addresses are Bastion's and the NAT gateway's."
+    error_message = "The managed-identity deploy host must accept no inbound traffic; its only public address is outbound-only NAT."
   }
 
   assert {
@@ -1017,6 +1037,49 @@ run "private_control_plane_has_no_public_api_server_registry_or_inbound_path" {
       output.APP_DEPLOYMENT_STATE.deployHostEnabled,
     ])
     error_message = "The hook and the deploy scripts read these outputs to know the control plane is private and where the deploy host is."
+  }
+}
+
+run "private_monitoring_keeps_ingestion_configuration_and_queries_inside_the_vnet" {
+  command = apply
+
+  variables {
+    aks_private_cluster = true
+  }
+
+  assert {
+    condition = alltrue([
+      azurerm_log_analytics_workspace.main.internet_ingestion_access_type == "Disabled",
+      azurerm_log_analytics_workspace.main.internet_query_access_type == "Disabled",
+      azurerm_monitor_private_link_scope.main[0].ingestion_access_mode == "PrivateOnly",
+      azurerm_monitor_private_link_scope.main[0].query_access_mode == "PrivateOnly",
+      !azurerm_monitor_data_collection_endpoint.private[0].public_network_access_enabled,
+      azurerm_monitor_data_collection_rule.container_insights.data_collection_endpoint_id == azurerm_monitor_data_collection_endpoint.private[0].id,
+      azurerm_monitor_data_collection_rule_association.private_endpoint[0].data_collection_endpoint_id == azurerm_monitor_data_collection_endpoint.private[0].id,
+      length(azurerm_private_dns_zone.monitor) == 4,
+      length(azurerm_private_endpoint.monitor[0].private_dns_zone_group[0].private_dns_zone_ids) == 5,
+    ])
+    error_message = "Private monitoring needs AMPLS, its five DNS zones, and both ingestion and configuration DCE wiring."
+  }
+}
+
+run "interactive_bastion_is_an_explicit_opt_in" {
+  command = apply
+
+  variables {
+    aks_private_cluster         = true
+    deploy_host_bastion_enabled = true
+  }
+
+  assert {
+    condition = alltrue([
+      length(azurerm_bastion_host.deploy_host) == 1,
+      length(azurerm_public_ip.bastion) == 1,
+      azurerm_subnet.bastion[0].name == "AzureBastionSubnet",
+      length([for rule in azurerm_network_security_group.deploy_host[0].security_rule : rule if rule.access == "Allow" && rule.destination_port_range == "22"]) == 1,
+      output.APP_DEPLOY_HOST_BASTION_ENABLED == "true",
+    ])
+    error_message = "Bastion may only be provisioned when explicitly requested."
   }
 }
 

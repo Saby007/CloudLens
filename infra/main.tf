@@ -110,6 +110,7 @@ locals {
   # The deploy host exists only where something private needs it, and has an outbound path through the NAT gateway
   # (shared with the cluster when that uses one) because its subnet has no default outbound access.
   deploy_host_enabled      = var.deploy_host_enabled && (var.aks_private_cluster || var.private_registry)
+  bastion_enabled          = local.deploy_host_enabled && var.deploy_host_bastion_enabled
   nat_gateway_enabled      = var.aks_outbound_type == "natGateway" || local.deploy_host_enabled
   aks_nat_gateway_outbound = var.aks_outbound_type == "natGateway"
 

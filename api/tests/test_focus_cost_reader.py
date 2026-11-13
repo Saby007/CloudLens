@@ -467,10 +467,28 @@ def test_loads_latest_complete_focus_costs_from_run_history_and_blobs(monkeypatc
     monkeypatch.setattr(focus_cost_reader.focus_export_download, "get_container_client", lambda: Container())
     focus_cost_reader._cache.clear()
 
-    data = asyncio.run(focus_cost_reader.load_latest_complete_focus_costs([SUBSCRIPTION_ID]))
+    data = asyncio.run(focus_cost_reader.load_latest_complete_focus_costs(
+        [SUBSCRIPTION_ID], now=datetime(2026, 8, 16, tzinfo=timezone.utc),
+    ))
 
     assert data.period == "2026-07"
     assert data.effective_cost_by_subscription[SUBSCRIPTION_ID] == 8.0
+
+
+def test_stale_billing_exports_are_not_downloaded_outside_the_recent_window(monkeypatch):
+    async def runs(subscription_id, export_name):
+        return [_run(subscription_id, "old-july")]
+
+    def unexpected_download(*args):
+        pytest.fail("A June-August or current-month billing file must not be read for the November window")
+
+    monkeypatch.setattr(focus_cost_reader.arm_client, "list_cost_export_runs", runs)
+    monkeypatch.setattr(focus_cost_reader, "_download_run_files", unexpected_download)
+    focus_cost_reader._cache.clear()
+    with pytest.raises(FocusCostDataError, match="No completed"):
+        asyncio.run(focus_cost_reader.load_latest_complete_focus_costs(
+            [SUBSCRIPTION_ID], now=datetime(2026, 11, 13, tzinfo=timezone.utc),
+        ))
 
 
 class _PrefixContainer:

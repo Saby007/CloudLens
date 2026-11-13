@@ -113,6 +113,12 @@ try {
     & $deployOnHost -EnvironmentName 'priv-env' -MaxAttempts 2 -SettleSeconds 0 | Out-Null
     if ($state.calls -contains 'env new priv-env') { throw 'An existing environment must not be recreated.' }
 
+    [IO.File]::AppendAllText($envFile, "`nMEGHKOSHA_API_CLIENT_ID=`"updated-client-id`"`n")
+    & $deployOnHost -EnvironmentName 'priv-env' -EnvFile $envFile -MaxAttempts 2 -SettleSeconds 0 | Out-Null
+    if ($state.environments['priv-env']['MEGHKOSHA_API_CLIENT_ID'] -ne 'updated-client-id') {
+        throw 'A rerun must refresh exported settings instead of silently keeping old client IDs.'
+    }
+
     # A failing deploy is retried, then reported, and still puts azure.yaml back.
     $state.calls.Clear()
     $state.failDeploy = $true

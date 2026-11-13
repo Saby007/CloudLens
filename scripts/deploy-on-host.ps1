@@ -22,7 +22,13 @@
 
 .PARAMETER EnvFile
     Settings exported by prepare-deploy-host.ps1 (KEY="value" lines, the format of `azd env get-values`). The azd
-    environment is created from them when it does not exist yet; an existing one is left as it is.
+    environment is created when missing, and its settings are refreshed on every supplied file, including reruns.
+
+.PARAMETER Verify
+    Require private data planes, both rollouts, private DNS and CA-validated HTTPS before returning.
+
+.PARAMETER ResultFile
+    Write the machine-readable verification result here when -Verify is used.
 
 .PARAMETER SkipLogin
     Do not check that az and azd are signed in (the calling script has already).
@@ -41,6 +47,8 @@ param(
     [ValidateRange(0, 900)]
     [int] $SettleSeconds = 120,
     [switch] $SkipLogin,
+    [switch] $Verify,
+    [string] $ResultFile = '',
     [switch] $PlanOnly
 )
 
@@ -138,8 +146,11 @@ try {
         if (-not (Test-Path -LiteralPath $EnvFile)) { throw "-EnvFile '$EnvFile' was not found." }
         & azd env new $EnvironmentName --no-prompt | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "Unable to create azd environment '$EnvironmentName'." }
+    }
+    if ($EnvFile) {
+        if (-not (Test-Path -LiteralPath $EnvFile)) { throw "-EnvFile '$EnvFile' was not found." }
         $count = Import-EnvironmentFile -Path $EnvFile
-        Write-Host "Imported $count settings into the azd environment '$EnvironmentName'."
+        Write-Host "Refreshed $count settings in the azd environment '$EnvironmentName'."
     }
     & azd env select $EnvironmentName --no-prompt | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Unable to select azd environment '$EnvironmentName'." }
@@ -171,6 +182,9 @@ try {
     $issuer = Get-AzdValue 'APP_TLS_CLUSTER_ISSUER'
     if ($issuer -eq 'private-ca') {
         Write-Host 'The certificate comes from the cluster''s own CA; browsers must trust it (see the README, "Private ingress").' -ForegroundColor Yellow
+    }
+    if ($Verify) {
+        & (Join-Path $PSScriptRoot 'verify-private-deployment.ps1') -EnvironmentName $EnvironmentName -ResultFile $ResultFile
     }
 } finally {
     if ($null -ne $originalYaml) { [System.IO.File]::WriteAllText($azureYaml, $originalYaml) }

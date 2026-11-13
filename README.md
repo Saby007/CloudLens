@@ -1,6 +1,6 @@
 # CloudLens
 
-**CloudLens** is a self-hosted Azure cost-assessment and FinOps dashboard. It turns native Azure Cost Management FOCUS exports into an executive-ready cost report, a rolling cost history (3–6 closed months plus the current month through yesterday), resource-level optimization recommendations, and an optional AI narrative — all running on your own infrastructure, in your own Azure subscription, under your own identity.
+**CloudLens** is a self-hosted Azure cost-assessment and FinOps dashboard. It turns native Azure Cost Management FOCUS exports into an executive-ready cost report, the last two completed calendar months of cost history by default, resource-level optimization recommendations, and an optional AI narrative — all running on your own infrastructure, in your own Azure subscription, under your own identity.
 
 You deploy it once into a subscription of your choice, grant it three read/cost-management role assignments on the subscriptions you want it to analyze, and it takes care of the rest: creating the native cost exports, scheduling the rolling monthly and daily pulls, and rendering the dashboards below.
 
@@ -26,7 +26,7 @@ You deploy it once into a subscription of your choice, grant it three read/cost-
 ## What it does
 
 - **Reads, never writes billing data.** All cost figures come from Azure's own native FOCUS 1.2-preview cost export — the same export format used by FinOps toolkit customers — so the numbers reconcile with your Azure invoice.
-- **Sets itself up.** Once the required roles are visible to its managed identity, the app creates the native exports (closed months plus a daily month-to-date export) and a rolling schedule of 3–6 months; you do not hand-configure Cost Management exports yourself.
+- **Sets itself up.** Once the required roles are visible to its managed identity, the app creates the native exports and a rolling two-completed-month schedule. For November 2026 that means September and October, not June–August or incomplete November. Daily current-month collection and longer history are explicit opt-ins.
 - **Assesses resources, not just spend.** It cross-references billed cost with resource inventory, Azure Advisor, Azure Monitor metrics, and SQL/compute/storage/network signals to flag idle and overprovisioned resources.
 - **Explains itself.** An optional Microsoft Foundry-backed agent turns the reconciled findings into a written executive summary and answers follow-up questions in a chat panel — this stays off until you explicitly enable it.
 - **Stays inside your tenant.** Authentication is delegated Microsoft Entra ID sign-in; the API validates a bearer token issued for itself. The browser never receives an Azure Resource Manager token, and the app never requests Entra admin consent.
@@ -93,7 +93,11 @@ Each profile is a superset of the previous one. Lowering an environment's profil
 
 **Identity and authorization.** The single-page app requests only its own API's `access_as_user` delegated scope from Entra ID — never an Azure Resource Manager scope. The API independently validates that bearer token's issuer, audience, tenant, and client before trusting it. Azure-side calls (discovering subscriptions, reading resources, creating exports) are made with the API's own **user-assigned managed identity** via `ManagedIdentityCredential` (workload identity on AKS), then filtered against the signed-in user's own Azure RBAC role on each subscription — so a user only ever sees subscriptions they themselves have access to, not everything the identity can reach.
 
-**Export creation and scheduling.** Once a target subscription's Reader and Cost Management Contributor grants are visible to the API identity, opening **Schedules** automatically creates two native FOCUS exports (CSV/gzip, partitioned, overwrite-enabled) in the deployment's own storage account — closed months under `cost-exports/focus/` and daily month-to-date snapshots under `cost-exports/focus-daily/` — and saves an active schedule — no manual export configuration step is required. Each schedule keeps 3–6 closed months of history (default 6; anomaly detection needs at least 60 days). **Export** re-pulls that whole window. On the schedule's monthly day the worker pulls only closed months that have no copy taken after Azure finalized them (Azure adds late charges for up to 72 hours after a month ends), which is normally just the month that closed. Every day after the schedule's UTC daily-pull time it also pulls the current month through yesterday, plus last month during the first five days. A separate **processor** identity (kept intentionally distinct from the API identity) runs these export executions from a Kubernetes CronJob every 5 minutes (`APP_PROCESSOR_CRON`), checkpointing progress per subscription so a restart or a missed tick doesn't re-run months that already succeeded. A month that finishes is followed by the next one in the same tick; throttled requests wait as long as Azure asks (1–15 minutes) without counting as failures, and `APP_EXPORT_PARALLEL_MONTHS` (default 1) sets how many months run at once.
+**Export creation and scheduling.** Once a target subscription's Reader and Cost Management Contributor grants are visible to the API identity, opening **Schedules** configures the native FOCUS exports (CSV/gzip, partitioned, overwrite-enabled) and creates a schedule. Closed months go under `cost-exports/focus/`; the optional daily export uses `cost-exports/focus-daily/`. By default **only the two completed UTC calendar months preceding the current month are pulled**: November 2026 pulls September 1–30 and October 1–31. January correctly crosses the year boundary. Daily current-month pulls default to off. Operators can explicitly select 3–6 months or enable daily pulls if their data and requirements justify them.
+
+Existing version-1 schedules are migrated under their storage lease to two months with daily pulls off; an unfinished old cycle is archived with an explicit migration reason rather than continuing to submit old months. Previously stored billing files and execution history are not deleted. Version-2 schedules retain any subsequent explicit operator choices. Anomaly detection still requires 60 complete days: a two-month window containing February can be shorter, in which case insufficient history is reported rather than silently fetching an older month.
+
+**Export** re-pulls the selected window. A scheduled monthly close pulls only months without a finalized copy (Azure can post late charges for 72 hours). The separate **processor** identity runs the Kubernetes CronJob every five minutes (`APP_PROCESSOR_CRON`), checkpointing progress. Throttled requests honor Azure's retry interval; `APP_EXPORT_PARALLEL_MONTHS` defaults to one. Creating an inactive daily export does not submit a current-month run.
 
 **Retention.** Storage lifecycle rules delete daily snapshots after 60 days (`APP_DAILY_EXPORT_RETENTION_DAYS`) and closed-month files after 214 days (`APP_CLOSED_MONTH_RETENTION_DAYS`, at least 190 so the longest 6-month window is always covered). Reports read history from the files that remain: the month to date appears in daily views as an estimate and is left out of monthly totals until the month closes.
 
@@ -131,7 +135,9 @@ Two other top-level views round out the app:
 
 ## Prerequisites
 
-**Tools** on the machine you deploy from — no local Docker is needed, the images are built in Azure Container Registry:
+**Cloud Shell (recommended):** select **Bash** and attach persistent storage. The launcher installs missing azd/Terraform tools in your user directory and reuses the portal's Azure CLI login. Docker is needed only on the private deploy VM, where cloud-init installs it; no Docker, VPN or Bastion is needed in Cloud Shell.
+
+**Tools** for an existing local checkout:
 
 - [git](https://git-scm.com/) and **PowerShell 7+** (`pwsh`); the deployment hook and helper scripts are PowerShell.
 - The [Azure CLI](https://learn.microsoft.com/cli/azure/), signed in with `az login`. Terraform authenticates through it, not through azd.
@@ -169,7 +175,7 @@ az provider show --namespace Microsoft.CostManagementExports --subscription <sub
 
 ## Deploying to Azure
 
-There are two ways to deploy: one command that does the whole thing, or the step-by-step Azure Developer CLI workflow. Both use [azure.yaml](azure.yaml), and one `azd up` does all of this:
+The recommended Cloud Shell command runs the complete deployment. Infrastructure is **Terraform**, orchestrated by azd through [azure.yaml](azure.yaml); no Bicep or local Docker is used. Provisioning goes through Azure Resource Manager. Private image builds, Kubernetes operations and HTTPS checks run inside the VNet through managed VM Run Command:
 
 1. **`azd provision` runs Terraform** ([infra/](infra)): resource group, network with an NSG on each subnet (plus dedicated ingress and Private Link subnets), AKS cluster, container registry, Log Analytics with Container Insights, managed identities with their workload-identity federation, and — per profile — the export storage and the Foundry account. Terraform state is kept in `.azure/<environment>/infra/`.
 2. **The postprovision hook** ([scripts/aks-bootstrap.ps1](scripts/aks-bootstrap.ps1)) prepares the cluster (with the default private control plane this runs on the deploy host; see [Private control plane](#private-control-plane-the-default)): it installs a pinned, checksum-verified cert-manager release, creates an app-routing NGINX ingress controller behind an internal load balancer with a Private Link service (or, for a public ingress, on the Terraform-owned static IP), and adds the certificate issuers. It is safe to rerun.
@@ -180,7 +186,35 @@ There are two ways to deploy: one command that does the whole thing, or the step
 
 ### Option 1 — One command, end to end (recommended)
 
-`scripts/deploy-end-to-end.ps1` is this entire page in a single self-contained script: prerequisites, sign-in, environment settings, the Terraform preview, `azd up` with automatic retries, `bootstrap-identity.ps1` plus the client-ID rollout, and the three role assignments on every subscription you name. When it finishes, the app is deployed, sign-in works, and the subscriptions you listed are ready to assess — no manual follow-up steps. **With the default private control plane the last stage, deploying the services, needs a machine inside the network:** the script does it itself when it can reach the private cluster, and otherwise prepares the deploy host and prints the one command to run there ([Private control plane](#private-control-plane-the-default)).
+[scripts/deploy-cloudshell.sh](scripts/deploy-cloudshell.sh) prepares a persistent checkout of `cloudlensdev` and invokes [scripts/deploy-end-to-end.ps1](scripts/deploy-end-to-end.ps1). It previews/applies Terraform, configures Entra sign-in, grants the target-subscription roles, builds both images inside the VNet, deploys them and validates private HTTPS with the actual CA. It does **not** finish with a pending manual VM login or temporarily enable public endpoints.
+
+In the Azure portal, open **Cloud Shell → Bash**, choose **Mount storage**, and run this one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Saby007/CloudLens/cloudlensdev/scripts/deploy-cloudshell.sh -o "$HOME/clouddrive/deploy-cloudlens.sh" && bash "$HOME/clouddrive/deploy-cloudlens.sh" -EnvironmentName cloudlens-dev -Location centralindia
+```
+
+By default this uses your current subscription, grants access to that subscription only, and deploys the **data** profile (dashboard, storage, scheduled exports; no Foundry quota required). Append `-SubscriptionId '<deployment-subscription>' -TargetSubscriptionId '<sub1>,<sub2>'` for other scopes, `-CustomDomain cloudlens.contoso.com` for customer DNS, or `-Profile ai` to include private Foundry and Model Router chat. Keep using the same profile when rerunning; lowering a provisioned profile is refused to protect data.
+
+The deploying user needs Owner, or Contributor plus User Access Administrator, on the relevant scopes, and permission to create Entra app registrations. Pass `-ServiceManagementReference '<id>'` if your tenant requires it. Organizational Conditional Access and app-registration policy still apply; the launcher never bypasses them.
+
+**Persistence and recovery.** The checkout and Terraform state are under `$HOME/clouddrive/CloudLens/.azure/`. Ephemeral Cloud Shell is rejected. First provisioning can take 30–60 minutes; keep the Cloud Shell tab active because its idle timeout is 20 minutes. If disconnected, rerun the same command from the same mounted storage. An already-running private managed command is monitored, not duplicated. Preserve/back up the state; never start an independent checkout to recover an existing deployment. Local source edits are refused rather than overwritten.
+
+The Cloud Shell workspace/file share is customer-managed, outside the CloudLens resource group. Protect it as sensitive deployment state. If policy also requires that workspace's storage network to be private, use [VNet-isolated Cloud Shell](https://learn.microsoft.com/azure/cloud-shell/vnet/overview) with approved private storage; the application deployment does not create or relax Cloud Shell's own storage networking.
+
+**Access after deployment.** The summary contains the private URL/IP and writes the **public** TLS CA certificate to `.azure/<environment>/cloudlens-ca.crt`. Your customer's existing VPN/ExpressRoute must route to the CloudLens VNet; their DNS must resolve the app name to the private ingress IP, and their laptops must trust its CA (or use an enterprise-issued certificate). A VPN connection alone does not configure DNS or certificate trust. Open **Schedules**, allow RBAC propagation, and use **Export** to initialize September/October in November. No personal VPN gateway is included in the application.
+
+**Check the system from ordinary Cloud Shell without a VPN:**
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+cd "$HOME/clouddrive/CloudLens"
+pwsh ./scripts/invoke-private-deploy.ps1 -EnvironmentName cloudlens-dev -VerifyOnly
+```
+
+This starts the private VM if needed, verifies private AKS/ACR/storage/Log Analytics settings, both rollouts, private DNS and CA-validated HTTPS, then deallocates the VM. Standard Cloud Shell cannot directly browse or curl private ingress; see [Cloud Shell networking](https://learn.microsoft.com/azure/cloud-shell/vnet/overview). The app continues running on AKS. `-KeepDeployHostRunning` is available for troubleshooting; a failed/interrupted run can leave the VM running, so inspect it and deallocate it when finished.
+
+Alternatively, from an existing **local checkout** with the prerequisite tools:
 
 ```powershell
 git clone --branch cloudlensdev https://github.com/Saby007/CloudLens.git
@@ -203,6 +237,7 @@ pwsh ./scripts/deploy-end-to-end.ps1 `
 | --- | --- |
 | `-PlanOnly` | Print exactly what would happen without touching Azure. |
 | `-SubscriptionId` | Deploy into a subscription other than the Azure CLI's current one. |
+| `-Profile` | `data` for the Cloud Shell default; `ai` for private Foundry/chat. The direct PowerShell helper retains its `ai` default for compatibility. |
 | `-MaxAttempts` | Allow more retries (default 3). |
 | `-InstallKubernetesTools` | Install kubectl and kubelogin with `az aks install-cli` without asking. |
 | `-AcmeEmail` | Register a contact address with Let's Encrypt for the TLS certificate. |
@@ -215,6 +250,7 @@ pwsh ./scripts/deploy-end-to-end.ps1 `
 | `-ControlPlane` | `private` (the default for a new environment) or `public`. Private means a private API server and registry, a NAT gateway and a deploy host; see [Private control plane](#private-control-plane-the-default). An existing cluster with a public API server is refused until you say `-ControlPlane public`. |
 | `-OutboundType` | `natGateway` (default) or `loadBalancer` for the cluster's outbound traffic. |
 | `-NoDeployHost` | Do not create the deploy host; you deploy from a network connected to the cluster's virtual network. |
+| `-EnableDeployHostBastion` | Explicitly add paid, public-facing Bastion for interactive administration. Never needed by the Cloud Shell flow; off by default. |
 | `-OperatorMode` | Dev only: you cannot create Entra app registrations. Deploys without sign-in; the public URL stays closed unless you add `-AllowedIpRanges` — see [operator mode](#operator-mode-dev-without-entra-app-registrations). |
 | `-AllowedIpRanges` | Public ingress only. Only these IPv4 addresses or CIDR ranges may reach the public URL over HTTPS. With `-OperatorMode`, this is what opens it; `scripts/allow-my-ip.ps1` keeps it current when your address changes. |
 | `-ServiceManagementReference` | Your tenant requires a Service Tree ID on app registrations. If you leave it out, the script asks when the tenant refuses, suggests the ID your existing registrations use, and remembers your answer. |
@@ -234,7 +270,7 @@ az login
 pwsh ./scripts/deploy-ai.ps1 -EnvironmentName my-environment -Location centralindia
 ```
 
-The helper is Option 1 without its sign-in and role-assignment phases: it checks the tools, applies the recommended `ai` profile with the app-local Model Router and the scheduled processor, previews the Terraform plan, and runs `azd up` with the same retries (with the default private control plane it provisions, then prepares the deploy host; see [Private control plane](#private-control-plane-the-default)). You then do [step 4 (sign-in)](#4-configure-sign-in) and [step 5 (role assignments)](#5-grant-access-to-the-subscriptions-you-want-to-assess) yourself.
+The helper is Option 1 without its sign-in and role-assignment phases: it checks the tools, selects the `ai` profile, previews Terraform and deploys through the private host. You still perform [step 4 (sign-in)](#4-configure-sign-in) and [step 5 (role assignments)](#5-grant-access-to-the-subscriptions-you-want-to-assess), then rerun the full end-to-end helper to refresh and verify the private deployment. Use Option 1 from Cloud Shell to avoid these manual stages.
 
 The equivalent raw commands are:
 
@@ -256,11 +292,11 @@ azd up
 
 Boolean settings must be lowercase `true` or `false`. With the default private control plane, `azd up` from a machine outside the network provisions everything and then stops at the cluster bootstrap with an error that says where to run it, so use Option 1 or the deploy host ([Private control plane](#private-control-plane-the-default)), or `azd env set APP_AKS_PRIVATE_CLUSTER false` and `azd env set APP_PRIVATE_REGISTRY false` first. Re-running `azd up` (or `azd deploy` alone, for code changes) later updates the deployment in place, as long as kubectl and kubelogin are on your `PATH` ([Prerequisites](#prerequisites)).
 
-If you intentionally want exports without Foundry chat, set `APP_PROFILE=data` and omit the five Model Router/chat settings. That is an opt-out path, not the recommended deployment.
+For exports without Foundry chat, set `APP_PROFILE=data` and omit the five Model Router/chat settings. This is the recommended Cloud Shell starting profile; AI is opt-in.
 
 For both `data` and `ai`, keep `APP_EXPORT_TRUSTED_SERVICES=true` — otherwise the storage account's network rules keep `bypass` at `None`, which blocks Cost Management's export-creation call (the Schedules tab always shows **Export status unavailable**, regardless of subscription type or RBAC grants, until this is set).
 
-> This grants Azure's own "trusted Microsoft services" exception (`Microsoft.CostManagementExports`) on the storage account's firewall — it's scoped to first-party Azure services, not a public network opening, and is required for native FOCUS exports to reach a firewalled/private-endpoint-only storage account at all. In tenants with central governance policies (for example `StorageAccount_PublicNetwork_Modify`), `publicNetworkAccess` may still end up `Disabled` regardless of `APP_EXPORT_TRUSTED_SERVICES` — that's expected and fine; the `AzureServices` bypass is what actually matters.
+> Native Cost Management exports require an authenticated **trusted Azure services exception**, not customer access to the public storage endpoint. Terraform always sets `publicNetworkAccess=Disabled`, firewall `defaultAction=Deny`, no IP/network allow rules, and shared keys off. With `APP_EXPORT_TRUSTED_SERVICES=true`, the AzureServices exception remains effective: [trusted-service access takes precedence](https://learn.microsoft.com/azure/storage/common/storage-network-security-limitations). See [Cost Management export requirements](https://learn.microsoft.com/azure/cost-management-billing/costs/tutorial-improved-exports#configure-exports-for-storage-accounts-with-a-firewall). This is an explicit platform exception, **not an air-gapped/private-link-only export delivery path**. A policy forbidding even this first-party exception is incompatible with native FOCUS export ingestion.
 
 > If `azd up`/`azd provision` crashes with a Go panic mentioning `HooksMiddleware`, that's a known `azd` bug ([azure-dev#10037](https://github.com/Azure/azure-dev/issues/10037)) unrelated to this repo — upgrade `azd` (`azd version` to check, then reinstall the latest).
 
@@ -449,8 +485,9 @@ Set these with `azd env set <name> <value>` before `azd provision`. Values marke
 | `APP_AKS_API_AUTHORIZED_IP_RANGES` | *(any)* | Public API server only (rejected for a private cluster). Comma-separated CIDR ranges allowed to reach the Kubernetes API server. Include the machine that runs `azd`. |
 | `APP_AKS_PRIVATE_CLUSTER`, `APP_PRIVATE_REGISTRY` | `true`, `true` | **Day-0.** A private API server (no public address) and a Premium container registry reachable only through a private endpoint. `false` keeps the public API server and the Basic registry. AKS cannot make an existing API server private in place; changing it replaces the cluster. |
 | `APP_AKS_OUTBOUND_TYPE` | `natGateway` | **Day-0.** `natGateway`: outbound traffic leaves through a NAT gateway with one static public IP (`APP_NAT_GATEWAY_IP`), and there is no public load balancer. `loadBalancer`: the cluster's load balancer with managed outbound IPs (the two SNAT settings below apply only to it). |
-| `APP_DEPLOY_HOST_ENABLED` | `true` | Create the deploy host (a Linux VM with no public address, plus Azure Bastion) when the cluster or the registry is private. Turn it off if you deploy from a network that is connected to this one. |
-| `APP_DEPLOY_HOST_SUBNET_PREFIX`, `APP_BASTION_SUBNET_PREFIX`, `APP_DEPLOY_HOST_VM_SIZE`, `APP_DEPLOY_HOST_SHUTDOWN_TIME` | `10.42.1.96/27`, `10.42.1.128/26`, `Standard_D4s_v5`, `1800` | **Day-0** for the subnets (inside the VNet, not overlapping the others; Bastion needs /26 or larger). The VM stops itself daily at this UTC time (`HHmm`; empty disables). |
+| `APP_DEPLOY_HOST_ENABLED` | `true` | Create the private managed-identity build/deploy VM. Cloud Shell uses ARM Run Command, with no inbound access; disable only when deploying from a connected machine with Docker. |
+| `APP_DEPLOY_HOST_BASTION_ENABLED` | `false` | Optional paid/public-facing Bastion for interactive administration; never needed by the Cloud Shell command. |
+| `APP_DEPLOY_HOST_SUBNET_PREFIX`, `APP_BASTION_SUBNET_PREFIX`, `APP_DEPLOY_HOST_VM_SIZE`, `APP_DEPLOY_HOST_SHUTDOWN_TIME` | `10.42.1.96/27`, `10.42.1.128/26`, `Standard_D4s_v5`, empty | **Day-0** subnet settings; Bastion's subnet exists only when opted in. Daily shutdown is optional (`HHmm`); the default avoids interrupting a build, and the managed flow deallocates the VM after verification. |
 | `APP_INGRESS_VISIBILITY` | `private` | `private` or `public`. Private serves the app from an internal load balancer; public adds a static public IP. Switching recreates the ingress address — see [Moving an existing environment](#moving-an-existing-environment-between-public-and-private). |
 | `APP_INGRESS_SUBNET_PREFIX`, `APP_PRIVATE_LINK_SUBNET_PREFIX` | `10.42.1.32/27`, `10.42.1.64/27` | **Day-0.** Subnets for the internal load balancer (it takes the 5th address) and for the Private Link service's NAT addresses. They must sit inside the VNet and not overlap the other subnets. |
 | `APP_PRIVATE_LINK_ENABLED` | `true` | Create a Private Link service so other networks can reach the app through a private endpoint. |
@@ -541,28 +578,21 @@ A new environment is private end to end. Besides the [private ingress](#private-
 - the **Kubernetes API server** is private (`APP_AKS_PRIVATE_CLUSTER`): it has only an address in the virtual network;
 - the **container registry** is Premium with a private endpoint and no public access (`APP_PRIVATE_REGISTRY`), with dedicated data endpoints so image layers also travel over the private endpoint;
 - **outbound traffic** leaves through a NAT gateway (`APP_AKS_OUTBOUND_TYPE=natGateway`): one static public IP that nothing can connect to, and no public load balancer. The cluster still needs outbound access to pull images from Microsoft and other registries and to call Azure APIs. Where that is not allowed either, use Azure Firewall with user-defined routing (not built here);
-- a **deploy host** (`APP_DEPLOY_HOST_ENABLED`) sits inside the network: a Linux VM with no public address, reached through Azure Bastion, with Azure CLI, azd, kubectl, kubelogin, Terraform, PowerShell and Docker installed. It shuts itself down daily.
+- **Log Analytics** ingestion and query access are private, with an Azure Monitor Private Link Scope, private DNS and a private data collection endpoint for Container Insights;
+- a **deploy host** (`APP_DEPLOY_HOST_ENABLED`) sits inside the network: a Linux VM with no public IP and a deny-all inbound NSG. Its system-assigned identity has only RG Reader, cluster-user/admin access and AcrPush. Managed Run Command operates it through ARM; it needs no inbound SSH, copied user tokens or app secrets. Bastion is off by default.
 
 Provisioning goes through Azure Resource Manager, so it runs from anywhere. What cannot is everything that touches the API server or the registry: the cluster bootstrap (cert-manager, the ingress controller), building and pushing the images (ACR Tasks cannot reach a private registry, so the images are built with Docker on the deploy host), and applying the manifests. `deploy-end-to-end.ps1` therefore does the following:
 
 1. From your machine: provision (the cluster bootstrap is skipped), configure sign-in and grant the subscription roles.
-2. Check whether this machine can reach the private API server (it can on a VPN or the deploy host). If so, it runs the deploy stage itself.
-3. Otherwise `scripts/prepare-deploy-host.ps1` (called automatically) starts the deploy host, copies this environment's settings and a clone of the repository onto it through `az vm run-command`, and prints the sign-in details and commands.
+2. Start the private deploy host and run [invoke-private-deploy.ps1](scripts/invoke-private-deploy.ps1) through durable managed Run Command, using the **exact checked-out commit**, not a moving branch. It waits for cloud-init tools and uses the VM's own managed identity to sign in.
+3. Refresh non-secret environment settings on every run, bootstrap the cluster, build/push both images with local Docker over ACR's private endpoint, and deploy the manifests.
+4. Require both rollouts and private DNS to succeed, verify HTTPS without `--insecure`, return a request-correlated result and export only the public CA certificate. Deallocate the build VM after success. No manual hop remains.
 
-On the deploy host (Azure portal → the VM → Connect → Bastion, user `cloudlensadmin`, password from `azd env get-value APP_DEPLOY_HOST_ADMIN_PASSWORD`):
-
-```bash
-az login --use-device-code
-azd auth login --use-device-code
-cd ~/cloudlens/CloudLens
-pwsh ./scripts/deploy-on-host.ps1 -EnvironmentName my-environment -EnvFile ~/cloudlens/my-environment.env
-```
-
-`deploy-on-host.ps1` creates the azd environment from the exported settings, runs the cluster bootstrap, builds both images with Docker (switching azure.yaml's remote build off for the run and restoring it afterwards) and runs `azd deploy`. Terraform does not run there. Every step is safe to rerun, and rerunning `prepare-deploy-host.ps1` refreshes the settings on the host. The deploying user needs **AcrPush** on the registry, which Terraform grants to the identity that provisioned.
+Terraform still runs only from the original persistent checkout, never from the build VM. If you explicitly use `-NoDeployHost`, a connected machine with Docker must run the final stage; an unreachable private cluster is an error, never a successful pending deployment.
 
 **Use `-ControlPlane public`** to keep a public API server and a Basic registry, deployed from anywhere as before (azd's remote build stays on for it). Pass `-NoDeployHost` when you deploy from a network you already connect to the virtual network; run `deploy-on-host.ps1` there with the environment's settings. An environment whose cluster has a public API server is never made private silently: AKS cannot do that in place, so Terraform would replace the cluster. The deploy script refuses until you say `-ControlPlane public`, and going private means a new environment.
 
-**Costs and caveats.** A Premium registry, Azure Bastion (billed hourly while it exists), the NAT gateway and the deploy host's disk add to the bill (see the Azure pricing calculator). Stop the host with `az vm deallocate` when you are not deploying; Bastion keeps billing until you set `APP_DEPLOY_HOST_ENABLED=false` and run `azd provision`, which removes the host and Bastion. Terraform state (`.azure/<environment>/infra`) stays on the machine that provisioned: keep it there. Not verified against a live subscription: the deploy host's tool installation (cloud-init, about 10 minutes after creation; progress is in `/var/log/cloudlens-tools.log`) and AKS's private DNS resolution from the deploy host. The jump box for testing the app from a browser (`deploy-test-jumpbox.ps1`) is a separate, test-only network and still works against a private cluster (it reads the CA through `az aks command invoke`).
+**Costs and caveats.** AKS nodes, Standard AKS tier, Premium ACR, NAT, private endpoints, Log Analytics ingestion and the deploy-host disk incur charges. The build VM is deallocated after success; there is no default Bastion or VPN gateway bill. Its optional daily shutdown is disabled by default so it cannot interrupt a build. On a failure inspect `/var/log/cloudlens-cloudlens-deploy-<environment>.log` through VM Run Command, then deallocate the VM when finished. Do not deallocate while a managed deployment is running. Offline contracts cover the topology and failure handling; an actual Azure apply is still required to establish regional quota, tenant policy and live service behavior.
 
 ### HTTPS and custom domains
 
@@ -636,7 +666,7 @@ Individual suites are `Backend`, `Frontend`, `Build`, and `Browser`. The runner 
 - The app never requests Entra admin consent, never requests an Azure Resource Manager scope from the browser, and never persists user bearer tokens.
 - Its managed identities hold only the roles you explicitly grant (see above) plus what the deployment itself provisions (container-scoped storage roles for its own control-state and export data). Pods reach them through workload identity federation — there are no client secrets, storage keys or registry passwords anywhere.
 - The cluster API accepts Entra ID only (local accounts are disabled) and is authorized by Azure RBAC. By default it also has no public address (a private cluster), and the container registry is reachable only through a private endpoint; with a public API server, restrict it further with `APP_AKS_API_AUTHORIZED_IP_RANGES`.
-- A new environment is [private](#private-ingress-the-default): no public IP, inbound internet traffic denied at the node subnet, and the app reachable only from the virtual network or through a private endpoint to its Private Link service (whose connections you approve or pre-approve by subscription). The AKS API server and container registry remain public endpoints protected by Entra ID and Azure RBAC.
+- A new environment is [private](#private-ingress-the-default): no public application IP, AKS API/ACR/storage/Foundry and monitoring data planes private, and no default Bastion. The NAT IP is outbound-only. ARM, Entra sign-in, billing APIs and package downloads still require approved outbound connectivity; this is not an air-gapped deployment.
 - TLS ends at the ingress controller. Network policies admit only the ingress controller to the web pods and only the web pods to the API; the API has no public endpoint. Storage and Foundry are reachable only through private endpoints.
 - [Operator mode](#operator-mode-dev-without-entra-app-registrations) (Dev only) replaces Entra sign-in with network access control: every request acts as one configured operator, and only the addresses on the IP allow-list (enforced by the network security group) or users with cluster access (through port-forward) can reach the app. Without an allow-list, HTTPS is blocked at the network security group, the network policies admit nothing from the ingress controller, and the API refuses requests it forwarded. Never use it in production.
 - Pods run as non-root users with read-only root filesystems, no privilege escalation, all Linux capabilities dropped and the runtime-default seccomp profile. Container images run on a minimal, digest-pinned base with no shell or package manager in the production API image.

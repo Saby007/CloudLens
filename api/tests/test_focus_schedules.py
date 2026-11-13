@@ -84,11 +84,57 @@ def store(monkeypatch):
     ("2024-03-01", "2023-09-01", "2024-02-29"),
 ])
 def test_six_completed_calendar_months(now, first, last):
-    months = focus_schedules.completed_months(datetime.fromisoformat(now).replace(tzinfo=timezone.utc))
+    months = focus_schedules.completed_months(datetime.fromisoformat(now).replace(tzinfo=timezone.utc), 6)
     assert len(months) == 6
     assert str(months[0].start.date()) == first
     assert str(months[-1].end.date()) == last
     assert all(after.start == before.end + timedelta(seconds=1) for before, after in zip(months, months[1:]))
+
+
+@pytest.mark.parametrize("now, first, last", [
+    ("2026-11-13T06:35:00+00:00", "2026-09-01", "2026-10-31"),
+    ("2027-01-01T00:00:00+00:00", "2026-11-01", "2026-12-31"),
+    ("2024-03-01T00:00:00+00:00", "2024-01-01", "2024-02-29"),
+    ("2026-11-01T01:00:00+05:30", "2026-08-01", "2026-09-30"),
+])
+def test_default_is_exactly_two_completed_utc_months(now, first, last):
+    months = focus_schedules.completed_months(datetime.fromisoformat(now))
+    assert len(months) == 2
+    assert str(months[0].start.date()) == first
+    assert str(months[-1].end.date()) == last
+    assert months[0].end + timedelta(seconds=1) == months[1].start
+
+
+def test_legacy_schedule_is_persistently_migrated_without_submitting_old_months(store):
+    now = datetime(2026, 11, 13, tzinfo=timezone.utc)
+
+    async def run():
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", 6, daily_enabled=True)
+        name, raw = next(iter(store.documents.items()))
+        legacy = focus_schedules.StoredSchedule.model_validate_json(raw)
+        legacy.schema_version = 1
+        legacy.cycle = focus_schedules.RefreshCycle(
+            started_at=now, window_months=6, months=focus_schedules.completed_months(now, 6),
+        )
+        legacy.cycle.months[0].baseline_ids = ["old-native-run"]
+        store.documents[name] = legacy.model_dump_json().encode()
+        await focus_schedules.advance(SUBSCRIPTION, now=now, force=True)
+        assert await focus_schedules.advance_daily(SUBSCRIPTION, now=now) == {
+            "subscriptionId": SUBSCRIPTION, "status": "not_due",
+        }
+        migrated = focus_schedules.StoredSchedule.model_validate_json(store.documents[name])
+        assert migrated.schema_version == 2 and migrated.window_months == 2
+        assert migrated.daily.enabled is False
+        assert [f"{month.start:%Y-%m}" for month in migrated.cycle.months] == ["2026-09", "2026-10"]
+        assert migrated.previous_runs[-1].status == "failed"
+        assert all(not month.baseline_ids for month in migrated.previous_runs[-1].months)
+        assert "two-completed-month policy" in migrated.previous_runs[-1].error
+        submissions = [item for item in store.requests if item[2] == "run"]
+        assert [(item[3]["timePeriod"]["from"], item[4]) for item in submissions] == [
+            ("2026-09-01T00:00:00Z", "monthly"),
+        ]
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("method,timeout", [("GET", 10), ("POST", 10), ("PUT", 45)])
@@ -182,12 +228,13 @@ def test_monthly_schedule_keeps_original_day_after_february():
     assert focus_schedules.next_monthly_run(start, datetime(2024, 2, 29, 4, tzinfo=timezone.utc)) == datetime(2024, 3, 31, 3, tzinfo=timezone.utc)
 
 
-def test_create_saves_six_month_schedule_without_creating_export_or_grants(store):
+def test_create_saves_two_month_schedule_without_creating_export_or_grants(store):
     result = asyncio.run(focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z"))
-    assert result["windowMonths"] == 6 and result["state"] == "active"
+    assert result["windowMonths"] == 2 and result["state"] == "active"
+    assert result["daily"]["enabled"] is False
     assert all(method == "GET" for method, *_ in store.requests)
     raw = next(iter(store.documents.values()))
-    assert b'"window_months":6' in raw and b"assertion" not in raw
+    assert b'"window_months":2' in raw and b'"schema_version":2' in raw and b"assertion" not in raw
     with pytest.raises(HTTPException) as error:
         asyncio.run(focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z"))
     assert error.value.status_code == 409
@@ -247,7 +294,7 @@ def test_export_setup_preview_never_creates_or_schedules(store, export_setup, pu
     assert result["state"] == "missing" and result["canConfigure"] is True
     assert result["destinationRoleScope"] == f"{STORAGE}/blobServices/default/containers/cost-exports"
     assert result["rootFolderPath"] == f"focus/{SUBSCRIPTION}"
-    assert result["nativeSchedule"] == "Inactive" and result["windowMonths"] == 6
+    assert result["nativeSchedule"] == "Inactive" and result["windowMonths"] == 2
     assert result["daily"] == {"exportName": "focus-daily-meghkoshaai", "rootFolderPath": f"focus-daily/{SUBSCRIPTION}",
                                "state": "missing", "canConfigure": True}
     assert all(method == "GET" for method, *_ in export_setup.calls)
@@ -472,7 +519,7 @@ def test_read_only_worker_cannot_schedule_export_execution(store, monkeypatch):
 
 def test_each_cycle_submits_the_next_month_in_the_tick_that_completes_the_previous(store):
     async def exercise():
-        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z")
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", 6)
         now = datetime(2030, 9, 5, 4, tzinfo=timezone.utc)
         assert (await focus_schedules.advance(SUBSCRIPTION, now=now))["status"] == "queued"
         for index in range(6):
@@ -815,15 +862,15 @@ def test_completed_month_discards_temporary_history_baseline(store):
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("window, first", [(3, "2026-06-01"), (4, "2026-05-01"), (5, "2026-04-01"), (6, "2026-03-01")])
+@pytest.mark.parametrize("window, first", [(2, "2026-07-01"), (3, "2026-06-01"), (4, "2026-05-01"), (5, "2026-04-01"), (6, "2026-03-01")])
 def test_completed_months_follow_the_selected_window(window, first):
     months = focus_schedules.completed_months(datetime(2026, 9, 13, tzinfo=timezone.utc), window)
     assert len(months) == window
     assert str(months[0].start.date()) == first and str(months[-1].end.date()) == "2026-08-31"
 
 
-@pytest.mark.parametrize("window", [0, 1, 2, 7, 12, True])
-def test_windows_outside_three_to_six_months_are_rejected_before_any_write(store, window):
+@pytest.mark.parametrize("window", [0, 1, 7, 12, True])
+def test_windows_outside_two_to_six_months_are_rejected_before_any_write(store, window):
     with pytest.raises(ValueError):
         focus_schedules.completed_months(datetime(2026, 9, 13, tzinfo=timezone.utc), window)
     with pytest.raises(ValueError):
@@ -863,7 +910,7 @@ def test_parallel_setting_submits_several_months_and_counts_outside_runs(store, 
         return [call[3]["timePeriod"] for call in store.requests if call[0] == "POST"]
 
     async def exercise():
-        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z")
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", 6)
         now = datetime(2030, 9, 5, 4, tzinfo=timezone.utc)
         assert (await focus_schedules.advance(SUBSCRIPTION, now=now))["status"] == "queued"
         assert [period["from"] for period in posts()] == ["2030-03-01T00:00:00Z", "2030-04-01T00:00:00Z", "2030-05-01T00:00:00Z"]
@@ -915,7 +962,7 @@ def test_repeated_throttling_keeps_attempts_and_holds_every_month(store, monkeyp
     monkeypatch.setenv("FOCUS_EXPORT_PARALLEL_MONTHS", "3")
 
     async def exercise():
-        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z")
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", 6)
         start = datetime(2030, 9, 5, 4, tzinfo=timezone.utc)
         await focus_schedules.advance(SUBSCRIPTION, now=start)
         await focus_schedules.advance(SUBSCRIPTION, now=start + timedelta(minutes=1))
@@ -975,7 +1022,7 @@ def _complete(runs, name, period):
 
 def test_daily_pull_runs_once_a_day_after_its_utc_time(store):
     async def exercise():
-        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_time="06:00")
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_enabled=True, daily_time="06:00")
         day = datetime(2030, 10, 10, tzinfo=timezone.utc)
         assert (await focus_schedules.advance_daily(SUBSCRIPTION, now=day + timedelta(hours=5, minutes=59)))["status"] == "not_due"
         assert (await focus_schedules.advance_daily(SUBSCRIPTION, now=day + timedelta(hours=6)))["status"] == "queued"
@@ -996,7 +1043,7 @@ def test_daily_pull_runs_once_a_day_after_its_utc_time(store):
 
 def test_daily_pull_refreshes_last_month_first_during_the_first_five_days(store):
     async def exercise():
-        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z")
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_enabled=True)
         now = datetime(2030, 10, 3, 7, tzinfo=timezone.utc)
         await focus_schedules.advance_daily(SUBSCRIPTION, now=now)
         previous = _daily_posts(store)[-1][3]["timePeriod"]
@@ -1021,7 +1068,7 @@ def test_daily_pull_waits_an_hour_when_the_daily_export_is_missing(store, monkey
         return await original(method, subscription_id, suffix, body, kind)
 
     async def exercise():
-        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z")
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_enabled=True)
         monkeypatch.setattr(focus_schedules, "_native_request", missing_daily)
         now = datetime(2030, 10, 10, 6, tzinfo=timezone.utc)
         assert (await focus_schedules.advance_daily(SUBSCRIPTION, now=now))["status"] == "unavailable"
@@ -1056,7 +1103,7 @@ def test_long_run_history_is_reconciled_by_period(store):
             "status": "Completed", "startDate": f"{day:%Y-%m}-01T00:00:00Z", "endDate": f"{day}T23:59:59Z"}})
 
     async def exercise():
-        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z")
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_enabled=True)
         now = datetime(2030, 10, 10, 6, tzinfo=timezone.utc)
         await focus_schedules.advance_daily(SUBSCRIPTION, now=now)
         stored = focus_schedules.StoredSchedule.model_validate_json(next(iter(store.documents.values())))
@@ -1125,7 +1172,7 @@ def _stored(store):
 
 def test_daily_view_lists_each_period_and_the_next_pull(store):
     async def exercise():
-        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_time="06:00")
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_enabled=True, daily_time="06:00")
         before = datetime(2030, 10, 5, 5, tzinfo=timezone.utc)
         idle = focus_schedules.schedule_view(SUB, _stored(store), now=before)["daily"]
         assert idle["runs"] == [] and idle["day"] is None and idle["nextRunAt"] == "2030-10-05T06:00:00Z"
@@ -1149,7 +1196,7 @@ def test_daily_view_lists_each_period_and_the_next_pull(store):
 
 def test_next_daily_pull_follows_retries_and_is_hidden_when_off_or_paused(store):
     async def exercise():
-        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_time="06:00")
+        await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_enabled=True, daily_time="06:00")
         now = datetime(2030, 10, 10, 7, tzinfo=timezone.utc)
         record = _stored(store)
         record.daily.status, record.daily.retry_after = "unavailable", now + timedelta(hours=1)
@@ -1183,7 +1230,7 @@ def test_stored_cycles_with_months_outside_their_window_are_rejected(store):
         await focus_schedules.create(SUB, ACTOR, "2030-09-05T03:00:00Z", daily_enabled=False)
         await focus_schedules.advance(SUBSCRIPTION, now=datetime(2030, 9, 5, 4, tzinfo=timezone.utc))
         name, raw = next(iter(store.documents.items()))
-        store.documents[name] = raw.replace(b'"start":"2030-03-01T00:00:00Z"', b'"start":"2029-03-01T00:00:00Z"', 1)
+        store.documents[name] = raw.replace(b'"start":"2030-07-01T00:00:00Z"', b'"start":"2029-07-01T00:00:00Z"', 1)
         view = await focus_schedules.load(SUB)
         assert view["availability"] == "export_unavailable" and "safely read" in view["statusMessage"]
 

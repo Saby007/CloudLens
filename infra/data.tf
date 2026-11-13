@@ -14,7 +14,7 @@ resource "azurerm_storage_account" "exports" {
   cross_tenant_replication_enabled  = false
   default_to_oauth_authentication   = true
   infrastructure_encryption_enabled = true
-  public_network_access             = var.allow_native_export_trusted_services ? "Enabled" : "Disabled"
+  public_network_access             = "Disabled"
   tags                              = local.tags
 
   network_rules {
@@ -150,14 +150,14 @@ resource "azurerm_role_assignment" "api_storage_account_contributor" {
 }
 
 resource "azurerm_private_dns_zone" "blob" {
-  count               = local.data_enabled ? 1 : 0
+  count               = local.data_enabled || var.aks_private_cluster ? 1 : 0
   name                = "privatelink.blob.core.windows.net"
   resource_group_name = azurerm_resource_group.main.name
   tags                = local.tags
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "blob" {
-  count                = local.data_enabled ? 1 : 0
+  count                = local.data_enabled || var.aks_private_cluster ? 1 : 0
   name                 = "link-${local.resource_token}"
   private_dns_zone_id  = azurerm_private_dns_zone.blob[0].id
   virtual_network_id   = azurerm_virtual_network.main.id

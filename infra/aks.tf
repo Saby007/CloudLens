@@ -224,11 +224,12 @@ locals {
 }
 
 resource "azurerm_monitor_data_collection_rule" "container_insights" {
-  name                = "MSCI-${azurerm_log_analytics_workspace.main.location}-${azurerm_kubernetes_cluster.main.name}"
-  resource_group_name = azurerm_resource_group.main.name
-  location            = azurerm_log_analytics_workspace.main.location
-  description         = "Container Insights logs and events for the CloudLens cluster."
-  tags                = local.tags
+  name                        = "MSCI-${azurerm_log_analytics_workspace.main.location}-${azurerm_kubernetes_cluster.main.name}"
+  resource_group_name         = azurerm_resource_group.main.name
+  location                    = azurerm_log_analytics_workspace.main.location
+  description                 = "Container Insights logs and events for the CloudLens cluster."
+  tags                        = local.tags
+  data_collection_endpoint_id = var.aks_private_cluster ? azurerm_monitor_data_collection_endpoint.private[0].id : null
 
   destinations {
     log_analytics {

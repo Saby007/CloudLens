@@ -1,4 +1,4 @@
-"""Explicit FOCUS export setup, ADLS schedules, bounded 3-6 month execution and daily pulls."""
+"""FOCUS export setup and schedules, defaulting to the two completed calendar months."""
 
 from __future__ import annotations
 
@@ -21,15 +21,15 @@ from fastapi import HTTPException
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from services import azure_connections, focus_export_control, user_arm_client
+from services.cost_periods import DEFAULT_HISTORY_MONTHS, completed_month_bounds
 from services.entra_tokens import configured_uuid
 
 logger = logging.getLogger(__name__)
 
 MAX_RECORD_BYTES = 128 * 1024
 MAX_SCHEDULES = 5000
-# Anomaly detection needs 60 complete days, so three closed months is the shortest window.
-WINDOW_MONTHS = (3, 4, 5, 6)
-DEFAULT_WINDOW_MONTHS = 6
+WINDOW_MONTHS = (2, 3, 4, 5, 6)
+DEFAULT_WINDOW_MONTHS = DEFAULT_HISTORY_MONTHS
 DAILY_TIME_PATTERN = r"^([01]\d|2[0-3]):[0-5]\d$"
 DEFAULT_DAILY_TIME = "06:00"
 # Azure keeps adding a closed month's charges for up to 72 hours after it ends.
@@ -59,14 +59,14 @@ class RefreshCycle(BaseModel):
     status: Literal["running", "succeeded", "failed"] = "running"
     # "full" re-pulls the whole window (Export); "close" only pulls months without a final copy.
     kind: Literal["full", "close"] = "full"
-    window_months: Literal[3, 4, 5, 6] = DEFAULT_WINDOW_MONTHS
+    window_months: Literal[2, 3, 4, 5, 6] = DEFAULT_WINDOW_MONTHS
     months: list[MonthRun] = Field(min_length=1, max_length=max(WINDOW_MONTHS))
     error: str | None = None
 
 
 class DailyPull(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    enabled: bool = True
+    enabled: bool = False
     time_utc: str = Field(default=DEFAULT_DAILY_TIME, pattern=DAILY_TIME_PATTERN)
     day: date | None = None
     status: Literal["idle", "running", "succeeded", "failed", "unavailable"] = "idle"
@@ -80,8 +80,8 @@ class DailyPull(BaseModel):
 
 class StoredSchedule(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    schema_version: Literal[1] = 1
-    window_months: Literal[3, 4, 5, 6] = DEFAULT_WINDOW_MONTHS
+    schema_version: Literal[1, 2] = 2
+    window_months: Literal[2, 3, 4, 5, 6] = DEFAULT_WINDOW_MONTHS
     tenant_id: str
     subscription_id: str
     display_name: str
@@ -102,7 +102,7 @@ def _utc(value: datetime) -> str:
 
 def _window(value: int) -> int:
     if isinstance(value, bool) or value not in WINDOW_MONTHS:
-        raise ValueError("The history window must be 3, 4, 5 or 6 months")
+        raise ValueError("The history window must be 2, 3, 4, 5 or 6 months")
     return value
 
 
@@ -113,14 +113,7 @@ def _daily_time(value: str) -> str:
 
 
 def completed_months(now: datetime, count: int = DEFAULT_WINDOW_MONTHS) -> list[MonthRun]:
-    boundary = now.astimezone(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    result = []
-    for _ in range(_window(count)):
-        end = boundary - timedelta(seconds=1)
-        start = end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        result.append(MonthRun(start=start, end=end))
-        boundary = start
-    return list(reversed(result))
+    return [MonthRun(start=start, end=end) for start, end in completed_month_bounds(now, _window(count))]
 
 
 def daily_periods(day: date) -> list[MonthRun]:
@@ -204,6 +197,25 @@ def _write(blob, record: StoredSchedule, **kwargs):
         raise ValueError("Schedule metadata exceeds its size limit")
     blob.upload_blob(payload, content_settings=_JSON, **kwargs)
 
+def _migrate_history_policy(record: StoredSchedule, now: datetime) -> bool:
+    if record.schema_version != 1:
+        return False
+    # Preserve the old execution as history, but never continue submitting its older months after an upgrade.
+    if record.cycle and record.cycle.status == "running":
+        record.cycle.status, record.cycle.completed_at = "failed", now
+        record.cycle.error = "Superseded by the two-completed-month policy; no further months were submitted."
+        for month in record.cycle.months:
+            month.baseline_ids = []
+        record.previous_runs = (record.previous_runs + [record.cycle])[-24:]
+        record.cycle = None
+    record.schema_version, record.window_months = 2, DEFAULT_WINDOW_MONTHS
+    record.daily = DailyPull(time_utc=record.daily.time_utc)
+    if record.state == "active":
+        record.next_run_at = min(record.next_run_at, now)
+    record.updated_at = now
+    logger.info("Migrated FOCUS schedule %s to two completed months with daily pulls off", record.subscription_id)
+    return True
+
 
 @asynccontextmanager
 async def _locked(subscription_id: str):
@@ -220,6 +232,8 @@ async def _locked(subscription_id: str):
                     async def save():
                         await asyncio.to_thread(_write, blob, record, overwrite=True, lease=lease)
 
+                    if _migrate_history_policy(record, datetime.now(timezone.utc)):
+                        await save()
                     yield record, save
             finally:
                 await asyncio.to_thread(lease.release)
@@ -319,7 +333,7 @@ def _export_setup_details(subscription: dict) -> dict:
     configured_uuid(parts[2])
     return {"subscriptionId": subscription_id, "exportName": export_name, "storageResourceId": storage_id,
             "container": container, "rootFolderPath": focus_export_control.root_folder(subscription_id), "format": "Csv",
-            "dataVersion": focus_export_control.DATA_VERSION, "windowMonths": max(WINDOW_MONTHS), "nativeSchedule": "Inactive",
+            "dataVersion": focus_export_control.DATA_VERSION, "windowMonths": DEFAULT_WINDOW_MONTHS, "nativeSchedule": "Inactive",
             "destinationRole": "Storage Blob Data Contributor",
             "destinationRoleScope": f"{storage_id}/blobServices/default/containers/{container}",
             "daily": {"exportName": daily_export_name, "rootFolderPath": focus_export_control.root_folder(subscription_id, "daily")}}
@@ -526,6 +540,9 @@ async def load(subscription: dict):
         if record is None:
             start = _utc(datetime.now(timezone.utc) + timedelta(minutes=6))
             return await create(subscription, "system:auto-provision", start)
+        if record.schema_version == 1:
+            async with _locked(subscription_id) as (record, _):
+                return schedule_view(subscription, record)
         return schedule_view(subscription, record)
     except HTTPException as error:
         return _unavailable_view(subscription, "export_unavailable", error.detail)
@@ -534,7 +551,7 @@ async def load(subscription: dict):
 
 
 async def create(subscription: dict, actor: str, schedule_start: str, window_months: int = DEFAULT_WINDOW_MONTHS, *,
-                 daily_enabled: bool = True, daily_time: str = DEFAULT_DAILY_TIME):
+                 daily_enabled: bool = False, daily_time: str = DEFAULT_DAILY_TIME):
     window_months = _window(window_months)
     daily = DailyPull(enabled=daily_enabled is True, time_utc=_daily_time(daily_time))
     normalized = focus_export_control._validate_schedule_start(schedule_start)

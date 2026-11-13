@@ -1,4 +1,4 @@
-"""Load multi-period daily FOCUS history: closed months plus, when available, the month to date."""
+"""Load FOCUS history for the recent completed calendar months, excluding stale and current-month runs."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ import calendar
 import logging
 import time
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
 from anomalies.models import DailyCostRecord
 from services import arm_client, focus_cost_reader
 from services.focus_export_control import normalize_subscription_id
+from services.cost_periods import DEFAULT_HISTORY_MONTHS as DEFAULT_WINDOW_MONTHS, recent_closed_runs as _recent_closed_runs
 
 logger = logging.getLogger(__name__)
 
@@ -290,45 +291,50 @@ async def load_complete_focus_history(
     subscription_ids: list[str],
     *,
     required_days: int = 60,
+    now: datetime | None = None,
 ) -> FocusHistoryData:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     normalized = [normalize_subscription_id(value) for value in subscription_ids]
-    cache_key = tuple(sorted(normalized)) + (str(required_days),)
-    now = time.monotonic()
+    cache_key = tuple(sorted(normalized)) + (str(required_days), f"{now:%Y-%m}")
+    clock = time.monotonic()
     cached = _cache.get(cache_key)
-    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+    if cached and clock - cached[0] < _CACHE_TTL_SECONDS:
         return cached[1]
 
     run_lists = await asyncio.gather(*(_export_runs(value) for value in normalized))
-    selected = _select_history_runs(normalized, dict(zip(normalized, run_lists)), required_days)
+    recent = _recent_closed_runs(dict(zip(normalized, run_lists)), now, DEFAULT_WINDOW_MONTHS)
+    selected = _select_history_runs(normalized, recent, required_days)
     group_tags = await focus_cost_reader._load_resource_group_tags(normalized)
     result = await asyncio.to_thread(_parse_history_files, normalized, selected, group_tags)
     if result.complete_days < required_days:
         raise focus_cost_reader.FocusCostDataError(
             f"FOCUS history has {result.complete_days} complete days; {required_days} are required"
         )
-    _cache[cache_key] = (now, result)
+    _cache[cache_key] = (clock, result)
     return result
 
 
 async def load_available_focus_history(
     subscription_ids: list[str],
     *,
-    max_periods: int = 12,
+    max_periods: int = DEFAULT_WINDOW_MONTHS,
+    now: datetime | None = None,
 ) -> FocusHistoryData:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     normalized = [normalize_subscription_id(value) for value in subscription_ids]
-    cache_key = tuple(sorted(normalized)) + ("dashboard", str(max_periods))
-    now = time.monotonic()
+    cache_key = tuple(sorted(normalized)) + ("dashboard", str(max_periods), f"{now:%Y-%m}")
+    clock = time.monotonic()
     cached = _cache.get(cache_key)
-    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+    if cached and clock - cached[0] < _CACHE_TTL_SECONDS:
         return cached[1]
 
     run_lists = await asyncio.gather(*(_export_runs(value) for value in normalized))
     selected = _select_available_history_runs(
         normalized,
-        dict(zip(normalized, run_lists)),
+        _recent_closed_runs(dict(zip(normalized, run_lists)), now, max_periods),
         max_periods=max_periods,
     )
     group_tags = await focus_cost_reader._load_resource_group_tags(normalized)
     result = await asyncio.to_thread(_parse_history_files, normalized, selected, group_tags)
-    _cache[cache_key] = (now, result)
+    _cache[cache_key] = (clock, result)
     return result

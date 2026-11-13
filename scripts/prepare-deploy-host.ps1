@@ -5,9 +5,10 @@
 
 .DESCRIPTION
     A private cluster and a private registry are reachable only from inside the virtual network. Terraform created a
-    deploy host in it (a Linux VM with no public address, reached through Azure Bastion). This script runs from anywhere:
+    deploy host in it (a Linux VM with no public address). This legacy interactive helper requires an explicitly
+    enabled Bastion or an existing private administrative route; the normal flow uses invoke-private-deploy.ps1.
 
-      - starts the VM if it is stopped (it shuts itself down every day);
+      - starts the VM if it is stopped;
       - copies this environment's azd settings to it (never the host's own password) and clones the repository at the
         branch you name, using az vm run-command, which goes through Azure Resource Manager and needs no network path;
       - checks that the host has finished installing its tools;
@@ -92,7 +93,7 @@ if ($RepoUrl -notmatch '^https://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$' -or $RepoBra
 
 $state = Get-CliText (& az vm get-instance-view --ids $vmId --query "instanceView.statuses[?starts_with(code,'PowerState/')].code | [0]" --output tsv --only-show-errors 2>$null)
 if ($state -ne 'PowerState/running') {
-    Write-Host "The deploy host is '$state'; starting it (it shuts down every day to save cost)." -ForegroundColor Yellow
+    Write-Host "The deploy host is '$state'; starting it." -ForegroundColor Yellow
     & az vm start --ids $vmId --only-show-errors --output none
     if ($LASTEXITCODE -ne 0) { throw "Unable to start the deploy host $vmName." }
 }

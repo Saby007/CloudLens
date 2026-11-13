@@ -10,16 +10,17 @@ const exportConfiguration: api.FocusExportConfiguration = {
   subscriptionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', exportName: 'app-focus',
   storageResourceId: '/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/teststore',
   container: 'cost-exports', rootFolderPath: 'focus/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', format: 'Csv',
-  dataVersion: '1.2-preview', windowMonths: 6, nativeSchedule: 'Inactive', destinationRole: 'Storage Blob Data Contributor',
+  dataVersion: '1.2-preview', windowMonths: 2, nativeSchedule: 'Inactive', destinationRole: 'Storage Blob Data Contributor',
   destinationRoleScope: '/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/teststore/blobServices/default/containers/cost-exports',
   state: 'missing', canConfigure: true,
 };
 
-it('previews export configuration without creating it and forwards cancellation', async () => {
-  const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(exportConfiguration)));
+it.each([2, 6])('previews a %i-month export configuration without creating it and forwards cancellation', async (windowMonths) => {
+  const configuration = { ...exportConfiguration, windowMonths };
+  const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(configuration)));
   vi.stubGlobal('fetch', fetchMock);
   const controller = new AbortController();
-  await expect(api.getCostExportConfiguration(exportConfiguration.subscriptionId, controller.signal)).resolves.toEqual(exportConfiguration);
+  await expect(api.getCostExportConfiguration(exportConfiguration.subscriptionId, controller.signal)).resolves.toEqual(configuration);
   expect(fetchMock).toHaveBeenCalledWith(`/api/schedules/${exportConfiguration.subscriptionId}/export`, expect.objectContaining({ cache: 'no-store', signal: controller.signal }));
   expect(fetchMock.mock.calls[0][1].body).toBeUndefined();
 });
@@ -84,7 +85,7 @@ it.each([
   { readAccess: true, costAccess: false, windowMonths: 6 },
   { readAccess: false, costAccess: true, windowMonths: 6 },
   { readAccess: true, costAccess: true, windowMonths: 1 },
-  { readAccess: true, costAccess: true, windowMonths: 2 },
+  { readAccess: true, costAccess: true, windowMonths: 0 },
   { readAccess: true, costAccess: true, windowMonths: 7 },
   { readAccess: true, costAccess: true, windowMonths: '6' },
 ])('rejects unverified or unsupported-window schedule candidates: %o', async (evidence) => {
@@ -107,7 +108,7 @@ function scheduleRow(windowMonths: number, runWindow: number, monthCount: number
   };
 }
 
-it.each([3, 4, 5, 6])('accepts a %i-month window and a latest run that kept an earlier window', async (windowMonths) => {
+it.each([2, 3, 4, 5, 6])('accepts a %i-month window and a latest run that kept an earlier window', async (windowMonths) => {
   const row = scheduleRow(windowMonths, 6, 6);
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify([row]))));
   await expect(listCostSchedules()).resolves.toEqual([row]);
@@ -119,7 +120,7 @@ it('accepts a close cycle that pulled fewer months than its window', async () =>
   await expect(listCostSchedules()).resolves.toEqual([row]);
 });
 
-it.each([[3, 4], [4, 0], [2, 2], [7, 7]])('rejects a latest run whose window is %i but lists %i months', async (runWindow, monthCount) => {
+it.each([[3, 4], [4, 0], [1, 1], [7, 7]])('rejects a latest run whose window is %i but lists %i months', async (runWindow, monthCount) => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify([scheduleRow(6, runWindow, monthCount)]))));
   await expect(listCostSchedules()).rejects.toMatchObject({ status: 502 });
 });

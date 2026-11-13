@@ -637,7 +637,7 @@ export default function App() {
                 </li>
                 <li className="is-pending">
                   <span className="landing-step-index">3</span>
-                  <span className="landing-step-copy"><strong>Explore Chat and Schedules</strong><small>Ask questions about the report or set up automatic FOCUS exports of up to six months.</small></span>
+                  <span className="landing-step-copy"><strong>Explore Chat and Schedules</strong><small>Ask questions about the report or export the last two completed months automatically.</small></span>
                 </li>
               </ol>
               {selectedIds.size > 0 && <button type="button" className="dark-button" disabled={!!identityError} onClick={() => void handleRun()}><BarChart3 size={16} aria-hidden="true" /> Run first report</button>}

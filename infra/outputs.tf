@@ -164,6 +164,22 @@ output "APP_DEPLOY_HOST_ID" {
   value = local.deploy_host_enabled ? azurerm_linux_virtual_machine.deploy_host[0].id : ""
 }
 
+output "APP_DEPLOY_HOST_BASTION_ENABLED" {
+  value = tostring(local.bastion_enabled)
+}
+
+output "APP_VNET_ID" {
+  value = azurerm_virtual_network.main.id
+}
+
+output "APP_VNET_NAME" {
+  value = azurerm_virtual_network.main.name
+}
+
+output "APP_LOG_ANALYTICS_WORKSPACE_ID" {
+  value = azurerm_log_analytics_workspace.main.id
+}
+
 output "APP_DEPLOY_HOST_ADMIN_USERNAME" {
   value = local.deploy_host_enabled ? local.deploy_host_admin : ""
 }

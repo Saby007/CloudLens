@@ -12,12 +12,13 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 import httpx
 
 from services import arm_client, focus_export_download
+from services.cost_periods import recent_closed_runs
 from services.focus_export_control import normalize_subscription_id
 
 FOCUS_DATA_VERSION = "1.2-preview"
@@ -667,12 +668,13 @@ def _download_run_files(
     return files
 
 
-async def load_latest_complete_focus_costs(subscription_ids: list[str]) -> FocusCostData:
+async def load_latest_complete_focus_costs(subscription_ids: list[str], *, now: datetime | None = None) -> FocusCostData:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     normalized = [normalize_subscription_id(value) for value in subscription_ids]
-    cache_key = tuple(sorted(normalized))
-    now = time.monotonic()
+    cache_key = tuple(sorted(normalized)) + (f"{now:%Y-%m}",)
+    clock = time.monotonic()
     cached = _cache.get(cache_key)
-    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+    if cached and clock - cached[0] < _CACHE_TTL_SECONDS:
         return cached[1]
 
     try:
@@ -686,7 +688,7 @@ async def load_latest_complete_focus_costs(subscription_ids: list[str]) -> Focus
             f"FOCUS export '{_FOCUS_EXPORT_NAME}' is not configured for one or more selected subscriptions. "
             "Open Schedules, create and run the exports, then retry after successful completion."
         ) from error
-    runs_by_subscription = dict(zip(normalized, run_lists))
+    runs_by_subscription = recent_closed_runs(dict(zip(normalized, run_lists)), now)
     period, selected_runs, period_path = _select_common_runs(normalized, runs_by_subscription)
     generated_at = max(
         str((run.get("properties") or {}).get("processingEndTime") or "")
@@ -702,7 +704,7 @@ async def load_latest_complete_focus_costs(subscription_ids: list[str]) -> Focus
     result = build_focus_cost_data(files, normalized, generated_at=generated_at, resource_group_tags=resource_group_tags)
     if result.period != period:
         raise FocusCostDataError("FocusCost run history and blob periods do not match")
-    _cache[cache_key] = (now, result)
+    _cache[cache_key] = (clock, result)
     return result
 
 

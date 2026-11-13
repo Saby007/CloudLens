@@ -21,9 +21,9 @@ export type CostAgentOutput = { executive_summary: string; prioritized_findings:
 export type ScheduleState = 'active' | 'paused' | 'not_scheduled' | 'unknown';
 export type ScheduleMonthStatus = 'pending' | 'submitting' | 'queued' | 'running' | 'succeeded' | 'failed';
 export type ScheduleMonth = { period: string; status: ScheduleMonthStatus };
-// Anomaly detection needs 60 complete days, so three closed months is the shortest window.
-export type ScheduleWindowMonths = 3 | 4 | 5 | 6;
-export const SCHEDULE_WINDOW_MONTHS: readonly ScheduleWindowMonths[] = [3, 4, 5, 6];
+export type ScheduleWindowMonths = 2 | 3 | 4 | 5 | 6;
+export const DEFAULT_SCHEDULE_WINDOW_MONTHS: ScheduleWindowMonths = 2;
+export const SCHEDULE_WINDOW_MONTHS: readonly ScheduleWindowMonths[] = [2, 3, 4, 5, 6];
 export const isScheduleWindow = (value: unknown): value is ScheduleWindowMonths =>
   SCHEDULE_WINDOW_MONTHS.includes(value as ScheduleWindowMonths);
 export type ScheduleRun = {
@@ -88,7 +88,7 @@ export type FocusExportConfiguration = {
   rootFolderPath: string;
   format: 'Csv';
   dataVersion: string;
-  windowMonths: 6;
+  windowMonths: ScheduleWindowMonths;
   nativeSchedule: 'Inactive';
   destinationRole: 'Storage Blob Data Contributor';
   destinationRoleScope: string;
@@ -418,7 +418,7 @@ function validateExportConfiguration(value: FocusExportConfiguration, subscripti
   if (!value || value.subscriptionId !== subscriptionId || fields.some((field) => {
     const content = value[field];
     return typeof content !== 'string' || !content.trim() || content.length > 2048;
-  }) || value.rootFolderPath !== `focus/${subscriptionId}` || value.windowMonths !== 6
+  }) || value.rootFolderPath !== `focus/${subscriptionId}` || !isScheduleWindow(value.windowMonths)
     || value.format !== 'Csv' || value.nativeSchedule !== 'Inactive' || value.destinationRole !== 'Storage Blob Data Contributor'
     || value.destinationRoleScope !== `${value.storageResourceId}/blobServices/default/containers/${value.container}`
     || !((value.state === 'missing' && value.canConfigure === true) || (value.state === 'configured' && value.canConfigure === false))

@@ -1,25 +1,29 @@
 resource "azurerm_log_analytics_workspace" "main" {
-  name                         = "law-${local.resource_token}"
-  location                     = azurerm_resource_group.main.location
-  resource_group_name          = azurerm_resource_group.main.name
-  sku                          = "PerGB2018"
-  retention_in_days            = var.log_retention_days
-  local_authentication_enabled = false
-  tags                         = local.tags
+  name                           = "law-${local.resource_token}"
+  location                       = azurerm_resource_group.main.location
+  resource_group_name            = azurerm_resource_group.main.name
+  sku                            = "PerGB2018"
+  retention_in_days              = var.log_retention_days
+  local_authentication_enabled   = false
+  internet_ingestion_access_type = var.aks_private_cluster ? "Disabled" : "Enabled"
+  internet_query_access_type     = var.aks_private_cluster ? "Disabled" : "Enabled"
+  tags                           = local.tags
 }
 
 # Private endpoints need Premium. With dedicated data endpoints the image layers also arrive over the private
 # endpoint instead of from public storage. A private registry cannot be reached by ACR Tasks (az acr build, azd's
 # remote build), so its images are built on the deploy host.
 resource "azurerm_container_registry" "main" {
-  name                          = "acr${local.resource_token}"
-  location                      = azurerm_resource_group.main.location
-  resource_group_name           = azurerm_resource_group.main.name
-  sku                           = var.private_registry ? "Premium" : "Basic"
-  admin_enabled                 = false
-  public_network_access_enabled = !var.private_registry
-  data_endpoint_enabled         = var.private_registry
-  tags                          = local.tags
+  name                                  = "acr${local.resource_token}"
+  location                              = azurerm_resource_group.main.location
+  resource_group_name                   = azurerm_resource_group.main.name
+  sku                                   = var.private_registry ? "Premium" : "Basic"
+  admin_enabled                         = false
+  public_network_access_enabled         = !var.private_registry
+  network_rule_bypass_option            = var.private_registry ? "None" : "AzureServices"
+  network_rule_bypass_for_tasks_enabled = var.private_registry ? false : null
+  data_endpoint_enabled                 = var.private_registry
+  tags                                  = local.tags
 }
 
 resource "azurerm_private_dns_zone" "acr" {

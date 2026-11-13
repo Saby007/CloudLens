@@ -493,7 +493,7 @@ def test_http_schedule_selection_is_bound_to_verified_user_and_rechecked_before_
         headers = {"authorization": f"Bearer {token}"}
         response = client.get("/api/schedules", headers=headers)
         assert response.status_code == 200
-        assert response.json()[0]["windowMonths"] == 6
+        assert response.json()[0]["windowMonths"] == 2
         assert response.headers["cache-control"] == "no-store" and response.headers["vary"] == "Authorization"
         body = {"subscriptionId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "scheduleStartAt": "2030-09-05T03:00:00Z"}
         assert client.post("/api/schedules", headers=headers, json=body).status_code == 403
@@ -504,7 +504,7 @@ def test_http_schedule_selection_is_bound_to_verified_user_and_rechecked_before_
         response = client.post("/api/schedules", headers=headers, json=body)
         assert response.status_code == 201 and response.headers["cache-control"] == "no-store"
         assert token not in response.text
-    assert writes == [(subscription, OBJECT_ID, "2030-09-05T03:00:00Z", 6, {"daily_enabled": True, "daily_time": "06:00"})]
+    assert writes == [(subscription, OBJECT_ID, "2030-09-05T03:00:00Z", 2, {"daily_enabled": False, "daily_time": "06:00"})]
     assert lookups == [None, ["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"], [subscription["subscriptionId"]]]
 
 

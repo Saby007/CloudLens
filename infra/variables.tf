@@ -244,9 +244,15 @@ variable "aks_outbound_type" {
 }
 
 variable "deploy_host_enabled" {
-  description = "Create the deploy host: a Linux VM with no public address, in this virtual network, reached through Azure Bastion, that has the tools to deploy a private cluster and registry. Only created when the cluster or the registry is private; turn it off when you deploy from a network you already connect to this one."
+  description = "Create a private build/deploy VM, operated through Azure VM Run Command using its managed identity. No inbound connection or VPN is needed from Cloud Shell. Disable only when deploying from an already connected network."
   type        = bool
   default     = true
+}
+
+variable "deploy_host_bastion_enabled" {
+  description = "Optional paid, public-facing Bastion for interactive administration of the deploy host. Not needed by Cloud Shell deployment; disabled by default."
+  type        = bool
+  default     = false
 }
 
 variable "deploy_host_subnet_prefix" {
@@ -278,9 +284,9 @@ variable "deploy_host_vm_size" {
 }
 
 variable "deploy_host_shutdown_time" {
-  description = "UTC time (HHmm) at which the deploy host shuts itself down every day, to stop its compute charge. It starts again with az vm start. Empty disables it."
+  description = "Optional daily shutdown time in UTC (HHmm). Empty avoids interrupting a build; the managed deployment deallocates the VM after verification instead."
   type        = string
-  default     = "1800"
+  default     = ""
 
   validation {
     condition     = var.deploy_host_shutdown_time == "" || can(regex("^([01][0-9]|2[0-3])[0-5][0-9]$", var.deploy_host_shutdown_time))

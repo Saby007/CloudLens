@@ -332,6 +332,7 @@ def test_ai_deployment_helper_plans_the_recommended_aks_profile_without_sign_in_
         "MEGHKOSHA_AUTH_MODE": "entra",
         "MEGHKOSHA_OPERATOR_OBJECT_ID": "",
         "MEGHKOSHA_OPERATOR_UPN": "",
+        "APP_DEPLOY_HOST_BASTION_ENABLED": "false",
     }
     source = script.read_text(encoding="utf-8")
     assert "deploy-end-to-end.ps1" in source
@@ -406,6 +407,32 @@ def test_end_to_end_helper_deploys_once_retries_and_never_hides_a_question():
     assert summary["publicClusterNeverReplacedSilently"]
 
 
+@pytest.mark.parametrize("harness, checks", [
+    ("test-private-deploy.ps1", ("durableExecution", "resumesWithoutDuplicateBuild", "verifiesBeforeSuccess", "excludesCredentials")),
+    ("test-private-verification.ps1", ("privateDataPlanes", "bothRollouts", "validatesTls", "rejectsUnhealthyResults")),
+])
+def test_cloud_shell_private_deployment_contracts(harness, checks):
+    summary = run_powershell_harness(harness)
+    assert summary["result"] == "passed"
+    assert all(summary[check] is True for check in checks)
+
+
+def test_cloud_shell_bash_launcher_preserves_state_and_local_changes():
+    bash = shutil.which("bash")
+    if os.name == "nt":
+        git = shutil.which("git")
+        candidates = [Path(git).parent.parent / "bin" / "bash.exe", Path(git).parent / "bash.exe"] if git else []
+        bash = next((str(path) for path in candidates if path.is_file()), None)
+    if not bash:
+        pytest.skip("Bash is required for the Cloud Shell launcher contract")
+    result = subprocess.run(
+        [bash, str(PROJECT_ROOT / "scripts" / "tests" / "test-cloudshell.sh")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("PASS:") == 4
+
+
 def test_the_deploy_host_deploys_from_inside_the_network_and_restores_what_it_changes():
     summary = run_powershell_harness("test-deploy-host.ps1")
     assert summary == {"result": "passed", "importsExportedSettings": True, "buildsLocallyForAPrivateRegistry": True,
@@ -416,7 +443,8 @@ def test_the_deploy_host_deploys_from_inside_the_network_and_restores_what_it_ch
 def test_the_deploy_host_installs_every_tool_the_deploy_stage_uses():
     cloud_init = (PROJECT_ROOT / "infra" / "deploy-host-cloud-init.yaml").read_text()
     for tool in ("InstallAzureCLIDeb", "install-azd.sh", "az aks install-cli", "kubelogin", "apt-get install -y terraform",
-                 "apt-get install -y powershell", "docker.io", "usermod -aG docker cloudlensadmin", "/var/lib/cloudlens/tools-ready"):
+                 "apt-get install -y powershell", "docker.io", "docker-buildx", "docker buildx version",
+                 "usermod -aG docker cloudlensadmin", "/var/lib/cloudlens/tools-ready"):
         assert tool in cloud_init, tool
     # prepare-deploy-host.ps1 waits on this marker and signs in as this user.
     assert (PROJECT_ROOT / "scripts" / "prepare-deploy-host.ps1").read_text().count("/var/lib/cloudlens/tools-ready") >= 1
@@ -433,9 +461,9 @@ def test_a_private_registry_is_never_built_into_by_the_cloud_and_the_default_bui
     assert azure_yaml.count("remoteBuild: true") == 2 and "remoteBuild: false" not in azure_yaml
     script = (PROJECT_ROOT / "scripts" / "deploy-on-host.ps1").read_text()
     assert "Set-RemoteBuild -Enabled $false" in script and "WriteAllText($azureYaml, $originalYaml)" in script
-    core = (PROJECT_ROOT / "infra" / "core.tf").read_text()
-    assert 'sku                           = var.private_registry ? "Premium" : "Basic"' in core
-    assert "public_network_access_enabled = !var.private_registry" in core and "data_endpoint_enabled         = var.private_registry" in core
+    core = re.sub(r"[ \t]+", " ", (PROJECT_ROOT / "infra" / "core.tf").read_text())
+    assert 'sku = var.private_registry ? "Premium" : "Basic"' in core
+    assert "public_network_access_enabled = !var.private_registry" in core and "data_endpoint_enabled = var.private_registry" in core
 
 
 def test_the_control_plane_is_private_unless_public_is_asked_for():
@@ -641,7 +669,8 @@ def test_azd_parameter_file_maps_every_terraform_variable_from_the_environment()
     assert defaults["aks_private_cluster"] == "true" and defaults["private_registry"] == "true"
     assert defaults["aks_outbound_type"] == "natGateway" and defaults["deploy_host_enabled"] == "true"
     assert defaults["deploy_host_subnet_prefix"] == "10.42.1.96/27" and defaults["bastion_subnet_prefix"] == "10.42.1.128/26"
-    assert defaults["deploy_host_vm_size"] == "Standard_D4s_v5" and defaults["deploy_host_shutdown_time"] == "1800"
+    assert defaults["deploy_host_vm_size"] == "Standard_D4s_v5" and defaults["deploy_host_shutdown_time"] == ""
+    assert defaults["deploy_host_bastion_enabled"] == "false"
     assert defaults["auth_mode"] == "" and defaults["web_allowed_ip_ranges"] == ""
     assert '"auth_mode": "${MEGHKOSHA_AUTH_MODE}"' in template and '"web_allowed_ip_ranges": "${APP_WEB_ALLOWED_IP_RANGES}"' in template
     assert '"principal_id": "${AZURE_PRINCIPAL_ID}"' in template

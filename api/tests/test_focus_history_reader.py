@@ -1,4 +1,5 @@
 import asyncio
+import calendar
 import csv
 import gzip
 import io
@@ -16,10 +17,7 @@ SUB_2 = "6efdb685-f5ce-4be4-9841-83d09c4ac05a"
 
 def _run(period: str, run_id: str):
     start = date.fromisoformat(f"{period}-01")
-    if period == "2026-06":
-        end = date(2026, 6, 30)
-    else:
-        end = date(2026, 7, 31)
+    end = start.replace(day=calendar.monthrange(start.year, start.month)[1])
     return {
         "name": run_id,
         "properties": {
@@ -58,7 +56,7 @@ def _content(subscription_id: str, period: str, missing_day: int | None = None) 
     from services.focus_cost_reader import _REQUIRED_COLUMNS
 
     start = date.fromisoformat(f"{period}-01")
-    days = 30 if period == "2026-06" else 31
+    days = calendar.monthrange(start.year, start.month)[1]
     columns = sorted(_REQUIRED_COLUMNS | {"ChargePeriodStart"})
     stream = io.StringIO()
     writer = csv.DictWriter(stream, fieldnames=columns)
@@ -107,16 +105,20 @@ def _content(subscription_id: str, period: str, missing_day: int | None = None) 
     return gzip.compress(stream.getvalue().encode())
 
 
-def test_loads_complete_daily_history_and_rejects_missing_subscription_day(monkeypatch):
+@pytest.mark.parametrize("now, periods", [
+    (datetime(2026, 8, 1, tzinfo=timezone.utc), ["2026-06", "2026-07"]),
+    (datetime(2026, 11, 13, tzinfo=timezone.utc), ["2026-09", "2026-10"]),
+])
+def test_loads_complete_daily_history_and_rejects_missing_subscription_day(monkeypatch, now, periods):
     runs = {
-        SUB_1: [_run("2026-06", "june-1"), _run("2026-07", "july-1")],
-        SUB_2: [_run("2026-06", "june-2"), _run("2026-07", "july-2")],
+        subscription: [_run(period, f"{period}-{subscription}") for period in periods]
+        for subscription in (SUB_1, SUB_2)
     }
     files = {}
     for subscription_id, period_runs in runs.items():
         for run in period_runs:
             period = str(run["properties"]["startDate"])[:7]
-            period_path = "20260601-20260630" if period == "2026-06" else "20260701-20260731"
+            period_path = run["properties"]["startDate"][:10].replace("-", "") + "-" + run["properties"]["endDate"][:10].replace("-", "")
             name = f"focus/{subscription_id}/focus-closed-month-meghkoshaai/{period_path}/{run['name']}/part.csv.gz"
             files[name] = _content(subscription_id, period)
 
@@ -146,16 +148,68 @@ def test_loads_complete_daily_history_and_rejects_missing_subscription_day(monke
     )
     focus_history_reader._cache.clear()
 
-    result = asyncio.run(focus_history_reader.load_complete_focus_history([SUB_1, SUB_2]))
+    result = asyncio.run(focus_history_reader.load_complete_focus_history([SUB_1, SUB_2], now=now))
 
     assert result.complete_days == 61
-    assert result.periods == ["2026-06", "2026-07"]
+    assert result.periods == periods
     assert len(result.records) == 122
-    assert result.history_start == "2026-06-01"
-    assert result.history_end == "2026-07-31"
+    assert result.history_start == f"{periods[0]}-01"
+    assert result.history_end == str(date.fromisoformat(f"{periods[-1]}-01").replace(day=31))
     assert result.records[0].service_category == "Compute"
     assert result.records[0].resource_type == "Microsoft.Compute/virtualMachines"
     assert result.records[0].region == "Unassigned"
+
+
+def test_november_history_excludes_old_and_incomplete_current_month_runs():
+    runs = {SUB_1: [_run(f"2026-{month:02d}", str(month)) for month in range(6, 12)]}
+    recent = focus_history_reader._recent_closed_runs(runs, datetime(2026, 11, 13, tzinfo=timezone.utc), 2)
+    assert [run["properties"]["startDate"][:7] for run in recent[SUB_1]] == ["2026-09", "2026-10"]
+    january = focus_history_reader._recent_closed_runs(
+        {SUB_1: [_run("2026-10", "old"), _run("2026-11", "nov"), _run("2026-12", "dec")]},
+        datetime(2027, 1, 1, tzinfo=timezone.utc), 2,
+    )
+    assert [run["name"] for run in january[SUB_1]] == ["nov", "dec"]
+
+
+def test_short_two_month_history_does_not_read_an_older_month_to_make_60_days():
+    runs = {SUB_1: [_run("2027-01", "old"), _run("2027-02", "feb"), _run("2027-03", "mar")]}
+    recent = focus_history_reader._recent_closed_runs(runs, datetime(2027, 4, 1, tzinfo=timezone.utc), 2)
+    with pytest.raises(FocusCostDataError, match="59 days"):
+        focus_history_reader._select_history_runs([SUB_1], recent, 60)
+
+
+def test_available_history_cache_changes_at_the_utc_month_boundary(monkeypatch):
+    calls = []
+
+    async def runs(subscription_id):
+        calls.append(subscription_id)
+        return [_run(f"2026-{month:02d}", str(month)) for month in range(6, 12)]
+
+    async def tags(subscription_ids):
+        return {}
+
+    def parse(subscription_ids, selected, group_tags):
+        return focus_history_reader.FocusHistoryData(
+            currency="USD", history_start="", history_end="", complete_days=61,
+            periods=[item[0] for item in selected], subscription_ids=subscription_ids,
+            subscription_names={}, records=[],
+        )
+
+    monkeypatch.setattr(focus_history_reader, "_export_runs", runs)
+    monkeypatch.setattr(focus_history_reader, "_parse_history_files", parse)
+    monkeypatch.setattr(focus_history_reader.focus_cost_reader, "_load_resource_group_tags", tags)
+    monkeypatch.setattr(focus_history_reader.time, "monotonic", lambda: 100.0)
+    focus_history_reader._cache.clear()
+    november = asyncio.run(focus_history_reader.load_available_focus_history(
+        [SUB_1], now=datetime(2026, 11, 13, tzinfo=timezone.utc),
+    ))
+    december = asyncio.run(focus_history_reader.load_available_focus_history(
+        [SUB_1], now=datetime(2026, 12, 1, tzinfo=timezone.utc),
+    ))
+    assert november.periods == ["2026-09", "2026-10"]
+    assert december.periods == ["2026-10", "2026-11"]
+    assert calls == [SUB_1, SUB_1]
+    focus_history_reader._cache.clear()
 
 
 @pytest.mark.parametrize("missing_day", [1, 15, 31])

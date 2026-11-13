@@ -57,6 +57,9 @@ $global:deployTestState = @{
     apiServer = ''
     runCommands = [System.Collections.Generic.List[string]]::new()
     dockerCalls = [System.Collections.Generic.List[string]]::new()
+    managedScript = ''
+    managedRequestId = ''
+    managedEnvironment = ''
 }
 
 function Get-StubArgument {
@@ -87,6 +90,7 @@ function Invoke-WebRequest {
 
 function git {
     $global:LASTEXITCODE = 0
+    if ($args -contains 'rev-parse') { return ('a' * 40) }
     $global:deployTestState.cloneCalls++
     throw 'The test checkout already exists; cloning must be skipped.'
 }
@@ -320,6 +324,36 @@ function az {
     }
     if ($a[0] -eq 'vm' -and $a[1] -eq 'get-instance-view') { return 'PowerState/running' }
     if ($a[0] -eq 'vm' -and $a[1] -eq 'start') { return }
+    if ($a[0] -eq 'vm' -and $a[1] -eq 'deallocate') { return }
+    if ($a[0] -eq 'rest') {
+        if ((Get-StubArgument $a '--method') -eq 'put') {
+            $requestFile = (Get-StubArgument $a '--body').TrimStart('@')
+            $request = Get-Content -LiteralPath $requestFile -Raw | ConvertFrom-Json
+            $state.managedScript = $request.properties.source.script
+            $state.managedRequestId = [regex]::Match($state.managedScript, '(?m)^# request ([a-f0-9]{32})$').Groups[1].Value
+            $state.managedEnvironment = [regex]::Match($state.managedScript, "(?m)^environment='([^']+)'$").Groups[1].Value
+            $state.runCommands.Add($state.managedScript)
+            return
+        }
+        if (-not $state.managedScript) {
+            $global:LASTEXITCODE = 1
+            return '(ResourceNotFound) no existing command'
+        }
+        $result = @{
+            environment = $state.managedEnvironment
+            healthy = $true
+            apiImage = 'acrtest.azurecr.io/cost-assessment-app/api-app-test:private-deploy'
+            webImage = 'acrtest.azurecr.io/cost-assessment-app/web-app-test:private-deploy'
+            caCertificateBase64 = ''
+            requestId = $state.managedRequestId
+            sourceRevision = 'a' * 40
+        }
+        return @{ properties = @{
+            provisioningState = 'Succeeded'
+            source = @{ script = $state.managedScript }
+            instanceView = @{ executionState = 'Succeeded'; exitCode = 0; output = 'CLOUDLENS_RESULT:' + ($result | ConvertTo-Json -Compress); error = '' }
+        }} | ConvertTo-Json -Depth 6
+    }
     if ($a[0] -eq 'vm' -and $a[1] -eq 'run-command' -and $a[2] -eq 'invoke') {
         # Like az on Windows, a multi-line argument would be cut after its first line, so the script must be a file.
         $scriptArgument = Get-StubArgument $a '--scripts'
@@ -661,19 +695,22 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     if (($state.azdCalls -join ',') -ne 'provision:succeeded') { throw "A private control plane must provision on its own, with no azd up and no deploy; got: $($state.azdCalls -join ',')" }
     if (Test-Path Env:CLOUDLENS_PROVISION_ONLY) { throw 'The provision-only marker must not outlive the provisioning call.' }
     if ($state.bootstrapCalls -ne $bootstrapsBefore + 1) { throw 'Sign-in must still be configured before the services are deployed.' }
-    if ($pendingSummary.controlPlane -ne 'private' -or $pendingSummary.deployStage -ne 'pending-on-deploy-host' -or $pendingSummary.deployHost -ne 'vm-deploy-0123456' -or
-        $pendingSummary.natGatewayIp -ne '20.1.2.3' -or $pendingSummary.apiImage -or $pendingSummary.webUrl -ne 'https://cloudlens-test.internal') {
-        throw "The summary must say the app is not deployed yet and name the deploy host: $($pendingSummary | ConvertTo-Json -Compress)"
+    if ($pendingSummary.controlPlane -ne 'private' -or $pendingSummary.deployStage -ne 'complete' -or $pendingSummary.deployHost -ne 'vm-deploy-0123456' -or
+        $pendingSummary.natGatewayIp -ne '20.1.2.3' -or -not $pendingSummary.apiImage -or -not $pendingSummary.webImage -or
+        -not $pendingSummary.healthy -or $pendingSummary.webUrl -ne 'https://cloudlens-test.internal') {
+        throw "The summary must report a fully deployed and verified private app: $($pendingSummary | ConvertTo-Json -Compress)"
     }
     if ($state.runCommands.Count -ne 1) { throw 'The deploy host must be prepared once through az vm run-command.' }
     $hostScript = $state.runCommands[0]
-    if ($hostScript -notmatch "echo '([A-Za-z0-9+/=]+)' \| base64 -d") { throw "The settings must reach the deploy host as data, not as shell text: $hostScript" }
+    if ($hostScript -notmatch "printf '%s' '([A-Za-z0-9+/=]+)' \| base64 -d") { throw "The settings must reach the deploy host as data, not as shell text: $hostScript" }
     $hostSettings = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1]))
     if ($hostSettings -notmatch 'APP_AKS_PRIVATE_CLUSTER="true"' -or $hostSettings -notmatch 'AZURE_AKS_CLUSTER_NAME="aks-0123456789abc"' -or
         $hostSettings -match 'ADMIN_PASSWORD' -or $hostSettings.Contains('Aa1!Bb2#Cc3%Dd4*Ee5-Ff6_')) {
         throw 'The deploy host gets this environment''s settings and never the host''s own password.'
     }
-    if ($hostScript -notmatch "git clone --quiet --branch 'cloudlensdev' 'https://github.com/Saby007/CloudLens.git'") { throw 'The deploy host must clone the repository at the branch being deployed.' }
+    if ($hostScript -notmatch "checkout --quiet --detach '$('a' * 40)'" -or $hostScript -notmatch 'az login --identity' -or $hostScript -notmatch '-Verify -ResultFile') {
+        throw 'The deploy host must use the exact source revision, its managed identity, and private verification.'
+    }
 
     # A machine that already reaches the private cluster (a VPN, say) finishes the job itself, and the build setting is put back.
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -690,11 +727,10 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         $listener.Stop()
         $state.apiServer = ''
     }
-    if (($state.azdCalls -join ',') -ne "provision:succeeded,hook:postprovision,deploy:succeeded:$apiClientId") {
-        throw "A reachable private cluster must be prepared and deployed here, after provisioning and sign-in; got: $($state.azdCalls -join ',')"
+    if (($state.azdCalls -join ',') -ne 'provision:succeeded') {
+        throw "A connected Cloud Shell still delegates the Docker build to its private host; got: $($state.azdCalls -join ',')"
     }
-    if ($reachableSummary.deployStage -ne 'complete' -or $reachableSummary.apiImage -notlike '*api-app-test*' -or $state.runCommands.Count) { throw "The summary must show the finished deployment: $($reachableSummary | ConvertTo-Json -Compress)" }
-    if (-not $state.remoteBuildOffDuringDeploy -or $state.dockerCalls -notcontains 'info') { throw 'The private registry must be built into with local Docker, so remote build is off during the deploy stage.' }
+    if ($reachableSummary.deployStage -ne 'complete' -or -not $reachableSummary.healthy -or $reachableSummary.apiImage -notlike '*api-app-test*' -or $state.runCommands.Count -ne 1) { throw "The summary must show the finished deployment: $($reachableSummary | ConvertTo-Json -Compress)" }
     if ([System.IO.File]::ReadAllText($state.azureYamlPath) -ne $yamlBefore) { throw 'azure.yaml must be put back exactly as it was after the deploy stage.' }
 
     # Without a deploy host (a team that deploys from a connected network) the run says what to run instead of preparing one.
@@ -702,9 +738,10 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     $state.runCommands.Clear()
     $noHostParameters = $controlParameters.Clone()
     $noHostParameters.EnvironmentName = 'nohost-test'
-    $noHostSummary = & $script @noHostParameters -SkipPreview -NoDeployHost | ConvertFrom-Json -AsHashtable
-    if ($state.environments['nohost-test']['APP_DEPLOY_HOST_ENABLED'] -cne 'false' -or $noHostSummary.deployStage -ne 'pending-on-deploy-host' -or $noHostSummary.deployHost -or $state.runCommands.Count) {
-        throw 'Without a deploy host nothing is prepared on one, and the run reports the deployment as pending.'
+    $noHostError = ''
+    try { & $script @noHostParameters -SkipPreview -NoDeployHost | Out-Null } catch { $noHostError = $_.Exception.Message }
+    if ($state.environments['nohost-test']['APP_DEPLOY_HOST_ENABLED'] -cne 'false' -or $noHostError -notmatch 'No private deployment path' -or $state.runCommands.Count) {
+        throw 'No deploy host and no private route must fail explicitly, not report a successful pending deployment.'
     }
 
     # An existing cluster with a public API server is never replaced silently: AKS cannot make it private in place.
@@ -719,6 +756,15 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         throw "An existing public cluster must be refused without a choice, before azd runs; got: $refused"
     }
     $values['APP_AKS_PRIVATE_CLUSTER'] = $keptControlPlane
+
+    $explicitPrivate = $parameters.Clone()
+    $explicitPrivate.ControlPlane = 'private'
+    $state.azdCalls.Clear()
+    $refused = ''
+    try { & $script @explicitPrivate -SkipPreview | Out-Null } catch { $refused = $_.Exception.Message }
+    if ($refused -notmatch 'use a new -EnvironmentName' -or $state.azdCalls.Count) {
+        throw 'The Cloud Shell private default must never replace an existing public cluster.'
+    }
 
     # Missing kubectl/kubelogin: the helper asks before installing them with az aks install-cli into the
     # tools directory, -InstallKubernetesTools installs without asking, and an unattended run that cannot

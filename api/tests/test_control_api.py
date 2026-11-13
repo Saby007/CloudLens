@@ -159,7 +159,7 @@ def test_schedules_load_only_managed_identity_read_and_cost_verified_subscriptio
 
     assert lookups == [_SUBSCRIPTION_ID, other_subscription]
     assert len(result) == 2
-    assert all(row["readAccess"] and row["costAccess"] and row["windowMonths"] == 6 for row in result)
+    assert all(row["readAccess"] and row["costAccess"] and row["windowMonths"] == 2 for row in result)
 
 
 def test_schedule_discovery_failure_is_not_an_empty_result(monkeypatch):
@@ -313,14 +313,14 @@ def test_create_uses_server_verified_subscription_not_client_metadata(monkeypatc
         assert subscription == {"subscriptionId": _SUBSCRIPTION_ID, "displayName": "Verified name"}
         assert actor == "22222222-2222-2222-2222-222222222222"
         assert schedule_start == "2030-09-05T03:00:00Z"
-        assert window_months == 6 and daily_enabled is True and daily_time == "06:00"
-        return {"windowMonths": 6}
+        assert window_months == 2 and daily_enabled is False and daily_time == "06:00"
+        return {"windowMonths": 2}
 
     monkeypatch.setattr(main.user_arm_client, "discover_schedule_subscriptions", verified)
     monkeypatch.setattr(main.focus_schedules, "create", create)
     result = asyncio.run(main.create_schedule(FakeRequest(), main.ScheduleCreateRequest(
         subscriptionId=_SUBSCRIPTION_ID, scheduleStartAt="2030-09-05T03:00:00Z")))
-    assert result == {"windowMonths": 6}
+    assert result == {"windowMonths": 2}
 
 
 def test_schedule_requests_forward_a_supported_window_and_reject_others(monkeypatch):
@@ -344,8 +344,8 @@ def test_schedule_requests_forward_a_supported_window_and_reject_others(monkeypa
         subscriptionId=_SUBSCRIPTION_ID, scheduleStartAt="2030-09-05T03:00:00Z", windowMonths=4, dailyTimeUtc="04:30")))
     asyncio.run(main.update_schedule(FakeRequest(), _SUBSCRIPTION_ID, main.ScheduleStateRequest(state="paused", windowMonths=3, dailyEnabled=False)))
     asyncio.run(main.update_schedule(FakeRequest(), _SUBSCRIPTION_ID, main.ScheduleStateRequest(state="active")))
-    assert calls == [("create", 4, True, "04:30"), ("update", 3, False, None), ("update", None, None, None)]
-    for window in (2, 7, 12):
+    assert calls == [("create", 4, False, "04:30"), ("update", 3, False, None), ("update", None, None, None)]
+    for window in (1, 7, 12):
         with pytest.raises(ValidationError):
             main.ScheduleCreateRequest(subscriptionId=_SUBSCRIPTION_ID, scheduleStartAt="2030-09-05T03:00:00Z", windowMonths=window)
         with pytest.raises(ValidationError):

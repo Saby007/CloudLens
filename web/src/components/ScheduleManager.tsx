@@ -24,6 +24,7 @@ import {
   runCostSchedule,
   setCostScheduleState,
   SCHEDULE_WINDOW_MONTHS,
+  DEFAULT_SCHEDULE_WINDOW_MONTHS,
   DAILY_TIME_PATTERN,
   DEFAULT_DAILY_TIME,
   type CostSchedule,
@@ -69,7 +70,7 @@ function defaultScheduleValue(): string {
 }
 
 const utcSchedule = (value: string) => `${value}:00Z`;
-const windowOf = (schedule: CostSchedule): ScheduleWindowMonths => schedule.windowMonths ?? 6;
+const windowOf = (schedule: CostSchedule): ScheduleWindowMonths => schedule.windowMonths ?? DEFAULT_SCHEDULE_WINDOW_MONTHS;
 // Configure creates whichever of the closed-month and daily exports is missing.
 const canConfigureAny = (configuration: FocusExportConfiguration): boolean => configuration.canConfigure || configuration.daily?.canConfigure === true;
 
@@ -163,8 +164,8 @@ export function ScheduleManager() {
   const [schedules, setSchedules] = useState<CostSchedule[]>([]);
   const [scheduleEditingId, setScheduleEditingId] = useState<string | null>(null);
   const [scheduleValue, setScheduleValue] = useState(defaultScheduleValue);
-  const [windowValue, setWindowValue] = useState<ScheduleWindowMonths>(6);
-  const [dailyEnabled, setDailyEnabled] = useState(true);
+  const [windowValue, setWindowValue] = useState<ScheduleWindowMonths>(DEFAULT_SCHEDULE_WINDOW_MONTHS);
+  const [dailyEnabled, setDailyEnabled] = useState(false);
   const [dailyTime, setDailyTime] = useState(DEFAULT_DAILY_TIME);
   const [exportEditingId, setExportEditingId] = useState<string | null>(null);
   const [exportConfiguration, setExportConfiguration] = useState<FocusExportConfiguration | null>(null);
@@ -377,7 +378,7 @@ export function ScheduleManager() {
     setScheduleEditingId(schedule.subscriptionId);
     setScheduleValue(schedule.scheduleStartAt?.slice(0, 16) ?? defaultScheduleValue());
     setWindowValue(windowOf(schedule));
-    setDailyEnabled(schedule.daily?.enabled ?? true);
+    setDailyEnabled(schedule.daily?.enabled ?? false);
     setDailyTime(schedule.daily?.timeUtc ?? DEFAULT_DAILY_TIME);
   }
 
@@ -469,7 +470,7 @@ export function ScheduleManager() {
   return (
     <section className="operations-view" aria-label="Export schedules">
       <section className="operations-heading">
-        <span className="operations-kicker"><CalendarClock size={14} /> 3-6 closed months plus a daily pull through yesterday</span>
+        <span className="operations-kicker"><CalendarClock size={14} /> Last 2 completed months by default; current-month pulls are opt-in</span>
         <h1>FOCUS export schedules</h1>
         <div className="operations-metrics" aria-label="Schedule summary">
           <span><strong data-unavailable={countsUnavailable}>{loading ? '...' : countsUnavailable ? 'Unavailable' : scheduledCount}</strong> scheduled</span>

@@ -333,8 +333,8 @@ class ScheduleCreateRequest(BaseModel):
     model_config = {"extra": "forbid"}
     subscription_id: str = Field(alias="subscriptionId")
     schedule_start_at: str = Field(alias="scheduleStartAt")
-    window_months: Literal[3, 4, 5, 6] = Field(default=6, alias="windowMonths")
-    daily_enabled: bool = Field(default=True, alias="dailyEnabled")
+    window_months: Literal[2, 3, 4, 5, 6] = Field(default=2, alias="windowMonths")
+    daily_enabled: bool = Field(default=False, alias="dailyEnabled")
     daily_time_utc: str = Field(default="06:00", alias="dailyTimeUtc", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
 
     @field_validator("subscription_id")
@@ -347,7 +347,7 @@ class ScheduleStateRequest(BaseModel):
     model_config = {"extra": "forbid"}
     state: Literal["active", "paused"]
     schedule_start_at: str | None = Field(default=None, alias="scheduleStartAt")
-    window_months: Literal[3, 4, 5, 6] | None = Field(default=None, alias="windowMonths")
+    window_months: Literal[2, 3, 4, 5, 6] | None = Field(default=None, alias="windowMonths")
     daily_enabled: bool | None = Field(default=None, alias="dailyEnabled")
     daily_time_utc: str | None = Field(default=None, alias="dailyTimeUtc", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
 
@@ -1281,7 +1281,7 @@ async def _build_and_publish_report(subscription_ids: list[str], stale_days: int
             try:
                 return await focus_history_reader.load_available_focus_history(
                     subscription_ids,
-                    max_periods=12,
+                    max_periods=focus_schedules.DEFAULT_WINDOW_MONTHS,
                 )
             except Exception:
                 logger.warning("Executive spend history unavailable", exc_info=True)
