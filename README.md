@@ -191,8 +191,12 @@ The recommended Cloud Shell command runs the complete deployment. Infrastructure
 In the Azure portal, open **Cloud Shell → Bash**, choose **Mount storage**, and run this one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Saby007/CloudLens/cloudlensdev/scripts/deploy-cloudshell.sh -o "$HOME/clouddrive/deploy-cloudlens.sh" && bash "$HOME/clouddrive/deploy-cloudlens.sh" -EnvironmentName cloudlens-dev -Location centralindia
+curl -fsSL https://raw.githubusercontent.com/Saby007/CloudLens/cloudlensdev/scripts/deploy-cloudshell.sh -o "$HOME/deploy-cloudlens.sh" && bash "$HOME/deploy-cloudlens.sh" -EnvironmentName cloudlens-dev -Location centralindia
 ```
+
+The bootstrap is downloaded to `$HOME` so it can explain missing storage before deployment. The checkout and Terraform state still require a **mounted, writable** `$HOME/clouddrive`; the launcher never provisions using ephemeral storage. If you previously chose **No storage account required**, save any files needed from the current session, select **Settings > Reset User Settings**, then choose **Mount storage** and attach a file share before retrying. See [Mount a new clouddrive](https://learn.microsoft.com/azure/cloud-shell/persisting-shell-storage#mount-a-new-clouddrive).
+
+**`curl: (23)` means the download could not be written locally**, not that Terraform failed. A missing output directory, an unwritable file/share or full storage can cause it. Do not use `mkdir ~/clouddrive` as a workaround: it creates a nonpersistent directory, not an Azure file-share mount. If the corrected download still fails, inspect `ls -ld "$HOME" "$HOME/clouddrive"` and `df -h "$HOME"`; verify the destination file is writable and the mounted share has space.
 
 By default this uses your current subscription, grants access to that subscription only, and deploys the **data** profile (dashboard, storage, scheduled exports; no Foundry quota required). Append `-SubscriptionId '<deployment-subscription>' -TargetSubscriptionId '<sub1>,<sub2>'` for other scopes, `-CustomDomain cloudlens.contoso.com` for customer DNS, or `-Profile ai` to include private Foundry and Model Router chat. Keep using the same profile when rerunning; lowering a provisioned profile is refused to protect data.
 

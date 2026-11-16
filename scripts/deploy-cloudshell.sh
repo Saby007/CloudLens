@@ -6,9 +6,23 @@ if [[ -z "${ACC_CLOUD:-}" && "${AZUREPS_HOST_ENVIRONMENT:-}" != cloud-shell* ]];
   exit 1
 fi
 if ! mountpoint -q "$HOME/clouddrive"; then
-  echo "Persistent Cloud Shell storage is required. Attach a file share (clouddrive), then rerun; Terraform state must survive a disconnected session." >&2
+  cat >&2 <<'HELP'
+Persistent Cloud Shell storage is required; Terraform state must survive a disconnected session.
+Save any files you need from this session, then select Cloud Shell Settings > Reset User Settings.
+Choose Mount storage and attach an Azure file share, select Bash, then rerun this command.
+Do not create clouddrive with mkdir: an ordinary directory does not provide persistent storage.
+HELP
   exit 1
 fi
+write_probe=''
+if ! write_probe="$(mktemp "$HOME/clouddrive/.cloudlens-write-XXXXXX")" ||
+   ! printf 'CloudLens storage check\n' > "$write_probe"; then
+  if [[ -n "$write_probe" ]]; then rm -f -- "$write_probe"; fi
+  echo "Cloud Shell storage is mounted but cannot be written. Check available space and file-share access before rerunning." >&2
+  echo 'Diagnostics: ls -ld "$HOME" "$HOME/clouddrive"; df -h "$HOME/clouddrive"' >&2
+  exit 1
+fi
+rm -f -- "$write_probe"
 for tool in az git curl jq unzip sha256sum pwsh; do
   command -v "$tool" >/dev/null || { echo "Missing Cloud Shell prerequisite: $tool" >&2; exit 1; }
 done

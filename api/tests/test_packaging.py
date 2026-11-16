@@ -430,7 +430,7 @@ def test_cloud_shell_bash_launcher_preserves_state_and_local_changes():
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS:") == 4
+    assert result.stdout.count("PASS:") == 7
 
 
 def test_the_deploy_host_deploys_from_inside_the_network_and_restores_what_it_changes():
