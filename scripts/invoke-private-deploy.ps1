@@ -104,54 +104,20 @@ if ($existing -and $existing.properties['provisioningState'] -notin @('Failed', 
     })
     if (-not $settings.Count) { throw 'No deployment settings were exported.' }
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($settings -join "`n") + "`n"))
-    $deployCommand = if ($VerifyOnly) {
-        'pwsh -NoLogo -NoProfile -File ./scripts/verify-private-deployment.ps1 -EnvironmentName "$environment" -ResultFile "$work/result.json"'
-    } else {
-        'pwsh -NoLogo -NoProfile -File ./scripts/deploy-on-host.ps1 -EnvironmentName "$environment" -EnvFile "$work/settings.env" -SkipLogin -Verify -ResultFile "$work/result.json"'
-    }
-    $remoteScript = @'
-set -eu
-umask 077
-environment='__ENVIRONMENT__'
-work="/var/lib/cloudlens/deployments/$environment"
-log='__LOG__'
-mkdir -p "$work"
-trap 'status=$?; if [ "$status" -ne 0 ]; then tail -n 40 "$log"; fi; exit "$status"' EXIT
-{
-  deadline=$(($(date +%s) + 1800))
-  while [ ! -f /var/lib/cloudlens/tools-ready ]; do
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      tail -n 40 /var/log/cloudlens-tools.log
-      echo "Deploy host tools did not become ready in 30 minutes." >&2
-      exit 1
-    fi
-    sleep 15
-  done
-  printf '%s' '__SETTINGS__' | base64 -d > "$work/settings.env"
-  export AZURE_CONFIG_DIR="$work/azure-cli"
-  export AZURE_EXTENSION_USE_DYNAMIC_INSTALL=yes_without_prompt
-  export CLOUDLENS_DEPLOY_REQUEST_ID='__REQUEST_ID__'
-  export CLOUDLENS_SOURCE_REVISION='__REVISION__'
-  az login --identity --output none --only-show-errors
-  az account set --subscription '__SUBSCRIPTION__'
-  azd auth login --managed-identity --no-prompt
-  if [ ! -d "$work/CloudLens/.git" ]; then
-    git clone --quiet --no-checkout '__REPOSITORY__' "$work/CloudLens"
-  fi
-  git -C "$work/CloudLens" fetch --quiet origin '__REVISION__'
-  git -C "$work/CloudLens" checkout --quiet --detach '__REVISION__'
-  cd "$work/CloudLens"
-  __DEPLOY__
-} >> "$log" 2>&1
-printf 'CLOUDLENS_RESULT:'
-cat "$work/result.json"
-printf '\n'
-'@
-    $remoteScript = $remoteScript.Replace('__ENVIRONMENT__', $EnvironmentName).Replace('__LOG__', $logFile).
-        Replace('__SETTINGS__', $encoded).Replace('__SUBSCRIPTION__', $subscription).
-        Replace('__REPOSITORY__', $RepoUrl).Replace('__REVISION__', $RepoRevision).Replace('__DEPLOY__', $deployCommand).
-        Replace('__REQUEST_ID__', $requestId)
-    $remoteScript = ($remoteScript -replace "`r`n", "`n") + "`n# request $requestId`n"
+    if ($subscription -notmatch '^[0-9a-fA-F-]{36}$') { throw 'The deployment subscription is not a valid GUID.' }
+    $hostScriptPath = Join-Path $PSScriptRoot 'private-host-run.sh'
+    $assignments = @(
+        "environment='$EnvironmentName'"
+        "subscription='$subscription'"
+        "repository='$RepoUrl'"
+        "revision='$RepoRevision'"
+        "request_id='$requestId'"
+        "settings_b64='$encoded'"
+        "deploy_mode='$(if ($VerifyOnly) { 'verify' } else { 'deploy' })'"
+        "log='$logFile'"
+    ) -join "`n"
+    $remoteScript = $assignments + "`n" + [IO.File]::ReadAllText($hostScriptPath)
+    $remoteScript = ($remoteScript -replace "`r`n", "`n").TrimEnd() + "`n# request $requestId`n"
     $request = @{
         location = $location
         properties = @{ source = @{ script = $remoteScript }; asyncExecution = $true; timeoutInSeconds = $TimeoutSeconds }
@@ -164,6 +130,16 @@ printf '\n'
     } finally {
         Remove-Item -LiteralPath $requestFile -Force
     }
+}
+
+function Get-HostLogTail {
+    # An asynchronous Run Command reports no output, so read the end of the host log directly for the failure message.
+    $tail = & az vm run-command invoke --ids $vmId --command-id RunShellScript --scripts "tail -n 60 '$logFile' 2>&1" `
+        --query 'value[0].message' -o tsv --only-show-errors 2>&1
+    if ($LASTEXITCODE -ne 0) { return '' }
+    $text = Get-CliText $tail
+    $text = $text -replace '(?i)(\b[a-z0-9_]*(?:secret|password|token|key|sig)\w*["'']?\s*[:=]\s*)\S+', '$1***' -replace '(?i)(bearer\s+)\S+', '$1***'
+    return "`n--- last lines of ${logFile} ---`n$text"
 }
 
 $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -187,7 +163,9 @@ do {
         }
     }
     if ($execution -in @('Failed', 'Canceled', 'TimedOut') -or ($command -and $command.properties['provisioningState'] -eq 'Failed')) {
-        throw "Private execution failed ($execution). $($view['error']) $($view['output']) Log: $logFile"
+        $detail = "$($view['error']) $($view['output'])".Trim()
+        $logTail = if ($detail) { '' } else { Get-HostLogTail }
+        throw "Private execution failed ($execution). $detail Log: $logFile$logTail"
     }
     if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
         throw "Timed out waiting for the host. The managed command may still be running; rerun to resume monitoring. Log: $logFile"

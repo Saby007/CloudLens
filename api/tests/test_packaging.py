@@ -418,7 +418,7 @@ def test_cloud_shell_private_deployment_contracts(harness, checks):
     assert all(summary[check] is True for check in checks)
 
 
-def test_cloud_shell_bash_launcher_preserves_state_and_local_changes():
+def _find_bash():
     bash = shutil.which("bash")
     if os.name == "nt":
         git = shutil.which("git")
@@ -426,12 +426,25 @@ def test_cloud_shell_bash_launcher_preserves_state_and_local_changes():
         bash = next((str(path) for path in candidates if path.is_file()), None)
     if not bash:
         pytest.skip("Bash is required for the Cloud Shell launcher contract")
+    return bash
+
+
+def test_cloud_shell_bash_launcher_preserves_state_and_local_changes():
     result = subprocess.run(
-        [bash, str(PROJECT_ROOT / "scripts" / "tests" / "test-cloudshell.sh")],
+        [_find_bash(), str(PROJECT_ROOT / "scripts" / "tests" / "test-cloudshell.sh")],
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.count("PASS:") == 9
+
+
+def test_the_private_host_script_runs_without_home_and_reports_failures():
+    result = subprocess.run(
+        [_find_bash(), str(PROJECT_ROOT / "scripts" / "tests" / "test-private-host-run.sh")],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("PASS:") == 3
 
 
 def test_the_deploy_host_deploys_from_inside_the_network_and_restores_what_it_changes():

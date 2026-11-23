@@ -13,6 +13,7 @@ function Reset-Test {
         puts = 0
         starts = 0
         stops = 0
+        logReads = 0
         polls = 0
         script = ''
         requestId = 'b' * 32
@@ -59,6 +60,10 @@ function az {
     if ($a[0] -eq 'vm' -and $a[1] -eq 'get-instance-view') { return 'PowerState/deallocated' }
     if ($a[0] -eq 'vm' -and $a[1] -eq 'start') { $state.starts++; return }
     if ($a[0] -eq 'vm' -and $a[1] -eq 'deallocate') { $state.stops++; return }
+    if ($a[0] -eq 'vm' -and $a[1] -eq 'run-command' -and $a[2] -eq 'invoke') {
+        $state.logReads++
+        return "azd panic: could not determine current home directory`nAZURE_CLIENT_SECRET=hunter2-never-print"
+    }
     if ($a[0] -ne 'rest') { throw "Unexpected az command: $($a -join ' ')" }
     if ((Argument-Value $a '--method') -eq 'put') {
         $state.puts++
@@ -70,7 +75,7 @@ function az {
         $state.requestId = [regex]::Match($state.script, '(?m)^# request ([a-f0-9]{32})$').Groups[1].Value
         if (-not $state.requestId -or $state.script.Contains("`r")) { throw 'The Linux script must have LF endings and a request correlation ID.' }
         if ($state.script -match 'synthetic-(password|secret|token)-never-copy') { throw 'A credential was copied to the host.' }
-        $encoded = [regex]::Match($state.script, "printf '%s' '([A-Za-z0-9+/=]+)'").Groups[1].Value
+        $encoded = [regex]::Match($state.script, "(?m)^settings_b64='([A-Za-z0-9+/=]+)'$").Groups[1].Value
         $settings = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
         if ($settings -match 'synthetic-(password|secret|token)-never-copy') { throw 'An encoded credential was copied to the host.' }
         if ($settings -notmatch 'COST_EXPORT_CONTAINER="cost-exports"') { throw 'Non-secret deployment settings were lost.' }
@@ -105,12 +110,14 @@ function az {
         $output = 'CLOUDLENS_RESULT:' + ($result | ConvertTo-Json -Compress)
     }
     if ($state.mode -eq 'no-result') { $output = 'Build completed, but verification did not run.' }
-    if ($state.mode -eq 'failed') { $execution = 'Failed' }
+    if ($state.mode -in @('failed', 'failed-silent')) { $execution = 'Failed' }
+    $detail = if ($state.mode -eq 'failed-silent') { '' } else { 'synthetic failure detail' }
+    if ($state.mode -eq 'failed-silent') { $output = '' }
     return @{
         properties = @{
             provisioningState = 'Succeeded'
             source = @{ script = "# request $($state.requestId)`n" }
-            instanceView = @{ executionState = $execution; exitCode = 0; output = $output; error = 'synthetic failure detail' }
+            instanceView = @{ executionState = $execution; exitCode = 0; output = $output; error = $detail }
         }
     } | ConvertTo-Json -Depth 6
 }
@@ -138,7 +145,7 @@ Write-Host 'PASS: a previous deployment result cannot masquerade as a new succes
 
 Reset-Test
 $result = & $subject -EnvironmentName test -RepoRevision $revision -PollSeconds 1 -VerifyOnly
-if ($global:privateTest.script -notmatch 'verify-private-deployment.ps1' -or $global:privateTest.script -match 'deploy-on-host.ps1') { throw 'VerifyOnly must not rebuild.' }
+if ($global:privateTest.script -notmatch "(?m)^deploy_mode='verify'$") { throw 'VerifyOnly must not rebuild.' }
 Write-Host 'PASS: repeat verification without a rebuild'
 
 foreach ($mode in @('forbidden', 'failed', 'no-result', 'wrong-scope')) {
@@ -148,6 +155,13 @@ foreach ($mode in @('forbidden', 'failed', 'no-result', 'wrong-scope')) {
     if (-not $threw) { throw "$mode must be a failure, never a successful pending deployment." }
     Write-Host "PASS: $mode is surfaced explicitly"
 }
+Reset-Test failed-silent
+$message = ''
+try { & $subject -EnvironmentName test -RepoRevision $revision -PollSeconds 1 | Out-Null } catch { $message = $_.Exception.Message }
+if ($global:privateTest.logReads -ne 1 -or $message -notmatch 'could not determine current home directory' -or $message -match 'hunter2') {
+    throw "A silent failure must show the redacted end of the host log: $message"
+}
+Write-Host 'PASS: a silent host failure shows the redacted log tail'
 Reset-Test
 $threw = $false
 try { & $subject -EnvironmentName test -RepoRevision $revision -RepoUrl 'https://user:password@example.test/repo.git' | Out-Null } catch { $threw = $true }

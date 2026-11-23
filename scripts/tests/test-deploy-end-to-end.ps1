@@ -753,13 +753,13 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     }
     if ($state.runCommands.Count -ne 1) { throw 'The deploy host must be prepared once through az vm run-command.' }
     $hostScript = $state.runCommands[0]
-    if ($hostScript -notmatch "printf '%s' '([A-Za-z0-9+/=]+)' \| base64 -d") { throw "The settings must reach the deploy host as data, not as shell text: $hostScript" }
+    if ($hostScript -notmatch "(?m)^settings_b64='([A-Za-z0-9+/=]+)'$") { throw "The settings must reach the deploy host as data, not as shell text: $hostScript" }
     $hostSettings = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1]))
     if ($hostSettings -notmatch 'APP_AKS_PRIVATE_CLUSTER="true"' -or $hostSettings -notmatch 'AZURE_AKS_CLUSTER_NAME="aks-0123456789abc"' -or
         $hostSettings -match 'ADMIN_PASSWORD' -or $hostSettings.Contains('Aa1!Bb2#Cc3%Dd4*Ee5-Ff6_')) {
         throw 'The deploy host gets this environment''s settings and never the host''s own password.'
     }
-    if ($hostScript -notmatch "checkout --quiet --detach '$('a' * 40)'" -or $hostScript -notmatch 'az login --identity' -or $hostScript -notmatch '-Verify -ResultFile') {
+    if ($hostScript -notmatch "(?m)^revision='$('a' * 40)'$" -or $hostScript -notmatch 'checkout --quiet --detach "\$revision"' -or $hostScript -notmatch 'az login --identity' -or $hostScript -notmatch '-Verify -ResultFile') {
         throw 'The deploy host must use the exact source revision, its managed identity, and private verification.'
     }
 
