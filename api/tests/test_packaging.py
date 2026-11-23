@@ -405,6 +405,7 @@ def test_end_to_end_helper_deploys_once_retries_and_never_hides_a_question():
     assert summary["privateIngressIsTheDefault"] and summary["publicAddressNeverSwitchedSilently"]
     assert summary["privateControlPlaneIsTheDefault"] and summary["deployStageRunsWhereTheClusterIsReachable"]
     assert summary["publicClusterNeverReplacedSilently"]
+    assert summary["previewRetriesAreBounded"] and summary["previewFailureNeverProvisions"]
 
 
 @pytest.mark.parametrize("harness, checks", [
@@ -430,7 +431,7 @@ def test_cloud_shell_bash_launcher_preserves_state_and_local_changes():
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS:") == 7
+    assert result.stdout.count("PASS:") == 9
 
 
 def test_the_deploy_host_deploys_from_inside_the_network_and_restores_what_it_changes():

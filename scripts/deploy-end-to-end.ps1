@@ -13,7 +13,7 @@
       2. Signs in with `azd` and `az` (Terraform authenticates through the Azure CLI).
       3. Creates the azd environment and applies the recommended `ai` profile settings, including the
          scheduled export processor.
-      4. Previews the Terraform plan, then runs `azd up`: Terraform provisions the network, AKS cluster,
+      4. Previews the Terraform plan with bounded retries, then runs `azd up`: Terraform provisions the network, AKS cluster,
          registry, storage, Foundry account and identities; the postprovision hook installs cert-manager
          and the ingress controller; azd builds both images in ACR and applies the Kubernetes manifests.
          Failures are retried after a wait.
@@ -470,9 +470,14 @@ function Invoke-AzdInTerminal {
 function Invoke-Azd {
     param([Parameter(Mandatory)][string[]] $Arguments, [Parameter(Mandatory)][string] $Reason)
     $command = "azd $($Arguments -join ' ')"
+    $isPreview = $Arguments -contains '--preview'
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         Write-Step "$command - $Reason (attempt $attempt of $MaxAttempts)"
-        Write-Host 'This can take a while - creating a new AKS cluster alone takes 10-15 minutes; azd reports each step as it finishes.' -ForegroundColor DarkGray
+        if ($isPreview) {
+            Write-Host 'Preview only: this validates and plans the infrastructure without applying it.' -ForegroundColor DarkGray
+        } else {
+            Write-Host 'This can take a while - creating a new AKS cluster alone takes 10-15 minutes; azd reports each step as it finishes.' -ForegroundColor DarkGray
+        }
         $text = Invoke-AzdCaptured $Arguments
         if ($LASTEXITCODE -eq 0) { return }
         if ($text -match $azdNeedsInput) {
@@ -483,9 +488,14 @@ function Invoke-Azd {
             throw "Terraform's local state is still locked by an earlier run that was interrupted. Make sure no other azd run is active, delete .azure/$EnvironmentName/infra/.terraform.tfstate.lock.info, then rerun this script."
         }
         if ($attempt -eq $MaxAttempts) {
+            if ($isPreview) {
+                throw "Infrastructure preview failed after $attempt attempt(s). No provisioning was started. Review the error above, then rerun the same command using this environment's existing state."
+            }
             throw "$command failed after $attempt attempt(s) while trying to $Reason. Review the output above; rerunning this script resumes from here."
         }
-        if ($text -match 'Forbidden|AuthorizationFailed|does not have (authorization|access)|cannot (create|get|list|patch)') {
+        if ($text -match 'AzureCLICredential: signal: killed') {
+            Write-Warning 'An Azure CLI credential subprocess was terminated. Retrying after a wait; the Cloud Shell launcher limits tenant discovery to one subprocess at a time.'
+        } elseif ($text -match 'Forbidden|AuthorizationFailed|does not have (authorization|access)|cannot (create|get|list|patch)') {
             Write-Warning 'A new role assignment had not reached Azure or the cluster yet. Retrying after a wait.'
         } elseif ($text -match 'AnotherOperationInProgress|OperationNotAllowed|AccountProvisioningStateInvalid|Another operation is in progress|RequestConflict|Conflict') {
             Write-Warning 'Azure was still finishing an earlier operation on the same resource. Retrying after a wait.'
@@ -809,10 +819,7 @@ try {
     if ($SkipPreview) {
         Write-Step 'Skipping the infrastructure preview (-SkipPreview)'
     } else {
-        Write-Step 'Previewing the infrastructure (azd provision --preview runs terraform plan)'
-        $previewText = Invoke-AzdCaptured @('provision', '--preview')
-        if ($LASTEXITCODE -ne 0 -and $previewText -match $azdNeedsInput) { Invoke-AzdInTerminal @('provision', '--preview') }
-        if ($LASTEXITCODE -ne 0) { throw 'Infrastructure preview failed. Nothing was deployed.' }
+        Invoke-Azd @('provision', '--preview') 'preview the infrastructure (terraform plan; no changes applied)'
     }
 
     if ($privateControlPlane) {

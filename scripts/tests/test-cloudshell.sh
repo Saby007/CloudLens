@@ -7,6 +7,7 @@ export HOME="$temp/home"
 export ACC_CLOUD=AzureCloud
 export TEST_LOG="$temp/commands.log"
 export TEST_REAL_MKTEMP="$(command -v mktemp)"
+unset AZD_SUBSCRIPTIONS_FETCH_MAX_CONCURRENCY
 mkdir -p "$HOME" "$temp/bin"
 source_url="file://$subject"
 if command -v cygpath >/dev/null; then source_url="file:///$(cygpath -m "$subject")"; fi
@@ -41,6 +42,7 @@ STUB
 cat > "$temp/bin/azd" <<'STUB'
 #!/usr/bin/env bash
 if [[ "$1" == version ]]; then echo 'azd version 1.37.3'; else printf 'azd %s\n' "$*" >> "$TEST_LOG"; fi
+printf 'azd subscription-concurrency=%s\n' "${AZD_SUBSCRIPTIONS_FETCH_MAX_CONCURRENCY:-unset}" >> "$TEST_LOG"
 STUB
 cat > "$temp/bin/terraform" <<'STUB'
 #!/usr/bin/env bash
@@ -53,13 +55,22 @@ if [[ "$1" == clone ]]; then mkdir -p "${@: -1}/.git"; exit; fi
 case "$3 $4" in
   'remote get-url') echo 'https://github.com/Saby007/CloudLens.git' ;;
   'branch --show-current') echo cloudlensdev ;;
-  'status --porcelain') [[ "${TEST_DIRTY:-false}" == false ]] || echo ' M README.md' ;;
+  'status --porcelain')
+    case "${TEST_DIRTY:-false}" in
+      false) ;;
+      lock) echo ' M infra/.terraform.lock.hcl' ;;
+      mixed) printf ' M infra/.terraform.lock.hcl\n M README.md\n' ;;
+      staged-lock) echo 'M  infra/.terraform.lock.hcl' ;;
+      deleted-lock) echo ' D infra/.terraform.lock.hcl' ;;
+      *) echo ' M README.md' ;;
+    esac ;;
 esac
 exit 0
 STUB
 cat > "$temp/bin/pwsh" <<'STUB'
 #!/usr/bin/env bash
 printf 'pwsh %s\n' "$*" >> "$TEST_LOG"
+printf 'pwsh subscription-concurrency=%s\n' "${AZD_SUBSCRIPTIONS_FETCH_MAX_CONCURRENCY:-unset}" >> "$TEST_LOG"
 STUB
 chmod +x "$temp/bin/"*
 
@@ -76,6 +87,8 @@ bash "$subject"
 grep -q 'git clone --single-branch --branch cloudlensdev' "$TEST_LOG"
 grep -q 'azd config set auth.useAzCliAuth true' "$TEST_LOG"
 grep -q -- '-IngressVisibility private -ControlPlane private -SkipLogin -InstallKubernetesTools -EnvironmentName cloudlens -Profile data' "$TEST_LOG"
+grep -q 'azd subscription-concurrency=1' "$TEST_LOG"
+grep -q 'pwsh subscription-concurrency=1' "$TEST_LOG"
 echo 'PASS: fresh Cloud Shell uses persistent storage, the existing login, private deployment and data profile'
 
 bash "$subject" -EnvironmentName customer -Profile ai -Location eastus2 -TargetSubscriptionId aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
@@ -87,6 +100,23 @@ if TEST_PERSISTENT=false bash "$subject" >/dev/null 2>&1; then echo 'Ephemeral C
 echo 'PASS: ephemeral Cloud Shell is rejected before provisioning'
 if TEST_DIRTY=true bash "$subject" >/dev/null 2>&1; then echo 'Local changes must not be overwritten' >&2; exit 1; fi
 echo 'PASS: existing local changes are preserved'
+
+mkdir -p "$HOME/clouddrive/CloudLens/infra"
+printf 'synthetic updated provider selections\n' > "$HOME/clouddrive/CloudLens/infra/.terraform.lock.hcl"
+TEST_DIRTY=lock bash "$subject"
+grep -q 'synthetic updated provider selections' "$HOME/clouddrive/CloudLens/infra/.terraform.lock.hcl"
+for dirty in mixed staged-lock deleted-lock; do
+  if TEST_DIRTY="$dirty" bash "$subject" >/dev/null 2>&1; then
+    echo "Changes other than an unstaged provider-lock update must be refused: $dirty" >&2
+    exit 1
+  fi
+done
+echo 'PASS: generated provider-lock updates survive reruns without allowing source edits or deliberate lock changes'
+
+AZD_SUBSCRIPTIONS_FETCH_MAX_CONCURRENCY=2 bash "$subject"
+grep -q 'azd subscription-concurrency=2' "$TEST_LOG"
+grep -q 'pwsh subscription-concurrency=2' "$TEST_LOG"
+echo 'PASS: a caller-supplied subscription concurrency limit is preserved'
 
 calls_before="$(wc -l < "$TEST_LOG")"
 if TEST_UNWRITABLE=true bash "$subject" >"$temp/unwritable-drive-error" 2>&1; then

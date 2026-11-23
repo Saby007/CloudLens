@@ -31,6 +31,8 @@ az account show --output none --only-show-errors
 tools="$HOME/.local/bin"
 mkdir -p "$tools"
 export PATH="$tools:$PATH"
+# azd can start one Azure CLI credential process per tenant; serialize discovery in memory-limited Cloud Shell.
+export AZD_SUBSCRIPTIONS_FETCH_MAX_CONCURRENCY="${AZD_SUBSCRIPTIONS_FETCH_MAX_CONCURRENCY:-1}"
 temp="$(mktemp -d)"
 trap 'rm -rf -- "$temp"' EXIT
 
@@ -64,9 +66,17 @@ branch=cloudlensdev
 if [[ -d "$repo/.git" ]]; then
   [[ "$(git -C "$repo" remote get-url origin)" == "$url" ]] || { echo "$repo has an unexpected origin." >&2; exit 1; }
   [[ "$(git -C "$repo" branch --show-current)" == "$branch" ]] || { echo "$repo must be on $branch." >&2; exit 1; }
-  [[ -z "$(git -C "$repo" status --porcelain)" ]] || { echo "$repo has local changes. Preserve them before updating; the launcher will not discard them." >&2; exit 1; }
+  status="$(git -C "$repo" status --porcelain)"
+  source_changes="$(printf '%s\n' "$status" | sed '/^ M infra\/\.terraform\.lock\.hcl$/d')"
+  [[ -z "$source_changes" ]] || { echo "$repo has local changes. Preserve them before updating; the launcher will not discard them." >&2; exit 1; }
+  if [[ -n "$status" ]]; then
+    echo "Preserving Terraform-generated infra/.terraform.lock.hcl updates while refreshing the source."
+  fi
   git -C "$repo" fetch origin "$branch"
-  git -C "$repo" merge --ff-only "origin/$branch"
+  if ! git -C "$repo" merge --ff-only "origin/$branch"; then
+    echo "The source update could not be fast-forwarded safely. Local files and Terraform state were not discarded; resolve the Git update before rerunning." >&2
+    exit 1
+  fi
 else
   git clone --single-branch --branch "$branch" "$url" "$repo"
 fi

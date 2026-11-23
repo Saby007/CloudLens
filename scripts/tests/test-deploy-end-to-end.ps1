@@ -24,6 +24,10 @@ $global:deployTestState = @{
     # Every azd provisioning/deployment call, as '<command>:<outcome>'.
     azdCalls = [System.Collections.Generic.List[string]]::new()
     previewCalls = 0
+    previewFailuresRemaining = 1
+    previewNeedsAnswer = $false
+    previewFailure = 'ERROR: fetching current principal id: listing subscriptions: AzureCLICredential: signal: killed'
+    retryWaits = [System.Collections.Generic.List[int]]::new()
     authChecks = 0
     interactiveLogins = 0
     cloneCalls = 0
@@ -69,7 +73,10 @@ function Get-StubArgument {
     return $Arguments[$index + 1]
 }
 
-function Start-Sleep { param([int] $Seconds) }
+function Start-Sleep {
+    param([int] $Seconds)
+    $global:deployTestState.retryWaits.Add($Seconds)
+}
 
 function Read-Host {
     param([string] $Prompt)
@@ -162,6 +169,19 @@ function azd {
     }
     if ($a[0] -eq 'provision' -and $a -contains '--preview') {
         $state.previewCalls++
+        if ($state.previewNeedsAnswer) {
+            if ($noPrompt) {
+                Write-Output 'ERROR: prompting for location: no default response'
+                $global:LASTEXITCODE = 1
+                return
+            }
+            $state.previewNeedsAnswer = $false
+        }
+        if ($state.previewFailuresRemaining -gt 0) {
+            $state.previewFailuresRemaining--
+            Write-Output $state.previewFailure
+            $global:LASTEXITCODE = 1
+        }
         return
     }
     # A private control plane provisions on its own: the cluster bootstrap and the image build wait for the deploy stage.
@@ -460,7 +480,7 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
         if ($values.Contains($retired)) { throw "$retired belongs to the Container Apps flow and must not be set on AKS." }
     }
     if ($values['APP_MODEL_DEPLOYMENTS'] -notmatch '"modelName":"model-router"' -or $values['APP_MODEL_DEPLOYMENTS'] -notmatch '"capacity":20\}') { throw 'The approved Model Router deployment definition was not applied.' }
-    if ($state.previewCalls -ne 1) { throw "azd provision --preview ran $($state.previewCalls) times instead of once." }
+    if ($state.previewCalls -ne 2) { throw 'A terminated Azure CLI credential process must retry the preview before provisioning.' }
     if ($state.authChecks -ne 1 -or $state.interactiveLogins -ne 0) { throw 'Sign-in must be checked once and must not prompt when already authenticated.' }
     if ($state.cloneCalls -ne 0) { throw 'An existing checkout must not be cloned again.' }
     if ($state.installCliCalls.Count -ne 0 -or $state.questions.Count -ne 0) { throw 'kubectl and kubelogin were available, so nothing may be installed or asked.' }
@@ -494,6 +514,37 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
     if ($state.roleCreates.Count -ne 0) { throw 'A rerun duplicated role assignments instead of detecting the existing ones.' }
     if ($state.previewCalls -ne 0) { throw '-SkipPreview still ran the infrastructure preview.' }
     if ($state.bootstrapCalls -ne 2) { throw 'The sign-in bootstrap must be re-verified on every run.' }
+
+    $state.azdCalls.Clear()
+    $state.previewCalls = 0
+    $state.previewFailuresRemaining = 5
+    $state.retryWaits.Clear()
+    $previewParameters = $parameters.Clone()
+    $previewParameters.SettleSeconds = 7
+    $previewError = ''
+    try { & $script @previewParameters -SkipIdentityBootstrap -SkipRoleAssignments | Out-Null } catch { $previewError = $_.Exception.Message }
+    if ($state.previewCalls -ne 3 -or $state.azdCalls.Count -or $previewError -notmatch 'preview failed after 3 attempt' -or
+        ($state.retryWaits -join ',') -ne '7,7') {
+        throw "Preview retries must stop at MaxAttempts without provisioning: $previewError"
+    }
+    $state.previewCalls = 0
+    $state.retryWaits.Clear()
+    $oneAttempt = $previewParameters.Clone()
+    $oneAttempt.MaxAttempts = 1
+    try { & $script @oneAttempt -SkipIdentityBootstrap -SkipRoleAssignments | Out-Null } catch { $previewError = $_.Exception.Message }
+    if ($state.previewCalls -ne 1 -or $state.azdCalls.Count -or $previewError -notmatch 'preview failed after 1 attempt' -or
+        $state.retryWaits.Count) {
+        throw '-MaxAttempts 1 must not retry or provision after a failed preview.'
+    }
+    $state.previewFailuresRemaining = 0
+    $state.previewNeedsAnswer = $true
+    $state.previewCalls = 0
+    & $script @parameters -SkipIdentityBootstrap -SkipRoleAssignments | Out-Null
+    if ($state.previewCalls -ne 2 -or $state.previewNeedsAnswer -or
+        ($state.interactiveAzd -join '; ') -ne "provision --preview --environment $environmentName") {
+        throw 'A preview that needs input must rerun visibly in the terminal, then provision only after it succeeds.'
+    }
+    $state.interactiveAzd.Clear()
 
     # azd must never wait on a question nobody can see: every call except sign-in runs with --no-prompt,
     # and when azd reports that it needed an answer, that same command reruns attached to the terminal.
@@ -848,7 +899,8 @@ if (`$global:deployTestState.requireServiceTree -and -not `$ServiceManagementRef
                 operatorModeSkipsSignInAndPublicUrl = $true; allowListOpensPublicUrl = $true
                 cloudShellSkipsBlockedHealthCheck = $true; privateIngressIsTheDefault = $true
                 publicAddressNeverSwitchedSilently = $true; privateControlPlaneIsTheDefault = $true
-                deployStageRunsWhereTheClusterIsReachable = $true; publicClusterNeverReplacedSilently = $true } | ConvertTo-Json -Compress
+                deployStageRunsWhereTheClusterIsReachable = $true; publicClusterNeverReplacedSilently = $true
+                previewRetriesAreBounded = $true; previewFailureNeverProvisions = $true } | ConvertTo-Json -Compress
 } finally {
     foreach ($name in $cloudShellMarkers.Keys) { [Environment]::SetEnvironmentVariable($name, $cloudShellMarkers[$name], 'Process') }
     Remove-Variable -Name deployTestState -Scope Global -ErrorAction SilentlyContinue
