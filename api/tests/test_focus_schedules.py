@@ -384,6 +384,16 @@ def test_mismatched_export_readback_does_not_claim_success_or_save_schedule(stor
     assert not store.documents
 
 
+def test_unsupported_offer_type_is_explained_instead_of_a_generic_failure(store, export_setup):
+    request = httpx.Request("PUT", "https://management.azure.com/export")
+    response = httpx.Response(400, request=request, json={"error": {"code": "BadRequest", "message":
+        "Export type: FocusCost is not supported for Agreement Type: WebDirect and Subscription."}})
+    export_setup.put_error = httpx.HTTPStatusError("bad request", request=request, response=response)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(focus_schedules.configure_export(SUB, allow_destination_role_assignment=True))
+    assert error.value.status_code == 422 and "offer type" in error.value.detail and "WebDirect" not in error.value.detail
+
+
 def test_uncertain_export_creation_is_not_retried_or_scheduled(store, export_setup):
     export_setup.put_error = httpx.ReadTimeout("private upstream detail")
     with pytest.raises(HTTPException) as error:

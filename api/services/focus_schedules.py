@@ -392,6 +392,8 @@ def _export_setup_failure(error: Exception) -> HTTPException:
             return HTTPException(status_code=403, detail="Azure denied the export setup operation. Verify the runtime managed identity's pre-granted subscription and destination permissions.")
         if response.status_code in (409, 412):
             return HTTPException(status_code=409, detail="The export changed during configuration. Refresh its status before trying again.")
+        if response.status_code == 400 and "not supported for agreement type" in response.text.lower():
+            return HTTPException(status_code=422, detail="Azure Cost Management does not offer FOCUS exports for this subscription's offer type (for example pay-as-you-go or Visual Studio). Assess a subscription on an Enterprise Agreement or Microsoft Customer Agreement instead.")
     return HTTPException(status_code=503, detail="FOCUS export configuration could not be confirmed. Refresh its status before trying again; no automatic retry was performed.")
 
 
